@@ -3,7 +3,6 @@ project(dpdk-test VERSION 0.1.0)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/")
 find_package(DPDK REQUIRED)
-find_package(Threads REQUIRED)
 
 add_subdirectory(lib)
 add_subdirectory(examples)

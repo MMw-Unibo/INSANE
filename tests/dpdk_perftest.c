@@ -245,7 +245,8 @@ void do_sink(struct rte_mempool *mempool, test_config_t *params) {
                 struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
 
                 if (ip_hdr->next_proto_id == IPPROTO_UDP &&
-                    rte_be_to_cpu_16(udp_hdr->dst_port) == INSANE_PORT) {
+                    rte_be_to_cpu_16(udp_hdr->dst_port) == INSANE_PORT)
+                {
 
                     if (counter == 0) {
                         first_time = get_clock_realtime_ns();
@@ -323,7 +324,8 @@ void do_ping(struct rte_mempool *mempool, test_config_t *params) {
                 uh = (struct rte_udp_hdr *)(ih + 1);
 
                 if (ih->next_proto_id == IPPROTO_UDP &&
-                    rte_be_to_cpu_16(uh->dst_port) == INSANE_PORT) {
+                    rte_be_to_cpu_16(uh->dst_port) == INSANE_PORT)
+                {
 
                     response_time = get_clock_realtime_ns();
                     latency       = response_time - send_time;
@@ -520,8 +522,7 @@ static inline int port_init(struct rte_mempool *mempool, uint16_t mtu) {
     uint16_t            port_id = 0;
     struct rte_eth_conf port_conf;
     memset(&port_conf, 0, sizeof(port_conf));
-    port_conf.rxmode.mtu            = actual_mtu;
-    port_conf.rxmode.split_hdr_size = 0;
+    port_conf.rxmode.mtu = actual_mtu;
     port_conf.rxmode.offloads |= (RTE_ETH_RX_OFFLOAD_CHECKSUM | RTE_ETH_RX_OFFLOAD_SCATTER);
     port_conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
     port_conf.txmode.offloads |= (RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_MULTI_SEGS);

@@ -51,7 +51,7 @@ if(EXISTS ${WITH_DPDK_MLX5})
 endif()
 
 include(FindPackageHandleStandardArgs)
-find_package_handle_standard_args(dpdk DEFAULT_MSG
+find_package_handle_standard_args(DPDK DEFAULT_MSG
         DPDK_INCLUDE_DIR
         check_LIBRARIES)
 
