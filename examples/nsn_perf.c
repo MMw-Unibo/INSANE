@@ -173,7 +173,7 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
     nsn_buffer_t      buf_recv, buf_send;
     uint64_t          send_time, response_time, latency;
 
-    while (g_running) {
+    while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
         if (params->sleep_time) {
             sleep(params->sleep_time);
@@ -202,11 +202,13 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
 //--------------------------------------------------------------------------------------------------
 // pong
 void do_pong(nsn_stream_t *stream, test_config_t *params) {
+    uint64_t counter = 0;
+
     nsn_sink_t   sink   = nsn_create_sink(stream, params->app_source_id, NULL);
     nsn_source_t source = nsn_create_source(stream, params->app_source_id);
 
     nsn_buffer_t buf_recv, buf_send;
-    while (g_running) {
+    while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
         buf_send = nsn_get_buffer(source, 1024, 0);
         buf_recv = nsn_consume_data(sink, 0);
         LOG_TRACE("Forwarding sample %d to buffer idx=%d\n",
@@ -219,6 +221,7 @@ void do_pong(nsn_stream_t *stream, test_config_t *params) {
             nsn_emit_data(source, &buf_send);
         }
         nsn_release_data(sink, &buf_recv);
+        counter++;
     }
 }
 
