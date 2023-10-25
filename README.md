@@ -112,9 +112,9 @@ A **latency test** can be performed by launching the ``nsn-perf`` applications o
 For instance:
 ```bash
 # On the server node
-sudo taskset -c 0 ./nsn-perf pong -s 64 -n 1000000 -q fast
+sudo taskset -c 0,1 ./nsn-perf pong -s 64 -n 1000000 -q fast
 # On the client node
-sudo taskset -c 0 ./nsn-perf ping -s 64 -n 1000000 -q fast
+sudo taskset -c 0,1 ./nsn-perf ping -s 64 -n 1000000 -q fast
 ```
 
 The output of the test is, on the client side, a set number that represent the Round-Trip Time, in microseconds, measured for each message sent and received back. In the paper, we used this number to generate the latency graphs in the microbenchmarking section.
@@ -124,9 +124,9 @@ A **throughput test** can be performed by launching the ``nsn-perf`` application
 For instance:
 ```bash
 # On the server node
-sudo taskset -c 0 ./nsn-perf sink -s 1024 -n 1000 -q fast
+sudo taskset -c 0,1 ./nsn-perf sink -s 1024 -n 1000 -q fast
 # On the client node
-sudo taskset -c 0 ./nsn-perf source -s 1024 -n 1000 -q fast
+sudo taskset -c 0,1 ./nsn-perf source -s 1024 -n 1000 -q fast
 ```
 
 The output of the test is, on the server side, first a human-readable summary of the results, and then a csv line that we used to generate the throughput graphs in the microbenchmarking section. For instance:
@@ -163,7 +163,24 @@ In particular:
 
 ### Lunar applications
 
-The instructions of how to run the two Lunar applications will be available soon.
+The LUNAR applications are example applications built to show the ease of programming guaranteed by INSANE with no performance compromises. The two applications are a Message-oriented Middleware (MoM) and an image streaming framework. In the following we explain how to launch them to reproduce the experiments reported in the paper.
+
+We plan to document soon how the LUNAR applications are designed internally.
+
+#### LUNAR MoM
+
+The code of LUNAR MoM is located in [```apps/lunar```](apps/lunar). Together with the MoM code, there is also a simple test application that can be used to test the MoM performance:  [```lunar-perftest```](apps/lunar/lunar_perftest.c). This application provides both a latency and a throughput test with the same semantic as the [```nsn-perf```](examples/nsn_perf.c) application.
+
+A **latency test** can be performed by launching the ``lunar-perftest`` applications on two nodes: one with the ``subpub`` role (working as server) and one with ``pubsub`` role, working as client. To improve performance, please launch the test using the ``taskset`` command to pin the application to a specific set of core, that must be on the same NUMA node.
+A **throughput test** can be performed by launching the ``lunar-perftest`` applications on two nodes: one with the ``sub`` role (working as server) and one with ``pub`` role, working as client. To improve performance, please launch the test using the ``taskset`` command to pin the application to a specific set of core, that must be on the same NUMA node.
+
+For instance, you can launch the latency test as:
+```bash
+# On the server node
+sudo taskset -c 0,1 ./lunar-perftest subpub -s 64 -n 1000000 -q fast
+# On the client node
+sudo taskset -c 0,1 ./lunar-perftest pubsub -s 64 -n 1000000 -q fast
+```
 
 ## Running on CloudLab
 
