@@ -242,9 +242,9 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
     config->max_msg    = 0;
 
     /* Test role (mandatory argument) */
-    if (!strcmp(argv[1], "pub")) {
+    if (!strcmp(argv[1], "sub")) {
         config->role = role_sub;
-    } else if (!strcmp(argv[1], "sub")) {
+    } else if (!strcmp(argv[1], "pub")) {
         config->role = role_pub;
     } else if (!strcmp(argv[1], "pubsub")) {
         config->role = role_pubsub;

@@ -148,8 +148,9 @@ int lunar_sub(const char *topic, lunar_data_cb datacb, void *args) {
     struct topic *t;
     HASH_FIND_STR(topics, topic, t);
 
-    if (!t)
-        add_new_topic(topic, transport);
+    if (!t) {
+        t = add_new_topic(topic, transport);
+    }
 
     switch (transport) {
     case TRANSPORT_UDP:
