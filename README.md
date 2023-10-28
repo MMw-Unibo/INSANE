@@ -165,11 +165,15 @@ In particular:
 
 The LUNAR applications are example applications built to show the ease of programming guaranteed by INSANE with no performance compromises. The two applications are a Message-oriented Middleware (MoM) and an image streaming framework. In the following we explain how to launch them to reproduce the experiments reported in the paper.
 
+Please remind that these applications attach to the INSANE runtime, so the runtime must be started first. Please refer to the [Starting the INSANE runtime](#starting-the-insane-runtime) section for more details.
+
 We plan to document soon how the LUNAR applications are designed internally.
 
 #### LUNAR MoM
 
-The code of LUNAR MoM is located in [```apps/lunar```](apps/lunar). Together with the MoM code, there is also a simple test application that can be used to test the MoM performance:  [```lunar-perftest```](apps/lunar/lunar_perftest.c). This application provides both a latency and a throughput test with the same semantic as the [```nsn-perf```](examples/nsn_perf.c) application.
+The code of LUNAR MoM is located in [```apps/lunar```](apps/lunar). The MoM gives the possibility to create topics and have other INSANE applications to publish or subscribe on them. By relying on the INSANE API, this MoM is very simple and exposes a very intuitive and easy-to-use interface.
+
+Together with the MoM code, there is also a simple test application that can be used to test the MoM performance:  [```lunar-perftest```](apps/lunar/lunar_perftest.c). This application provides both a latency and a throughput test with the same semantic as the [```nsn-perf```](examples/nsn_perf.c) application. Both these tests create a topic and publish/subscribe on it. The topic name can be passed as an argument to the application.
 
 A **latency test** can be performed by launching the ``lunar-perftest`` applications on two nodes: one with the ``subpub`` role (working as server) and one with ``pubsub`` role, working as client. To improve performance, please launch the test using the ``taskset`` command to pin the application to a specific set of core, that must be on the same NUMA node.
 A **throughput test** can be performed by launching the ``lunar-perftest`` applications on two nodes: one with the ``sub`` role (working as server) and one with ``pub`` role, working as client. To improve performance, please launch the test using the ``taskset`` command to pin the application to a specific set of core, that must be on the same NUMA node.
@@ -182,11 +186,68 @@ sudo taskset -c 0,1 ./lunar-perftest subpub -s 64 -n 1000000 -q fast
 sudo taskset -c 0,1 ./lunar-perftest pubsub -s 64 -n 1000000 -q fast
 ```
 
+#### LUNAR Stream
+
+The code of LUNAR Stream is located in [```apps/lunar```](apps/lunar). Lunar Streaming exposes a simple set of APIs, starting with ```lnr_s_open_server``` to open the server-side application and with ```lnr_s_connect``` that allows clients to connect to it. Thus, the server application must implement a simple interface by exposing two methods: ```get_frame``` and ```wait_next```. The first allows to get a new frame, while the second pauses the server waiting for the next frame. To start streaming, the server application must invoke ```lnr_s_loop``` which performs the following steps: 
+1. Requesting a new frame
+2. Fragmenting and sending the frame
+3. Waiting for the next frame to restart the loop until the end of streaming.
+
+Together with the Stream code, there is also a simple client/server application, written using the LUNAR Stream framweork, that can be used to test the performance of raw image streaming:  [```s-server```](apps/lunar-streaming/s_server.c) and [```s-client```](apps/lunar-streaming/s_client.c). The server application embeds two files from the single-header library [stb](https://github.com/nothings/stb) to handle image loading and writing.
+
+The application measures two metrics:
+1. The number of frames per second (FPS) the client application can handle;
+2. The average end-to-end latency for frame transmission, i.e., the time between the server application sending a frame (including fragmentation) and the client application receiving the reconstructed frame.
+
+Because the measured latency is *one-way latency*, before the test execution it is necessary that the two physical hosts are synchronized using PTP. At [this link](https://tsn.readthedocs.io/timesync.html) you can find the necessary instructions.
+<!-- TODO: provide the commands to synchronize the hosts. Here or in a separate section of the readme/folder of the repo -->
+
+Once the hosts are synchronized, the client must be started first: this simulates the behavior of usual streaming application in which the client asks the server for data, and the server sends it back. The client application takes the following arguments:
+```bash
+Usage: apps/s-client [-q <quality>]
+-q: image quality. Can be hd|fullhd|2k|4k|8k.
+```
+For instance, to ask the server for a FullHD (1920x1080) image, you can run:
+```bash
+sudo taskset -c 0,1 ./s-client -q fullhd
+```
+
+After starting the client on one host, the server can be started on the other host. The server application takes the following arguments:
+
+```bash
+Usage: apps/s-server -i <filename> -f <frames> -r <rate_ms>
+-i: input file
+-f: number of frames to send
+-r: frame rate in ms
+```
+In the [data](apps/lunar-streaming/data) folder, three examples images are already provided as samples that can be passed with the -i parameter. The -f parameter specifies the number of frames to send, whereas the -r parameter specifies the frame rate in milliseconds. For instance, to send 1000 frames at 500 FPS, you can run:
+```bash
+sudo taskset -c 0,1 ./s-server -i data/test.jpg -f 1000 -r 2
+``` 
+
+To change the QoS parameters passed to INSANE, currenlty the application does not provide a command line interface. You must change the proper options at line 44 of the [```lunar_s.c```](apps/lunar-streaming/lunar_s.c) file and recompile the application.
+
+The results of the tests will be printed to the console of both the client and the server application, one line per frame. On the client side, each line shows two values: *latency* and *time*. The *latency* field represents the end-to-end latency between when the server started to send the frame and when the client received it entirely. Because frame reception is sequential, this value can be averaged and used to compute the FPS latency the client is able to handle.
+
+An example output on the client side, for three frames, would be:
+```bash
+lat, time
+1807895,1804478
+1801885,1797829
+1802669,1799150
+```
+These numbers, which are purely indicative, would correspond to an average 1.8ms *end-to-end* latency and 1.8ms of per-frame handling time, corresponding to roughly 555 FPS.
+
 ## Running on CloudLab
 
-Few modifications are required to run on CloudLab: you must apply a specific [patch](cloudlab_eval.diff).
+To run on CloudLab, we suggest to select an hardware type that supports at least two experimental LANs, so that it is possible to test the same application with UDP/IP and DPDK. Please do not use the management network for the experiment traffic. To use DPDK, we tested our code with Mellanox hardware only, so please try to select a node with Mellanox NICs. 
+
+We performed our tests using the [d6515](https://docs.cloudlab.us/hardware.html) hardware, but others with similar characteristics should work as well. To ease the testing, we created a [CloudLab profile](https://www.cloudlab.us/show-profile.php?uuid=f548d0d5-4f15-11ed-994d-e4434b2381fc) that uses Ubuntu 22.04 and already has the network configured. 
+
+Once instantiated, you can proceed with the installation of the prerequisites (see the [Prerequisites](#prerequisites) section) and the build of the project (see the [Building the project](#building-the-project) section).
+
 
 ## Running on Azure
 
-We support the deployment of INSANE on Azure. We are going to release soon the associated instructions, but please email us if you are interested in trying it out.
+We support the deployment of INSANE on Azure. However, the use of DPDK in Azure requires some different steps from those described in this guide and also some code modifications. We are going to release soon the associated instructions, but please email us if you are interested in trying it out.
 
