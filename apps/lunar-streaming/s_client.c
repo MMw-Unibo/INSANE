@@ -53,7 +53,7 @@ int main(int argc, char *argv[]) {
             quality = optarg;
             break;
         default:
-            fprintf(stderr, "Usage: %s -w <width> -h <height>\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-q [hd|fullhd|2k|4k|8k]]\n", argv[0]);
             exit(EXIT_FAILURE);
         }
     }
@@ -62,6 +62,7 @@ int main(int argc, char *argv[]) {
         printf("unknown image quality, use: hd|fullhd|2k|4k|8k\n");
     }
 
+    printf("Starting client with quality: %s\n", quality);
     lnr_streaming_connect();
 
     struct frame *frame = NULL;
