@@ -43,7 +43,7 @@ The current implementations also assumes that the two supported plugins run on s
 * a network interface for the kernel UDP plugin (e.g., `enp0s5`)
 * a network interface for the DPDK plugin (e.g., `roce0`)
 
-where `enp0s3` and `enp0s8` can actually be the same interface, if no dedicated network is available.
+where `eno1` and `enp0s5` can actually be the same interface, if no dedicated network is available.
 
 **Currently, INSANE only runs on two physical machines.** We are working on a new version that will support multiple machines.
 
@@ -70,7 +70,7 @@ First, the INSANE runtime (nsnd) must be started. Then, applications can be star
 
 Launch the INSANE runtime. Because we are using DPDK in PA IOVA mode, the use of **sudo** is required. You should pass four arguments to the runtime, the local and remote IP addresses of the considered nodes on the DPDK and of the UDP (sk) networks.
 ```bash
-sudo ./nsnd [local_ip_dpdk] [dest_ip_dpdk] [local_ip_sk] [dest_ip_sk]
+sudo taskset -c 0-2 ./nsnd [local_ip_dpdk] [dest_ip_dpdk] [local_ip_sk] [dest_ip_sk]
 ```
 
 This daemon must be in execution in the same machine (or VM) of the applications that need acceleration.
@@ -112,9 +112,9 @@ A **latency test** can be performed by launching the ``nsn-perf`` applications o
 For instance:
 ```bash
 # On the server node
-sudo taskset -c 0,1 ./nsn-perf pong -s 64 -n 1000000 -q fast
+sudo taskset -c 0-2 ./nsn-perf pong -s 64 -n 1000000 -q fast
 # On the client node
-sudo taskset -c 0,1 ./nsn-perf ping -s 64 -n 1000000 -q fast
+sudo taskset -c 0-2 ./nsn-perf ping -s 64 -n 1000000 -q fast
 ```
 
 The output of the test is, on the client side, a set number that represent the Round-Trip Time, in microseconds, measured for each message sent and received back. In the paper, we used this number to generate the latency graphs in the microbenchmarking section.
@@ -124,9 +124,9 @@ A **throughput test** can be performed by launching the ``nsn-perf`` application
 For instance:
 ```bash
 # On the server node
-sudo taskset -c 0,1 ./nsn-perf sink -s 1024 -n 1000 -q fast
+sudo taskset -c 0-2 ./nsn-perf sink -s 1024 -n 1000 -q fast
 # On the client node
-sudo taskset -c 0,1 ./nsn-perf source -s 1024 -n 1000 -q fast
+sudo taskset -c 0-2 ./nsn-perf source -s 1024 -n 1000 -q fast
 ```
 
 The output of the test is, on the server side, first a human-readable summary of the results, and then a csv line that we used to generate the throughput graphs in the microbenchmarking section. For instance:
@@ -181,9 +181,9 @@ A **throughput test** can be performed by launching the ``lunar-perftest`` appli
 For instance, you can launch the latency test as:
 ```bash
 # On the server node
-sudo taskset -c 0,1 ./lunar-perftest subpub -s 64 -n 1000000 -q fast
+sudo taskset -c 0-2 ./lunar-perftest subpub -s 64 -n 1000000 -q fast
 # On the client node
-sudo taskset -c 0,1 ./lunar-perftest pubsub -s 64 -n 1000000 -q fast
+sudo taskset -c 0-2 ./lunar-perftest pubsub -s 64 -n 1000000 -q fast
 ```
 
 #### LUNAR Stream
@@ -209,7 +209,7 @@ Usage: apps/s-client [-q <quality>]
 ```
 For instance, to ask the server for a FullHD (1920x1080) image, you can run:
 ```bash
-sudo taskset -c 0,1 ./s-client -q fullhd
+sudo taskset -c 0-2 ./s-client -q fullhd
 ```
 
 After starting the client on one host, the server can be started on the other host. The server application takes the following arguments:
@@ -222,7 +222,7 @@ Usage: apps/s-server -i <filename> -f <frames> -r <rate_ms>
 ```
 In the [data](apps/lunar-streaming/data) folder, three examples images are already provided as samples that can be passed with the -i parameter. The -f parameter specifies the number of frames to send, whereas the -r parameter specifies the frame rate in milliseconds. For instance, to send 1000 frames at 500 FPS, you can run:
 ```bash
-sudo taskset -c 0,1 ./s-server -i data/test.jpg -f 1000 -r 2
+sudo taskset -c 0-2 ./s-server -i data/test.jpg -f 1000 -r 2
 ``` 
 
 To change the QoS parameters passed to INSANE, currenlty the application does not provide a command line interface. You must change the proper options at line 44 of the [```lunar_s.c```](apps/lunar-streaming/lunar_s.c) file and recompile the application.
@@ -242,7 +242,7 @@ These numbers, which are purely indicative, would correspond to an average 1.8ms
 
 To run on CloudLab, we suggest to select an hardware type that supports at least two experimental LANs, so that it is possible to test the same application with UDP/IP and DPDK. Please do not use the management network for the experiment traffic. To use DPDK, we tested our code with Mellanox hardware only, so please try to select a node with Mellanox NICs. 
 
-We performed our tests using the [d6515](https://docs.cloudlab.us/hardware.html) hardware, but others with similar characteristics should work as well. To ease the testing, we created a [CloudLab profile](https://www.cloudlab.us/show-profile.php?uuid=f548d0d5-4f15-11ed-994d-e4434b2381fc) that uses Ubuntu 22.04 and already has the network configured. 
+We performed our tests using the [d6515](https://docs.cloudlab.us/hardware.html) hardware, but others with similar characteristics should work as well. To ease the testing, we created a [CloudLab profile](https://www.cloudlab.us/show-profile.php?uuid=f548d0d5-4f15-11ed-994d-e4434b2381fc) for two node, configured to use Ubuntu 22.04 and with two suitable LANs already configured. 
 
 Once instantiated, you can proceed with the installation of the prerequisites (see the [Prerequisites](#prerequisites) section) and the build of the project (see the [Building the project](#building-the-project) section).
 
