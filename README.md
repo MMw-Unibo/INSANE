@@ -242,7 +242,7 @@ These numbers, which are purely indicative, would correspond to an average 1.8ms
 
 To run on CloudLab, we suggest to select an hardware type that supports at least two experimental LANs, so that it is possible to test the same application with UDP/IP and DPDK. Please do not use the management network for the experiment traffic. To use DPDK, we tested our code with Mellanox hardware only, so please try to select a node with Mellanox NICs. 
 
-We performed our tests using the [d6515](https://docs.cloudlab.us/hardware.html) hardware, but others with similar characteristics should work as well. To ease the testing, we created a [CloudLab profile](https://www.cloudlab.us/show-profile.php?uuid=f548d0d5-4f15-11ed-994d-e4434b2381fc) for two node, configured to use Ubuntu 22.04 and with two suitable LANs already configured. 
+We performed our tests using the [d6515](https://docs.cloudlab.us/hardware.html) hardware, but others with similar characteristics should work as well (e.g., c6525-100g). To ease the testing, we created a [CloudLab profile](https://www.cloudlab.us/p/INSANEProject/Ubuntu22.04-TwoLANs) for two nodes that use Ubuntu 22.04, with two suitable LANs already configured, and DPDK 22.11 already installed.  
 
 Once instantiated, you can proceed with the installation of the prerequisites (see the [Prerequisites](#prerequisites) section) and the build of the project (see the [Building the project](#building-the-project) section).
 
