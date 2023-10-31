@@ -35,8 +35,10 @@ First, it is necessary to prepare the environment by installing the prerequisite
 * CMake 3.0.0 or newer
 * DPDK 22.11 (other versions might require small code changes)
 
-If you are going to use INSANE in CloudLab, please have a look at the [CloudLab section](#running-on-cloudlab).\
 In this first version of the prototype, we require DPDK to start even if it is not used by the applications. Newer releases will remove this constraint.
+
+If you are going to use INSANE in CloudLab, please have a look at the [CloudLab section](#running-on-cloudlab) as we provide a ready-to-use profile with all the dependencies pre-installed. Otherwise, please look at the [DPDK installation script](scripts/install-dpdk.sh) to ease the installation of the prerequisites.
+
 
 The current implementations also assumes that the two supported plugins run on separate networks. Hence, your environment must have **at least two network interfaces**: one for the kernel UDP plugin and one for the DPDK plugin. Ideally, the UDP plugin should run on a dedicated network separate from the one used as the management network, but that is not a mandatory requirement. For example, to run the INSANE runtime you will need:
 * a network interface for the management network (e.g., `eno1`)
@@ -45,14 +47,21 @@ The current implementations also assumes that the two supported plugins run on s
 
 where `eno1` and `enp0s5` can actually be the same interface, if no dedicated network is available.
 
-**Currently, INSANE only runs on two physical machines.** We are working on a new version that will support multiple machines.
+#### Limitations
+
+* **Currently, INSANE only runs on two physical machines.** We are working on a new version that will support multiple machines.
+* We tested the code only with **Mellanox NICs**. NICs from other vendors might work, but it is possible that small code changes are required.
+
+We are working on removing these limitations in the next release.
 
 ### Environment setup
 
-Please prepare the enviroment for DPDK by enabling the hugepages: 
+Step 1. Please prepare the enviroment for DPDK by enabling the hugepages: 
 ```bash
 echo 2048 | sudo tee /sys/devices/system/node/node*/hugepages/hugepages-2048kB/nr_hugepages
 ```
+
+Step 2. This step is not necessary if a Mellanox NIC is used, as we reccommend. Otherwise, the NIC to be used with DPDK must be bound to the ```vfio-pci``` driver. Please follow the instruction from the [DPDK documentation](https://doc.dpdk.org/guides/tools/devbind.html).
 
 ### Building the project
 
@@ -242,7 +251,7 @@ These numbers, which are purely indicative, would correspond to an average 1.8ms
 
 To run on CloudLab, we suggest to select an hardware type that supports at least two experimental LANs, so that it is possible to test the same application with UDP/IP and DPDK. Please do not use the management network for the experiment traffic. To use DPDK, we tested our code with Mellanox hardware only, so please try to select a node with Mellanox NICs. 
 
-We performed our tests using the [d6515](https://docs.cloudlab.us/hardware.html) hardware, but others with similar characteristics should work as well (e.g., c6525-100g). To ease the testing, we created a [CloudLab profile](https://www.cloudlab.us/p/INSANEProject/Ubuntu22.04-TwoLANs) for two nodes that use Ubuntu 22.04, with two suitable LANs already configured, and DPDK 22.11 already installed.  
+We performed our tests using the [d6515](https://docs.cloudlab.us/hardware.html) hardware, but others with similar characteristics should work as well (e.g., c6525-100g). To ease the testing, we created a [CloudLab profile](https://www.cloudlab.us/p/INSANEProject/Ubuntu22.04-TwoLANs) for two nodes that use Ubuntu 22.04, with two suitable LANs already configured, and DPDK 22.11 already installed. If you use that image, we reccommend using the 192.168.0.0/16 network for DPDK and the 10.0.0.0/16 for kernel UDP. 
 
 Once instantiated, you can proceed with the installation of the prerequisites (see the [Prerequisites](#prerequisites) section) and the build of the project (see the [Building the project](#building-the-project) section).
 
