@@ -52,6 +52,8 @@ where `eno1` and `enp0s5` can actually be the same interface, if no dedicated ne
 * **Currently, INSANE only runs on two physical machines.** We are working on a new version that will support multiple machines.
 * We tested the code only with **Mellanox NICs**. NICs from other vendors might work, but it is possible that small code changes are required.
 
+To check whether the device is using the Mellanox driver, please run the command `dpdk-devbind.py` and check that the interface that will be used with DPDK (e.g., `roce0`) is bound to either the `mlx5_core` or the `mlx4_core` driver.
+
 We are working on removing these limitations in the next release.
 
 ### Environment setup
@@ -251,10 +253,19 @@ These numbers, which are purely indicative, would correspond to an average 1.8ms
 
 To run on CloudLab, we suggest to select an hardware type that supports at least two experimental LANs, so that it is possible to test the same application with UDP/IP and DPDK. Please do not use the management network for the experiment traffic. To use DPDK, we tested our code with Mellanox hardware only, so please try to select a node with Mellanox NICs. 
 
-We performed our tests using the [d6515](https://docs.cloudlab.us/hardware.html) hardware, but others with similar characteristics should work as well (e.g., c6525-100g). To ease the testing, we created a [CloudLab profile](https://www.cloudlab.us/p/INSANEProject/Ubuntu22.04-TwoLANs) for two nodes that use Ubuntu 22.04, with two suitable LANs already configured, and DPDK 22.11 already installed. If you use that image, we reccommend using the 192.168.0.0/16 network for DPDK and the 10.0.0.0/16 for kernel UDP. 
+We performed our tests using the [d6515](https://docs.cloudlab.us/hardware.html) hardware, but others with similar characteristics should work as well (e.g., c6525-100g, c6525-25g, r7525). To ease the testing, we created a [CloudLab profile](https://www.cloudlab.us/p/INSANEProject/Ubuntu22.04-TwoLANs) for two nodes that use Ubuntu 22.04, with two suitable LANs already configured, and DPDK 22.11 already installed. If you use that image, we reccommend using the 192.168.0.0/16 network for DPDK and the 10.0.0.0/16 for kernel UDP. 
 
 Once instantiated, you can proceed with the installation of the prerequisites (see the [Prerequisites](#prerequisites) section) and the build of the project (see the [Building the project](#building-the-project) section).
 
+A second important note is that on CloudLab it is possible that DPDK, by default, gets ownership of all the Mellanox cards on the machine. If that includes the management interface (used for ssh), access to the node is lost. To avoid this behavior, there is a simple workaround:
+1. Get the PCI address of the interface used for DPDK interface (e.g., `roce0` in our previous example) by running the command `dpdk-devbind --status`.
+2. When launching the INSANE runtime and applications, pass this address as an environment variable `DPDK_PCI`. E.g.:
+
+```bash
+sudo DPDK_PCI=<pci_addr> taskset -c 0-2 ./nsnd [local_ip_dpdk] [dest_ip_dpdk] [local_ip_sk] [dest_ip_sk]
+```
+
+We have prepared a step-by-step guide to run INSANE on CloudLab, that is available [here](docs/Cloudlab-detailed-guide.pdf).
 
 ## Running on Azure
 

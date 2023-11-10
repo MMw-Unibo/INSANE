@@ -30,13 +30,22 @@ static u32                n_sources = 0;
 
 //--------------------------------------------------------------------------------------------------
 int nsn_init() {
-    int   argc = 2;
+    int   argc = 4;
     char *argv[argc];
     argv[0] = (char *)calloc(ARG_LENGTH, sizeof(char));
     argv[1] = (char *)calloc(ARG_LENGTH, sizeof(char));
+    argv[2] = (char *)calloc(ARG_LENGTH, sizeof(char));
+    argv[3] = (char *)calloc(ARG_LENGTH, sizeof(char));
 
     strncpy(argv[0], app_name, ARG_LENGTH);
     strncpy(argv[1], proc_type, ARG_LENGTH);
+
+    if (getenv("DPDK_PCI")) {
+        strncpy(argv[2], "-a", ARG_LENGTH);
+        strncpy(argv[3], getenv("DPDK_PCI"), ARG_LENGTH);
+    } else {
+        argc = 2;
+    }
 
     /* Init the DPDK environment*/
     i32 ret = rte_eal_init(argc, argv);
@@ -160,7 +169,8 @@ nsn_sink_t nsn_create_sink(nsn_stream_t *stream, int64_t source_id, handle_data_
     // preference, but also on the specific technologies available at deployment site. Like:
     // getMPTfromQoS()?
     if (stream->options.datapath == datapath_fast &&
-        stream->options.consumption == consumption_high) {
+        stream->options.consumption == consumption_high)
+    {
         sinks[new_sink_id].mptype = mempool_dpdk;
     } else {
         sinks[new_sink_id].mptype = mempool_socket;

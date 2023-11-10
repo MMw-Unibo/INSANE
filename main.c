@@ -35,6 +35,8 @@
 #define RX_BURST_SIZE   MAX_PKT_BURST_RX
 #define TX_BURST_SIZE   64
 
+#define ARG_LENGTH 64
+
 #define ETHERNET_P_LOOP  0x0060 /* Ethernet Loopback packet	*/
 #define ETHERNET_P_TSN   0x22F0 /* TSN (IEEE 1722) packet	*/
 #define ETHERNET_P_IP    0x0800 /* Internet Protocol packet	*/
@@ -918,11 +920,21 @@ int main(int argc, char *argv[]) {
 
     // Start DPDK library to get their ring.
     // TODO: change me back
-    const char *rte_args[] = {
-        "-l",
-        "0,1",
-    };
-    ret = rte_eal_init(2, rte_args);
+    int   eal_argc = 4;
+    char *eal_argv[eal_argc];
+    eal_argv[0] = (char *)calloc(ARG_LENGTH, sizeof(char));
+    eal_argv[1] = (char *)calloc(ARG_LENGTH, sizeof(char));
+    eal_argv[2] = (char *)calloc(ARG_LENGTH, sizeof(char));
+    eal_argv[3] = (char *)calloc(ARG_LENGTH, sizeof(char));
+    strncpy(eal_argv[0], "-l", ARG_LENGTH);
+    strncpy(eal_argv[1], "0,1", ARG_LENGTH);
+    if (getenv("DPDK_PCI")) {
+        strncpy(eal_argv[2], "-a", ARG_LENGTH);
+        strncpy(eal_argv[3], getenv("DPDK_PCI"), ARG_LENGTH);
+    } else {
+        eal_argc = 2;
+    }
+    ret = rte_eal_init(eal_argc, eal_argv);
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "error with EAL initialization\n");
     }
