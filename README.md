@@ -10,15 +10,18 @@ To get details about the system, read our paper in Middleware '23. If you use IN
 ```bibtex
 @inproceedings{insane,
 author = {Rosa, Lorenzo and Garbugli, Andrea and Corradi, Antonio and Bellavista, Paolo},
-title = {INSANE: A Unified Middleware for QoS-aware Network Acceleration in Edge Cloud Computing},
+title = {INSANE: A Unified Middleware for QoS-Aware Network Acceleration in Edge Cloud Computing},
 year = {2023},
+isbn = {9798400701771},
 publisher = {Association for Computing Machinery},
 address = {New York, NY, USA},
 url = {https://doi.org/10.1145/3590140.3629105},
 doi = {10.1145/3590140.3629105},
-booktitle = {Proceedings of the 24th ACM/IFIP International Middleware Conference},
-pages = {14},
-location = {Bologna, Italy},
+booktitle = {Proceedings of the 24th International Middleware Conference},
+pages = {57–70},
+numpages = {14},
+keywords = {QoS, Edge Cloud, Network Acceleration},
+location = {<conf-loc>, <city>Bologna</city>, <country>Italy</country>, </conf-loc>},
 series = {Middleware '23}
 }
 ```
