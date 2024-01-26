@@ -45,7 +45,7 @@ nsn_shm_alloc(const char *name, usize size)
 
     result = buffer;
     memory_zero_struct(result);
-    strncpy(result->name, name, NSN_SHM_NAME_MAX);
+    strncpy(result->name, name, NSN_SHM_NAME_MAX - 1);
     result->base = buffer;
     result->size = size;
     result->used = sizeof(struct nsn_shm);

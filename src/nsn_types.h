@@ -86,6 +86,7 @@ typedef atomic_uint_fast64_t    atu64;
 
 #define array_count(a) (sizeof(a) / sizeof((a)[0]))
 
+#define memory_copy(dst, src, size) memcpy(dst, src, size)
 #define memory_zero(ptr, size)      memset(ptr, 0, size)
 #define memory_zero_struct(ptr)     memory_zero(ptr, sizeof(*(ptr)))
 #define memory_zero_array(ptr)      memory_zero(ptr, sizeof((ptr)[0]) * array_count(ptr))
@@ -97,5 +98,58 @@ typedef atomic_uint_fast64_t    atu64;
 static inline usize align_to(usize value, usize alignment)   { return (value + (alignment - 1)) & ~(alignment - 1); }
 static inline usize align_down(usize value, usize alignment) { return value & ~(alignment - 1); }
 static inline bool  is_power_of_two(usize value)             { return (value & (value - 1)) == 0; }
+
+// --- Time --------------------------------------------------------------------
+#define NSEC_PER_SEC    1000000000ULL
+#define USEC_PER_SEC    1000000ULL
+#define MSEC_PER_SEC    1000ULL
+
+#define nsec_to_sec(nsec)   ((nsec) / NSEC_PER_SEC)
+#define nsec_to_msec(nsec)  ((nsec) / (NSEC_PER_SEC / MSEC_PER_SEC))
+#define nsec_to_usec(nsec)  ((nsec) / (NSEC_PER_SEC / USEC_PER_SEC))
+
+// --- Collections Helpers -----------------------------------------------------
+
+typedef struct list_head list_head;
+struct list_head
+{
+    list_head *next;
+    list_head *prev;
+};
+
+#define list_head_init(name)        ((list_head){ &(name), &(name) })
+#define list_head(name)             list_head name = list_head_init(name)
+
+static inline void list_add(list_head *h, list_head *n)         { n->next = h->next; n->prev = h; h->next->prev = n; h->next = n; }
+static inline void list_add_tail(list_head *h, list_head *n)    { n->next = h; n->prev = h->prev; h->prev->next = n; h->prev = n; }
+static inline bool list_empty(list_head *h)                     { return h->next == h; }
+
+#ifndef typeof
+#define typeof __typeof__
+#endif
+#ifndef offsetof
+#define offsetof(type, member)                  ((size_t) &((type *)0)->member)
+#endif
+#ifndef container_of
+#define container_of(ptr, type, member)         ((type *)((char *)(ptr)-offsetof(type, member)))
+#endif
+#define list_entry(ptr, type, member)           container_of(ptr, type, member)
+#define list_first_entry(ptr, type, member)     list_entry((ptr)->next, type, member)
+#define list_last_entry(ptr, type, member)      list_entry((ptr)->prev, type, member)
+#define list_for_each(pos, head)                for (pos = (head)->next; pos != (head); pos = pos->next)
+#define list_for_each_safe(pos, n, head)        for (pos = (head)->next, n = pos->next; pos != (head); pos = n, n = pos->next)
+#define list_next_entry(pos, member)            list_entry((pos)->member.next, typeof(*(pos)), member)
+#define list_for_each_entry(pos, head, member)  for (pos = list_first_entry(head, typeof(*pos), member); &pos->member != (head); pos = list_entry(pos->member.next, typeof(*pos), member))
+
+#define nsn_list_push(head, tail, node) \
+    do {                                \
+        if (head == NULL) {             \
+            head = tail = node;         \
+        } else {                        \
+            tail->next = node;          \
+            tail = node;                \
+            node->next = NULL;          \
+        }                               \
+    } while (0)
 
 #endif // NSN_TYPES_H

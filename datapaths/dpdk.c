@@ -16,15 +16,15 @@ NSN_DATAPATH_INIT(dpdk)
     nsn_unused(ctx);
     char *rte_argv[] = {
         "nsnd_dpdk",
-        "-c 0x1",
-        "-n 4",
+        "-c", "0x1",
+        "-n", "4",
         "--proc-type=auto",
     };
 
     size_t rte_argc = array_count(rte_argv);
     int result = rte_eal_init(rte_argc, rte_argv);
 
-    log_debug("rte_eal_init: %d", result);
+    printf("#### rte_eal_init: %d\n", result);
 
     direct_pool = rte_pktmbuf_pool_create("direct_pool", 10240, 64, 0,
                                           RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());

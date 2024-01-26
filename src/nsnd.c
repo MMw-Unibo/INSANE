@@ -1,22 +1,21 @@
 // --- gax: Includes -----------------------------------------------------------
-#include "nsn_types.h"
 #include "nsn_arena.h"
-#include "nsn_ipc.h"
+#include "nsn_config.h"
 #include "nsn_datapath.h"
+#include "nsn_ipc.h"
 #include "nsn_shm.h"
+#include "nsn_string.h"
+#include "nsn_types.h"
 
 #define NSN_LOG_IMPLEMENTATION_H
 #include "nsn_log.h"
 
 // --- gax: c files ------------------------------------------------------------
 #include "nsn_arena.c"
+#include "nsn_config.c"
+#include "nsn_os_inc.c"
 #include "nsn_shm.c"
-
-#if defined(__linux__)
-# include "nsn_os_linux.c"
-#else
-# error "Unsupported platform"
-#endif
+#include "nsn_string.c"
 
 // #include "nsn_thread_pool.c"
 
@@ -102,6 +101,15 @@ struct datapath_ops
     nsn_datapath_deinit *deinit;
 };
 
+
+int instance_id = 0;
+bool is_main_thread = false;
+// nsn_thread_local nsn_thread_ctx *thread_ctx = NULL;
+struct nsn_arena *scratch_arena = NULL;
+
+string8_list arg_list = {0};
+nsn_config *config = NULL;
+
 int 
 main(int argc, char *argv[])
 {
@@ -111,6 +119,32 @@ main(int argc, char *argv[])
     logger_init(NULL);
     logger_set_level(LOGGER_LEVEL_DEBUG);
 
+    instance_id    = nsn_os_get_process_id();
+    is_main_thread = true;
+    scratch_arena  = nsn_arena_alloc(gigabytes(1));
+
+    for (int i = 0; i < argc; i++)
+        str8_list_push(scratch_arena, &arg_list, str8_cstr(argv[i]));
+
+    string8 config_filename = str8_lit("nsnd.cfg");
+    for (string8_node *node = arg_list.head; node; node = node->next) {
+        if (str8_match(str8_lit("--config"), node->string) || str8_match(str8_lit("-c"), node->string)) {
+            if (node->next) {
+                config_filename = node->next->string;
+            }
+        }
+    }
+
+    config = nsn_load_config(scratch_arena, config_filename);
+    if (!config) {
+        log_error("Failed to load config file: %*.s\n", str8_arg(config_filename));
+        exit(1);
+    }
+ 
+    log_debug("instance id: %d\n", instance_id);
+
+    struct nsn_arena *arena = nsn_arena_alloc(gigabytes(1));
+
     // init SIG_INT handler
     struct sigaction sa;
     memory_zero_struct(&sa);
@@ -118,8 +152,7 @@ main(int argc, char *argv[])
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
 
-    struct nsn_arena *arena = nsn_arena_alloc(gigabytes(1));
-
+ 
     int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         log_error("Failed to open socket: %s\n", strerror(errno));
@@ -140,6 +173,12 @@ main(int argc, char *argv[])
     // set the socket to non-blocking
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+
+    struct nsn_shm *shm = nsn_shm_alloc("nsn_datamem", kilobytes(4) * 1024);
+    if (!shm) {
+        log_error("Failed to create shared memeory\n");
+        exit(1);
+    }
 
     // while (g_running) 
     // {
@@ -170,49 +209,47 @@ main(int argc, char *argv[])
 
     // }
 
-    struct nsn_shm *shm = nsn_shm_alloc("nsn_datamem", kilobytes(4) * 1024);
-    if (!shm) {
-        log_error("Failed to create shared memeory\n");
-        exit(1);
+
+    // struct nsn_os_module module = nsn_os_load_library("./datapaths/libdpdk.so", 0);
+    // if (module.handle == NULL) {
+    //     log_error("Failed to load library: %s\n", strerror(errno));
+    //     // return -1;
+    // }
+
+    // // TODO: dpdk example, in the final code the string "dpdk" should be replaced by the name of the datapath
+    // // and has to be done in a parameterized way. 
+    // struct datapath_ops ops = {
+    //     .init   = (nsn_datapath_init*)  nsn_os_get_proc_address(module, "dpdk_datapath_init"),
+    //     .tx     = (nsn_datapath_tx*)    nsn_os_get_proc_address(module, "dpdk_datapath_tx"),
+    //     .deinit = (nsn_datapath_deinit*)nsn_os_get_proc_address(module, "dpdk_datapath_deinit"),
+    // };
+
+    // void *rawdata = nsn_shm_rawdata(shm);
+    // log_debug("%p == %p", (void*)shm->base, rawdata);
+
+    // struct nsn_datapath_ctx ctx = {
+    //     .running          = 1,
+    //     .data_memory      = rawdata,
+    //     .data_memory_size = nsn_shm_size(shm),
+    // };
+
+    // log_debug("init: %d\n", ops.init(&ctx));
+    // log_debug("tx: %d\n", ops.tx(NULL));
+
+    while (g_running) {
+        sleep(1);
+        printf("simulating work\n");
+        sleep(1);
     }
 
-    struct nsn_os_module module = nsn_os_load_library("./datapaths/libdpdk.so", 0);
-    if (module.handle == NULL) {
-        log_error("Failed to load library: %s\n", strerror(errno));
-        // return -1;
-    }
-
-    // TODO: dpdk example, in the final code the string "dpdk" should be replaced by the name of the datapath
-    // and has to be done in a parameterized way. 
-    struct datapath_ops ops = {
-        .init   = nsn_os_get_proc_address(module, "dpdk_datapath_init"),
-        .tx     = nsn_os_get_proc_address(module, "dpdk_datapath_tx"),
-        .deinit = nsn_os_get_proc_address(module, "dpdk_datapath_deinit"),
-    };
-
-    void *rawdata = nsn_shm_rawdata(shm);
-    log_debug("%p == %p", (void*)shm->base, rawdata);
-
-    struct nsn_datapath_ctx ctx = {
-        .running          = 1,
-        .data_memory      = rawdata,
-        .data_memory_size = nsn_shm_size(shm),
-    };
-
-    log_debug("init: %d\n", ops.init(&ctx));
-    log_debug("tx: %d\n", ops.tx(NULL));
-
-    sleep(1);
-    printf("simulating work\n");
-    sleep(1);
-    log_debug("deinit: %d\n", ops.deinit(NULL));
-
-    nsn_os_unload_library(module);
+    // log_debug("deinit: %d\n", ops.deinit(NULL));
+    // nsn_os_unload_library(module);
 
     // cleanup
     close(sockfd);
     unlink(REQUEST_IPC_PATH);
     nsn_shm_release(shm);
+    nsn_arena_release(scratch_arena);
     nsn_arena_release(arena);
 
     log_debug("done\n");

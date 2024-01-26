@@ -1,0 +1,220 @@
+#include "string.h"
+
+// --- Helpers -----------------------------------------------------------------
+usize 
+calc_cstr_len(char *cstr)
+{
+    usize len = 0;
+    while (*cstr++) len++;
+    return len;
+}
+
+int 
+str8_contains(string8 string, string8 match)
+{
+    if (match.len > string.len) return -1;
+
+    int occurence = 0;
+    for (usize i = 0; i < string.len; i++) {
+        if (string.data[i] == match.data[0]) {
+            bool match_found = true;
+            for (usize j = 0; j < match.len; j++) {
+                if (string.data[i + j] != match.data[j]) {
+                    match_found = false;
+                    break;
+                }
+            }
+
+            if (match_found) {
+                occurence += 1;
+                i += match.len - 1;
+            }
+        }
+    }
+
+    return occurence;
+}
+
+usize 
+str8_index_of_first(string8 string, string8 match)
+{
+    if (match.len > string.len) return -1;
+
+    for (usize i = 0; i < string.len; i++) {
+        if (string.data[i] == match.data[0]) {
+            bool match_found = true;
+            for (usize j = 0; j < match.len; j++) {
+                if (string.data[i + j] != match.data[j]) {
+                    match_found = false;
+                    break;
+                }
+            }
+
+            if (match_found) return i;
+        }
+    }
+
+    return -1;
+}
+
+string8 
+str8_trim_start(string8 string)
+{
+    usize offset = 0;
+    while (char_is_whitespace(string.data[offset])) offset++;
+    return substring8(string, offset, string.len);
+}
+
+string8 
+str8_trim_end(string8 string)
+{
+    usize offset = string.len - 1;
+    while (char_is_whitespace(string.data[offset])) offset--;
+    return substring8(string, 0, offset + 1);
+}
+
+string8 
+str8_trim(string8 string)
+{
+    return str8_trim_start(str8_trim_end(string));
+}
+
+// --- Numbers
+f64 
+f64_from_str8(string8 value)
+{
+    char str[64] = {0};
+    usize len    = value.len;
+    if (len > sizeof(str) - 1) len = sizeof(str) - 1;
+    memory_copy(str, value.data, len);
+    str[len] = '\0';
+    return atof(str);
+}
+
+// --- Constructors ------------------------------------------------------------
+string8 
+str8(char *cstr, usize len)
+{
+    string8 str = {0};
+    str.data = (u8 *)cstr;
+    str.len  = len;
+    return str;
+}
+
+string8 
+substring8(string8 string, usize start, usize end)
+{
+    usize min = start;
+    usize max = end;
+    if (min > string.len) min = string.len;
+    if (max > string.len) max = string.len;
+    if (min > max) {
+        usize tmp = min;
+        min = max;
+        max = tmp;
+    }
+
+    string8 sub = {0};
+    sub.data = string.data + min;
+    sub.len  = max - min;
+    return sub;
+}
+
+string8_list 
+str8_split(nsn_arena *arena, string8 string, string8 *delimiters, usize delimiter_count)
+{
+    string8_list list  = {0};
+    string8_node *node = NULL;
+    string8 sub        = {0};
+    usize start            = 0;
+    usize end              = 0;
+
+    for (usize i = 0; i < string.len; i++) {
+        for (usize j = 0; j < delimiter_count; j++) {
+            if (string.data[i] == delimiters[j].data[0]) {
+                end = i;
+                if (start != end) {
+                    sub          = substring8(string, start, end);
+                    node         = nsn_arena_push_struct(arena, string8_node);
+                    node->string = sub;
+                    str8_list_push_node(&list, node);
+                }
+                
+                start = i + 1;
+            }
+        }
+    }
+
+    if (start < string.len) {
+        sub          = substring8(string, start, string.len);
+        node         = nsn_arena_push_struct(arena, string8_node);
+        node->string = sub;
+        str8_list_push_node(&list, node);
+    }
+
+    return list;
+}
+
+
+// --- Comparisons -------------------------------------------------------------
+bool
+str8_match(string8 string, string8 match)
+{
+    if (string.len != match.len) return false;
+    for (usize i = 0; i < string.len; i++) {
+        if (string.data[i] != match.data[i]) return false;
+    }
+
+    return true;
+}
+
+bool 
+str8_match_one_of(string8 string, string8 *matches, usize match_count)
+{
+    for (usize i = 0; i < match_count; i++) {
+        if (str8_match(string, matches[i])) return true;
+    }
+
+    return false;
+}
+
+
+bool 
+str8_starts_with(string8 string, string8 prefix)
+{
+    if (prefix.len > string.len) return false;
+    for (usize i = 0; i < prefix.len; i++) {
+        if (string.data[i] != prefix.data[i]) return false;
+    }
+
+    return true;
+}
+
+bool 
+str8_ends_with(string8 string, string8 suffix)
+{
+    if (suffix.len > string.len) return false;
+    for (usize i = 0; i < suffix.len; i++) {
+        if (string.data[string.len - suffix.len + i] != suffix.data[i]) return false;
+    }
+
+    return true;
+}
+
+// --- String Collections ------------------------------------------------------
+
+void
+str8_list_push_node(string8_list *list, string8_node *node)
+{
+    nsn_list_push(list->head, list->tail, node);
+    list->count += 1;
+    list->size  += node->string.len;
+}
+
+void 
+str8_list_push(nsn_arena *arena, string8_list *list, string8 string)
+{
+    string8_node *node = nsn_arena_push_struct(arena, string8_node);
+    node->string = string;
+    str8_list_push_node(list, node);
+}

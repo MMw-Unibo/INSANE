@@ -2,8 +2,8 @@
 #define NSN_ARENA_H
 
 #include "nsn_types.h"
-#include "nsn_os.h"
 
+typedef struct nsn_arena nsn_arena;
 struct nsn_arena {
     struct nsn_arena *base;
 

@@ -1,5 +1,14 @@
 #include "nsn_os.h"
 
+// --- Time --------------------------------------------------------------------
+i64 
+nsn_os_get_time_ns(void)
+{
+    struct timespec ts = {0};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (i64)ts.tv_sec * 1000000000 + (i64)ts.tv_nsec;
+}
+
 // --- Library -----------------------------------------------------------------
 
 struct nsn_os_module
@@ -110,5 +119,59 @@ nsn_os_conditional_variable_init(struct nsn_conditional_variable *cv)
     pthread_condattr_init(&attr);
     int result = pthread_cond_init(&cv->handle, &attr);
     pthread_condattr_destroy(&attr);
+    return result;
+}
+
+// --- File --------------------------------------------------------------------
+struct nsn_file
+nsn_os_file_open(string8 filename, enum nsn_file_flag flags)
+{
+    int mode = 0;
+    if (flags & NsnFileFlag_Read) {
+        mode |= O_RDONLY;
+    }
+    if (flags & NsnFileFlag_Write) {
+        mode |= O_WRONLY;
+    }
+    if (flags & NsnFileFlag_Create) {
+        mode |= O_CREAT;
+    }
+    if (flags & NsnFileFlag_Truncate) {
+        mode |= O_TRUNC;
+    }
+    if (flags & NsnFileFlag_Append) {
+        mode |= O_APPEND;
+    }
+
+    struct nsn_file result = {0};
+    result.handle = open((const char *)filename.data, mode, 0644);
+    return result;
+}
+
+bool 
+nsn_file_valid(struct nsn_file file)
+{
+    return file.handle != -1;
+}
+
+
+string8 
+nsn_os_read_entire_file(struct nsn_arena *arena, struct nsn_file file)
+{
+    string8 result = {0};
+
+    struct stat file_stat = {0};
+    if (fstat(file.handle, &file_stat) == -1) {
+        return result;
+    }
+
+    result.len  = file_stat.st_size;
+    result.data = nsn_arena_push_array(arena, u8, result.len);
+
+    if ((usize)read(file.handle, result.data, result.len) != result.len) {
+        result.data = NULL;
+        result.len  = 0;
+    }
+
     return result;
 }

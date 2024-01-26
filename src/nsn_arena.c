@@ -1,4 +1,15 @@
 #include "nsn_arena.h"
+#include "nsn_os_inc.h"
+
+#if !defined(arena_impl_reserve)
+#error arena_impl_reserve must be defined to use base memory.
+#endif
+#if !defined(arena_impl_release)
+#error arena_impl_release must be defined to use base memory.
+#endif
+#if !defined(arena_impl_commit)
+#error arena_impl_commit must be defined to use base memory.
+#endif
 
 struct nsn_arena *
 nsn_arena_alloc_with_alignement(usize size, usize align)
@@ -6,7 +17,7 @@ nsn_arena_alloc_with_alignement(usize size, usize align)
     usize aligned_size = align_to(size, NSN_ARENA_DEFAULT_GRANULARITY);
     printf("aligned_size: %zu\n", aligned_size);
     
-    void *base = nsn_os_reserve_memory(aligned_size, NsnOsMemoryFlag_Anonymous | NsnOsMemoryFlag_Private);
+    void *base = arena_impl_reserve(aligned_size, NsnOsMemoryFlag_Anonymous | NsnOsMemoryFlag_Private);
     assert(base && "Failed to allocate memory");
     assert(NSN_ARENA_DEFAULT_COMMIT_GRANULARITY >= sizeof(struct nsn_arena) && "Commit granularity must be greater than the size of the arena header");
     nsn_os_commit_memory(base, NSN_ARENA_DEFAULT_COMMIT_GRANULARITY);
@@ -24,7 +35,7 @@ nsn_arena_alloc_with_alignement(usize size, usize align)
 void 
 nsn_arena_release(struct nsn_arena *arena)
 {
-    nsn_os_release_memory(arena->base, arena->size);
+    arena_impl_release(arena->base, arena->size);
 }
 
 void *
@@ -44,7 +55,7 @@ nsn_arena_push_no_zero(struct nsn_arena *arena, usize size)
             // align the size to commit to a multiple of the granularity
             usize commit_size = arena->pos - arena->com_pos;
             commit_size       = align_to(commit_size, NSN_ARENA_DEFAULT_COMMIT_GRANULARITY);
-            nsn_os_commit_memory(base + arena->com_pos, commit_size);
+            arena_impl_commit(base + arena->com_pos, commit_size);
             arena->com_pos   += commit_size;
         }
     }

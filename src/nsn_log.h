@@ -215,7 +215,7 @@ logger_log(int level, char *fmt, ...)
     buflen += vsnprintf(buf + buflen, sizeof(buf) - buflen, fmt, args);
 
     FILE *file = s_config.filename ? s_logger.file : stderr;
-    fprintf(file, "%s\n", buf);
+    fprintf(file, "%s", buf);
 
     va_end(args);
 }

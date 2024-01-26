@@ -1,7 +1,12 @@
 #ifndef NSN_OS_H
 #define NSN_OS_H
 
+#include "nsn_arena.h"
+#include "nsn_string.h"
 #include "nsn_types.h"
+
+// --- Time --------------------------------------------------------------------
+i64 nsn_os_get_time_ns(void);
 
 // --- Library -----------------------------------------------------------------
 struct nsn_os_module
@@ -92,5 +97,28 @@ struct nsn_conditional_variable
 int nsn_os_conditional_variable_create(struct nsn_conditional_variable *cv);
 
 // --- File --------------------------------------------------------------------
+
+struct nsn_file
+{
+#if NSN_OS_LINUX
+    int handle;
+#else
+# error "Unsupported operating system"
+#endif
+};
+
+enum nsn_file_flag {
+    NsnFileFlag_None     = 0,
+    NsnFileFlag_Read     = 1 << 0,
+    NsnFileFlag_Write    = 1 << 1,
+    NsnFileFlag_Create   = 1 << 2,
+    NsnFileFlag_Truncate = 1 << 3,
+    NsnFileFlag_Append   = 1 << 4,
+};
+
+struct nsn_file nsn_os_file_open(string8 filename, enum nsn_file_flag flags);
+bool nsn_file_valid(struct nsn_file file);
+string8 nsn_os_read_entire_file(nsn_arena *arena, struct nsn_file file);
+void nsn_os_file_close(struct nsn_file file);
 
 #endif // NSN_OS_H

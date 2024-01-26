@@ -26,7 +26,6 @@
 //     // nsn_ioctx_socket_t socket_ctx;
 // };
 
-
 int 
 nsn_init()
 {
@@ -44,6 +43,7 @@ nsn_init()
     // send a message to the daemon to create a new instance
     struct nsn_temp_arena temp = nsn_temp_arena_begin(arena);
     byte *msg = nsn_arena_push_array(temp.arena, byte, 1024);
+
     struct nsn_request *req = (struct nsn_request *)msg;
     req->type = nsn_msg_type_connect;
     req->id   = nsn_os_get_process_id();

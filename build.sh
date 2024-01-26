@@ -17,6 +17,8 @@ if [ $BUILD_TYPE = "debug" ]; then
     CFLAGS="$CFLAGS -g"
     DEFINES="$DEFINES -DDEBUG -DNSN_ENABLE_LOGGER"
 elif [ $BUILD_TYPE = "release" ]; then
+    # Maybe remove the NSN_ENABLE_LOGGER define in release builds
+    DEFINES="$DEFINES -DDEBUG -DNSN_ENABLE_LOGGER"
     CFLAGS="$CFLAGS -O3"
 else
     echo "Invalid build type: $BUILD_TYPE"
