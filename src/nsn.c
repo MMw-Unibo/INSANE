@@ -1,7 +1,7 @@
 #include "nsn.h"
 
 #include "nsn_types.h"
-#include "nsn_arena.h"
+#include "nsn_memory.h"
 #include "nsn_ipc.h"
 
 // struct nsn_app_context
@@ -29,7 +29,7 @@
 int 
 nsn_init()
 {
-    struct nsn_arena *arena = nsn_arena_alloc_default();
+    struct mem_arena *arena = mem_arena_alloc_default();
     // open a connection with the insance of the nsn daemon
     int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (sockfd < 0) {
@@ -41,19 +41,19 @@ nsn_init()
     strncpy(addr.sun_path, REQUEST_IPC_PATH, sizeof(addr.sun_path) - 1);
 
     // send a message to the daemon to create a new instance
-    struct nsn_temp_arena temp = nsn_temp_arena_begin(arena);
-    byte *msg = nsn_arena_push_array(temp.arena, byte, 1024);
+    struct temp_mem_arena temp = temp_mem_arena_begin(arena);
+    byte *msg = mem_arena_push_array(temp.arena, byte, 1024);
 
     struct nsn_request *req = (struct nsn_request *)msg;
     req->type = nsn_msg_type_connect;
     req->id   = nsn_os_get_process_id();
 
     sendto(sockfd, msg, sizeof(struct nsn_request), 0, (struct sockaddr *)&addr, sizeof(struct sockaddr_un));
-    nsn_temp_arena_end(temp);
+    temp_mem_arena_end(temp);
 
     // wait for the daemon to respond with the instance id
     // return ok or error
 
-    nsn_arena_release(arena);
+    mem_arena_release(arena);
     return 0;
 }

@@ -1,4 +1,4 @@
-#include "nsn_arena.h"
+#include "nsn_memory.h"
 #include "nsn_os_inc.h"
 
 #if !defined(arena_impl_reserve)
@@ -11,21 +11,21 @@
 #error arena_impl_commit must be defined to use base memory.
 #endif
 
-struct nsn_arena *
-nsn_arena_alloc_with_alignement(usize size, usize align)
+struct mem_arena *
+mem_arena_alloc_with_alignement(usize size, usize align)
 {
     usize aligned_size = align_to(size, NSN_ARENA_DEFAULT_GRANULARITY);
     printf("aligned_size: %zu\n", aligned_size);
     
     void *base = arena_impl_reserve(aligned_size, NsnOsMemoryFlag_Anonymous | NsnOsMemoryFlag_Private);
     assert(base && "Failed to allocate memory");
-    assert(NSN_ARENA_DEFAULT_COMMIT_GRANULARITY >= sizeof(struct nsn_arena) && "Commit granularity must be greater than the size of the arena header");
+    assert(NSN_ARENA_DEFAULT_COMMIT_GRANULARITY >= sizeof(struct mem_arena) && "Commit granularity must be greater than the size of the arena header");
     nsn_os_commit_memory(base, NSN_ARENA_DEFAULT_COMMIT_GRANULARITY);
 
-    struct nsn_arena *arena = base;
+    struct mem_arena *arena = base;
     arena->base    = base;
     arena->size    = aligned_size;
-    arena->pos     = sizeof(struct nsn_arena);
+    arena->pos     = sizeof(struct mem_arena);
     arena->com_pos = NSN_ARENA_DEFAULT_COMMIT_GRANULARITY;
     arena->align   = align;
 
@@ -33,13 +33,13 @@ nsn_arena_alloc_with_alignement(usize size, usize align)
 }
 
 void 
-nsn_arena_release(struct nsn_arena *arena)
+mem_arena_release(struct mem_arena *arena)
 {
     arena_impl_release(arena->base, arena->size);
 }
 
 void *
-nsn_arena_push_no_zero(struct nsn_arena *arena, usize size)
+mem_arena_push_no_zero(struct mem_arena *arena, usize size)
 {
     void *ptr = NULL;
     // calculate the aligned position
@@ -68,33 +68,33 @@ nsn_arena_push_no_zero(struct nsn_arena *arena, usize size)
 }
 
 void *
-nsn_arena_push(struct nsn_arena *arena, usize size)
+mem_arena_push(struct mem_arena *arena, usize size)
 {
-    void *ptr = nsn_arena_push_no_zero(arena, size);
+    void *ptr = mem_arena_push_no_zero(arena, size);
     memory_zero(ptr, size);
     return ptr;
 }
 
 void 
-nsn_arena_pop(struct nsn_arena *arena, usize size)
+mem_arena_pop(struct mem_arena *arena, usize size)
 {
     arena->pos -= size;
 }
 
 void
-nsn_arena_clear(struct nsn_arena *arena)
+mem_arena_clear(struct mem_arena *arena)
 {
-    arena->pos = sizeof(struct nsn_arena);
+    arena->pos = sizeof(struct mem_arena);
 }
 
 void
-nsn_arena_set_pos(struct nsn_arena *arena, usize pos)
+mem_arena_set_pos(struct mem_arena *arena, usize pos)
 {
     arena->pos = pos;
 }
 
 void
-print_arena(struct nsn_arena *arena)
+print_arena(struct mem_arena *arena)
 {
     printf("arena->base:    %p\n", (void *)arena->base);
     printf("arena->size:    %zu\n", arena->size);

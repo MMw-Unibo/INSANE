@@ -121,7 +121,7 @@ substring8(string8 string, usize start, usize end)
 }
 
 string8_list 
-str8_split(nsn_arena *arena, string8 string, string8 *delimiters, usize delimiter_count)
+str8_split(mem_arena *arena, string8 string, string8 *delimiters, usize delimiter_count)
 {
     string8_list list  = {0};
     string8_node *node = NULL;
@@ -135,7 +135,7 @@ str8_split(nsn_arena *arena, string8 string, string8 *delimiters, usize delimite
                 end = i;
                 if (start != end) {
                     sub          = substring8(string, start, end);
-                    node         = nsn_arena_push_struct(arena, string8_node);
+                    node         = mem_arena_push_struct(arena, string8_node);
                     node->string = sub;
                     str8_list_push_node(&list, node);
                 }
@@ -147,7 +147,7 @@ str8_split(nsn_arena *arena, string8 string, string8 *delimiters, usize delimite
 
     if (start < string.len) {
         sub          = substring8(string, start, string.len);
-        node         = nsn_arena_push_struct(arena, string8_node);
+        node         = mem_arena_push_struct(arena, string8_node);
         node->string = sub;
         str8_list_push_node(&list, node);
     }
@@ -212,9 +212,9 @@ str8_list_push_node(string8_list *list, string8_node *node)
 }
 
 void 
-str8_list_push(nsn_arena *arena, string8_list *list, string8 string)
+str8_list_push(mem_arena *arena, string8_list *list, string8 string)
 {
-    string8_node *node = nsn_arena_push_struct(arena, string8_node);
+    string8_node *node = mem_arena_push_struct(arena, string8_node);
     node->string = string;
     str8_list_push_node(list, node);
 }

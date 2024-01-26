@@ -1,7 +1,7 @@
 #ifndef NSN_OS_H
 #define NSN_OS_H
 
-#include "nsn_arena.h"
+#include "nsn_memory.h"
 #include "nsn_string.h"
 #include "nsn_types.h"
 
@@ -118,7 +118,7 @@ enum nsn_file_flag {
 
 struct nsn_file nsn_os_file_open(string8 filename, enum nsn_file_flag flags);
 bool nsn_file_valid(struct nsn_file file);
-string8 nsn_os_read_entire_file(nsn_arena *arena, struct nsn_file file);
+string8 nsn_os_read_entire_file(mem_arena *arena, struct nsn_file file);
 void nsn_os_file_close(struct nsn_file file);
 
 #endif // NSN_OS_H

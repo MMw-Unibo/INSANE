@@ -43,6 +43,6 @@ struct nsn_config
     list_head   sections;
 };
 
-nsn_config *nsn_load_config(nsn_arena *arena, string8 path);
+nsn_config *nsn_load_config(mem_arena *arena, string8 path);
 
 #endif // NSN_CONFIG_H

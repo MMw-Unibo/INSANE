@@ -1,5 +1,5 @@
 // --- gax: Includes -----------------------------------------------------------
-#include "nsn_arena.h"
+#include "nsn_memory.h"
 #include "nsn_config.h"
 #include "nsn_datapath.h"
 #include "nsn_ipc.h"
@@ -11,8 +11,8 @@
 #include "nsn_log.h"
 
 // --- gax: c files ------------------------------------------------------------
-#include "nsn_arena.c"
 #include "nsn_config.c"
+#include "nsn_memory.c"
 #include "nsn_os_inc.c"
 #include "nsn_shm.c"
 #include "nsn_string.c"
@@ -78,7 +78,7 @@ struct nsn_app_node
 
 struct nsn_app_pool
 {
-    struct nsn_arena *arena;
+    struct mem_arena *arena;
 
     struct nsn_app_node *head;
     
@@ -105,7 +105,7 @@ struct datapath_ops
 int instance_id = 0;
 bool is_main_thread = false;
 // nsn_thread_local nsn_thread_ctx *thread_ctx = NULL;
-struct nsn_arena *scratch_arena = NULL;
+struct mem_arena *scratch_arena = NULL;
 
 string8_list arg_list = {0};
 nsn_config *config = NULL;
@@ -121,7 +121,7 @@ main(int argc, char *argv[])
 
     instance_id    = nsn_os_get_process_id();
     is_main_thread = true;
-    scratch_arena  = nsn_arena_alloc(gigabytes(1));
+    scratch_arena  = mem_arena_alloc(gigabytes(1));
 
     for (int i = 0; i < argc; i++)
         str8_list_push(scratch_arena, &arg_list, str8_cstr(argv[i]));
@@ -143,7 +143,7 @@ main(int argc, char *argv[])
  
     log_debug("instance id: %d\n", instance_id);
 
-    struct nsn_arena *arena = nsn_arena_alloc(gigabytes(1));
+    struct mem_arena *arena = mem_arena_alloc(gigabytes(1));
 
     // init SIG_INT handler
     struct sigaction sa;
@@ -152,7 +152,6 @@ main(int argc, char *argv[])
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
 
- 
     int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         log_error("Failed to open socket: %s\n", strerror(errno));
@@ -249,8 +248,8 @@ main(int argc, char *argv[])
     close(sockfd);
     unlink(REQUEST_IPC_PATH);
     nsn_shm_release(shm);
-    nsn_arena_release(scratch_arena);
-    nsn_arena_release(arena);
+    mem_arena_release(scratch_arena);
+    mem_arena_release(arena);
 
     log_debug("done\n");
 

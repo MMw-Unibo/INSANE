@@ -1,9 +1,9 @@
 #include "nsn_config.h"
 
 nsn_config *
-nsn_load_config(nsn_arena *arena, string8 path)
+nsn_load_config(mem_arena *arena, string8 path)
 {
-    nsn_config *config = nsn_arena_push_struct(arena, nsn_config);
+    nsn_config *config = mem_arena_push_struct(arena, nsn_config);
     config->sections    = list_head_init(config->sections);
 
     struct nsn_file config_file = nsn_os_file_open(path, NsnFileFlag_Read);
@@ -33,7 +33,7 @@ nsn_load_config(nsn_arena *arena, string8 path)
                 continue;
             }
 
-            nsn_config_section *new_section = nsn_arena_push_struct(arena, nsn_config_section);
+            nsn_config_section *new_section = mem_arena_push_struct(arena, nsn_config_section);
             new_section->name               = sections_string.head->string;
             new_section->opts               = list_head_init(new_section->opts);
             new_section->sub_sections       = list_head_init(new_section->sub_sections);
@@ -42,7 +42,7 @@ nsn_load_config(nsn_arena *arena, string8 path)
             current_section = new_section;
 
             if (sections_string.count == 2) {
-                nsn_config_section *sub_section = nsn_arena_push_struct(arena, nsn_config_section);
+                nsn_config_section *sub_section = mem_arena_push_struct(arena, nsn_config_section);
                 sub_section->name               = sections_string.head->next->string;
                 sub_section->opts               = list_head_init(sub_section->opts);
                 list_add_tail(&new_section->sub_sections, &sub_section->list);
@@ -51,7 +51,7 @@ nsn_load_config(nsn_arena *arena, string8 path)
                 current_section = sub_section;
             }
         } else if (char_is_alpha(line.data[0]) && str8_contains(line, str8_lit("="))) { // new option
-            nsn_config_opt *new_opt = nsn_arena_push_struct(arena, nsn_config_opt);
+            nsn_config_opt *new_opt = mem_arena_push_struct(arena, nsn_config_opt);
             usize index_of_first_equal = str8_index_of_first(line, str8_lit("="));
             new_opt->key               = substring8(line, 0, index_of_first_equal);
             new_opt->key               = str8_trim(new_opt->key);

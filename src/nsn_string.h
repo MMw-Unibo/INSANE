@@ -1,7 +1,7 @@
 #ifndef NSN_STRING_H
 #define NSN_STRING_H
 
-#include "nsn_arena.h"
+#include "nsn_memory.h"
 #include "nsn_types.h"
 
 // --- Basic String Types ------------------------------------------------------
@@ -79,10 +79,10 @@ string8 str8(char *cstr, usize len);
 string8 substring8(string8 string, usize start, usize end);
 #define str8_prefix(string, pre_size)   substring8(string, 0, pre_size)
 
-string8_list str8_split(nsn_arena *arena, string8 string, string8 *delimiters, usize delimiter_count);
+string8_list str8_split(mem_arena *arena, string8 string, string8 *delimiters, usize delimiter_count);
 
 // --- String Collections ------------------------------------------------------
-void str8_list_push(nsn_arena *arena, string8_list *list, string8 string);
+void str8_list_push(mem_arena *arena, string8_list *list, string8 string);
 void str8_list_push_node(string8_list *list, string8_node *node);
 
 

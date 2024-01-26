@@ -156,7 +156,7 @@ nsn_file_valid(struct nsn_file file)
 
 
 string8 
-nsn_os_read_entire_file(struct nsn_arena *arena, struct nsn_file file)
+nsn_os_read_entire_file(struct mem_arena *arena, struct nsn_file file)
 {
     string8 result = {0};
 
@@ -166,7 +166,7 @@ nsn_os_read_entire_file(struct nsn_arena *arena, struct nsn_file file)
     }
 
     result.len  = file_stat.st_size;
-    result.data = nsn_arena_push_array(arena, u8, result.len);
+    result.data = mem_arena_push_array(arena, u8, result.len);
 
     if ((usize)read(file.handle, result.data, result.len) != result.len) {
         result.data = NULL;

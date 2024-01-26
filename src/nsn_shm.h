@@ -1,5 +1,5 @@
-#ifndef NSN_MEMORY_H
-#define NSN_MEMORY_H
+#ifndef NSN_SHARED_MEMORY_H
+#define NSN_SHARED_MEMORY_H
 
 #include "nsn_types.h"
 #include "nsn_log.h"
@@ -26,4 +26,4 @@ void nsn_shm_release(struct nsn_shm *shm);
 static inline void *nsn_shm_rawdata(struct nsn_shm *shm) { return ((byte *)shm->base) + sizeof(struct nsn_shm); }
 static inline usize nsn_shm_size(struct nsn_shm *shm)    { return shm->size - sizeof(struct nsn_shm); }
 
-#endif // NSN_MEMORY_H
+#endif // NSN_SHARED_MEMORY_H
