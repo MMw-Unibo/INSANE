@@ -62,26 +62,20 @@
 //     rte_eal_cleanup();
 // }
 
+typedef struct nsn_app nsn_app_t;
 struct nsn_app
 {
-    int id;
-    int pid;
-
-    void *rx_queue_slot;
+    int app_id;
 };
 
-struct nsn_app_node
-{
-    struct nsn_app *app;
-    struct nsn_app_node *next;
-};
-
+typedef struct nsn_app_pool nsn_app_pool_t;
 struct nsn_app_pool
 {
-    struct mem_arena *arena;
-
-    struct nsn_app_node *head;
-    
+    mem_arena_t *arena;
+    nsn_app_t   *apps;
+    bool        *free_apps_slots;
+    usize        count;
+    usize        used;
 };
 
 static volatile bool g_running = true;
@@ -101,14 +95,53 @@ struct datapath_ops
     nsn_datapath_deinit *deinit;
 };
 
+////////
+// insane daemon state
 
-int instance_id = 0;
+int instance_id     = 0;
 bool is_main_thread = false;
 // nsn_thread_local nsn_thread_ctx *thread_ctx = NULL;
-struct mem_arena *scratch_arena = NULL;
+mem_arena_t *scratch_arena = NULL;
+nsn_app_pool_t app_pool = {0};
 
-string8_list arg_list = {0};
-nsn_config *config = NULL;
+string_list_t arg_list = {0};
+nsn_config_t *config   = NULL;
+////////
+
+typedef struct nsn_datapath_memory nsn_datapath_memory_t;
+struct nsn_datapath_memory
+{
+    fixed_mem_arena_t *arena;
+    nsn_shm_t         *shm;
+};
+
+nsn_datapath_memory_t *
+nsn_datapath_memory_create(mem_arena_t *arena, string_t name, usize size)
+{
+    // TODO(garbu): create a shared memory for the data plane using the config 
+    //              to determine the size of the shared memory. 
+    //              In the shared memory, we have both the memory buffer and the
+    //              ring buffers used for the receive and transmit queues.
+    nsn_shm_t *shm = nsn_shm_alloc(arena, to_cstr(name), size);
+    if (!shm) {
+        log_error("Failed to create shared memeory\n");
+        return NULL;
+    }
+
+    fixed_mem_arena_t *fixed_arena = fixed_mem_arena_alloc(shm->base, shm->size);
+
+    nsn_datapath_memory_t *mem = mem_arena_push_struct(arena, nsn_datapath_memory_t);
+    mem->arena = fixed_arena;
+    mem->shm   = shm;
+
+    return mem;
+}
+
+void
+nsn_datapath_memory_destroy(nsn_datapath_memory_t *mem)
+{
+    nsn_shm_release(mem->shm);
+}
 
 int 
 main(int argc, char *argv[])
@@ -117,7 +150,7 @@ main(int argc, char *argv[])
     nsn_unused(argv);
 
     logger_init(NULL);
-    logger_set_level(LOGGER_LEVEL_DEBUG);
+    logger_set_level(LOGGER_LEVEL_TRACE);
 
     instance_id    = nsn_os_get_process_id();
     is_main_thread = true;
@@ -126,8 +159,8 @@ main(int argc, char *argv[])
     for (int i = 0; i < argc; i++)
         str8_list_push(scratch_arena, &arg_list, str8_cstr(argv[i]));
 
-    string8 config_filename = str8_lit("nsnd.cfg");
-    for (string8_node *node = arg_list.head; node; node = node->next) {
+    string_t config_filename = str8_lit("nsnd.cfg");
+    for (string_node_t *node = arg_list.head; node; node = node->next) {
         if (str8_match(str8_lit("--config"), node->string) || str8_match(str8_lit("-c"), node->string)) {
             if (node->next) {
                 config_filename = node->next->string;
@@ -143,7 +176,12 @@ main(int argc, char *argv[])
  
     log_debug("instance id: %d\n", instance_id);
 
-    struct mem_arena *arena = mem_arena_alloc(gigabytes(1));
+    // init the memory arena
+    mem_arena_t *arena = mem_arena_alloc(gigabytes(1));
+    app_pool.count           = 64;
+    app_pool.apps            = mem_arena_push_array(arena, nsn_app_t, app_pool.count);
+    app_pool.free_apps_slots = mem_arena_push_array(arena, bool, app_pool.count);
+    for (usize i = 0; i < app_pool.count; i++)    app_pool.free_apps_slots[i] = true;
 
     // init SIG_INT handler
     struct sigaction sa;
@@ -152,6 +190,15 @@ main(int argc, char *argv[])
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
 
+
+    // create the shared memory
+    nsn_datapath_memory_t *mem = nsn_datapath_memory_create(arena, str8_lit("nsnd_datamem"), megabytes(8));
+    if (!mem) {
+        log_error("Failed to create shared memory\n");
+        exit(1);
+    }
+
+    // create the control socket
     int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         log_error("Failed to open socket: %s\n", strerror(errno));
@@ -160,10 +207,10 @@ main(int argc, char *argv[])
 
     struct sockaddr_un addr;
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, REQUEST_IPC_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, NSNAPP_TO_NSND_IPC, sizeof(addr.sun_path) - 1);
 
     // bind the socket to the address
-    unlink(REQUEST_IPC_PATH);
+    unlink(NSNAPP_TO_NSND_IPC);
     if (bind(sockfd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) < 0) {
         log_error("Failed to bind socket: %s\n", strerror(errno));
         return -1;
@@ -173,41 +220,104 @@ main(int argc, char *argv[])
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
-    struct nsn_shm *shm = nsn_shm_alloc("nsn_datamem", kilobytes(4) * 1024);
-    if (!shm) {
-        log_error("Failed to create shared memeory\n");
-        exit(1);
+    while (g_running) 
+    {
+        // send a message to the daemon to create a new instance
+        temp_mem_arena_t temp_arena = temp_mem_arena_begin(arena);
+    
+        usize bufflen = 4096;
+        byte *buffer  = mem_arena_push_array(temp_arena.arena, byte, bufflen);
+    
+        struct sockaddr_un temp_addr;
+        socklen_t temp_len = sizeof(struct sockaddr_un);
+        isize bytes_recv   = recvfrom(sockfd, buffer, bufflen, 0, (struct sockaddr *)&temp_addr, &temp_len);
+        if (bytes_recv == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1);
+                goto clean_and_next;
+            }
+            else {
+                // TODO: handle error
+                printf("error: %s\n", strerror(errno));
+                break;
+            }
+        }
+
+        bool send_reply         = true;
+        usize reply_len         = 0;
+        nsn_cmsg_hdr_t *cmsghdr = (nsn_cmsg_hdr_t *)buffer;
+        int app_id              = cmsghdr->app_id;
+        switch (cmsghdr->type)
+        {
+            case nsn_cmsg_type_connect:
+            {
+                // check if there are free slots in the app pool
+                int slot = -1;
+                for (usize i = 0; i < app_pool.count; i++) {
+                    if (app_pool.free_apps_slots[i]) {
+                        slot = i;                
+                        break;
+                    }
+                        
+                }
+
+                if (slot == -1) {
+                    cmsghdr->type   = nsn_cmsg_type_error;
+                    int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                    *error_code     = 1;
+                    reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int); 
+                } else {                    
+                    log_debug("app %d connected\n", app_id);
+                    app_pool.used                  += 1;
+                    app_pool.free_apps_slots[slot]  = false;
+                    app_pool.apps[slot].app_id      = app_id;                    
+                    nsn_cmsg_connect_t *reply = (nsn_cmsg_connect_t *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                    snprintf(reply->shm_name, NSN_MAX_PATH_SIZE, "nsnd_datamem");
+                    cmsghdr->type = nsn_cmsg_type_connected;
+                    reply_len     = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_connect_t);
+                }
+            } break;        
+            case nsn_cmsg_type_disconnect:
+            {
+                log_debug("received disconnect message from app %d\n", app_id);
+
+                // check if the app is in the pool
+                bool found = false;
+                for (usize i = 0; i < app_pool.count; i++) {
+                    if (app_pool.apps[i].app_id == app_id) {
+                        log_trace("found app %d in slot %d\n", app_id, i);
+                        app_pool.free_apps_slots[i]  = true;
+                        app_pool.used               -= 1;
+                        found                        = true;
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    cmsghdr->type   = nsn_cmsg_type_error;
+                    int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                    *error_code     = 2;
+                    reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                } else {
+                    log_debug("app %d disconnected\n", app_id);
+                    cmsghdr->type = nsn_cmsg_type_disconnected;
+                    reply_len     = sizeof(nsn_cmsg_hdr_t);
+                }
+
+            } break;
+            default:
+            {
+                printf("unknown message from '%d' type: %d\n", app_id, cmsghdr->type);
+                send_reply = false;
+            } break;
+        }
+
+        if (send_reply) { 
+            sendto(sockfd, cmsghdr, reply_len, 0, (struct sockaddr *)&temp_addr, temp_len);        
+        }
+clean_and_next: 
+        temp_mem_arena_end(temp_arena);
     }
-
-    // while (g_running) 
-    // {
-    //     printf("waiting for a message\n");
-
-    //     // send a message to the daemon to create a new instance
-    //     struct nsn_temp_arena temp = nsn_temp_arena_begin(arena);
-    
-    //     byte *msg = nsn_arena_push_array(temp.arena, byte, 1024);
-    //     socklen_t len = sizeof(struct sockaddr_un);
-    
-    //     isize bytes_recv = recvfrom(sockfd, msg, 1024, 0, (struct sockaddr *)&addr, &len);
-    //     if (bytes_recv == -1) {
-    //         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-    //             usleep(1000 * 1000);
-    //             continue;
-    //         }
-    //         else {
-    //             // TODO: handle error
-    //             printf("error: %s\n", strerror(errno));
-    //             break;
-    //         }
-    //     }
-
-    //     struct nsn_request *req = (struct nsn_request *)msg;
-    //     printf("type: %d, id: %d\n", req->type, req->id);
-    //     nsn_temp_arena_end(temp);
-
-    // }
-
 
     // struct nsn_os_module module = nsn_os_load_library("./datapaths/libdpdk.so", 0);
     // if (module.handle == NULL) {
@@ -235,19 +345,13 @@ main(int argc, char *argv[])
     // log_debug("init: %d\n", ops.init(&ctx));
     // log_debug("tx: %d\n", ops.tx(NULL));
 
-    while (g_running) {
-        sleep(1);
-        printf("simulating work\n");
-        sleep(1);
-    }
-
     // log_debug("deinit: %d\n", ops.deinit(NULL));
     // nsn_os_unload_library(module);
 
     // cleanup
     close(sockfd);
-    unlink(REQUEST_IPC_PATH);
-    nsn_shm_release(shm);
+    unlink(NSNAPP_TO_NSND_IPC);
+    nsn_shm_release(mem->shm);
     mem_arena_release(scratch_arena);
     mem_arena_release(arena);
 

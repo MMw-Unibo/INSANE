@@ -5,28 +5,28 @@
 #include "nsn_types.h"
 
 // --- Basic String Types ------------------------------------------------------
-typedef struct string8 string8;
-struct string8 
+typedef struct string string_t;
+struct string
 {
     u8    *data;
     usize  len;
 };
 
 // --- String Collections ------------------------------------------------------
-typedef struct string8_node string8_node;
-struct string8_node
+typedef struct string_node string_node_t;
+struct string_node
 {
-    string8_node *next;
-    string8       string;
+    string_node_t *next;
+    string_t       string;
 };
 
-typedef struct string8_list string8_list;
-struct string8_list
+typedef struct string_list string_list_t;
+struct string_list
 {
-    string8_node *head;
-    string8_node *tail;
-    usize             count;
-    usize             size;
+    string_node_t   *head;
+    string_node_t   *tail;
+    usize            count;
+    usize            size;
 };
 
 enum string_match_flag
@@ -53,37 +53,38 @@ static inline bool char_is_lower(char c)            { return char_is_alpha_lower
 // --- Helpers -----------------------------------------------------------------
 usize calc_cstr_len(char *cstr);
 
-int   str8_contains(string8 string, string8 match);
-usize str8_index_of_first(string8 string, string8 match);
+int   str8_contains(string_t string, string_t match);
+usize str8_index_of_first(string_t string, string_t match);
 
-string8 str8_trim_start(string8 string);
-string8 str8_trim_end(string8 string);
-string8 str8_trim(string8 string);
+string_t str8_trim_start(string_t string);
+string_t str8_trim_end(string_t string);
+string_t str8_trim(string_t string);
 
-f64 f64_from_str8(string8 value);
+f64 f64_from_str8(string_t value);
 
 // --- Comparisons -------------------------------------------------------------
-bool str8_match(string8 string, string8 match);
-bool str8_match_one_of(string8 string, string8 *matches, usize match_count);
-bool str8_starts_with(string8 string, string8 prefix);
-bool str8_ends_with(string8 string, string8 suffix);
+bool str8_match(string_t string, string_t match);
+bool str8_match_one_of(string_t string, string_t *matches, usize match_count);
+bool str8_starts_with(string_t string, string_t prefix);
+bool str8_ends_with(string_t string, string_t suffix);
 
 // --- Constructors ------------------------------------------------------------
 #define str8_fmt         "%.*s"
 #define str8_arg(string) (int)(string).len, (string).data
 
-string8 str8(char *cstr, usize len);
-#define str8_cstr(cstr) str8(cstr, calc_cstr_len(cstr))
-#define str8_lit(cstr)  str8(cstr, sizeof(cstr) - 1)
+string_t str8(char *cstr, usize len);
+#define str8_cstr(cstr)     str8(cstr, calc_cstr_len(cstr))
+#define str8_lit(cstr)      str8(cstr, sizeof(cstr) - 1)
+#define to_cstr(string)     ((char *)(string).data)
 
-string8 substring8(string8 string, usize start, usize end);
+string_t substring8(string_t string, usize start, usize end);
 #define str8_prefix(string, pre_size)   substring8(string, 0, pre_size)
 
-string8_list str8_split(mem_arena *arena, string8 string, string8 *delimiters, usize delimiter_count);
+string_list_t str8_split(mem_arena_t *arena, string_t string, string_t *delimiters, usize delimiter_count);
 
 // --- String Collections ------------------------------------------------------
-void str8_list_push(mem_arena *arena, string8_list *list, string8 string);
-void str8_list_push_node(string8_list *list, string8_node *node);
+void str8_list_push(mem_arena_t *arena, string_list_t *list, string_t string);
+void str8_list_push_node(string_list_t *list, string_node_t *node);
 
 
 #endif // NSN_STRING_H

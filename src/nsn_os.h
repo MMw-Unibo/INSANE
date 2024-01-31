@@ -6,6 +6,7 @@
 #include "nsn_types.h"
 
 // --- Time --------------------------------------------------------------------
+u64 nsn_os_get_cycles(void);
 i64 nsn_os_get_time_ns(void);
 
 // --- Library -----------------------------------------------------------------
@@ -98,6 +99,7 @@ int nsn_os_conditional_variable_create(struct nsn_conditional_variable *cv);
 
 // --- File --------------------------------------------------------------------
 
+typedef struct nsn_file nsn_file_t;
 struct nsn_file
 {
 #if NSN_OS_LINUX
@@ -116,9 +118,9 @@ enum nsn_file_flag {
     NsnFileFlag_Append   = 1 << 4,
 };
 
-struct nsn_file nsn_os_file_open(string8 filename, enum nsn_file_flag flags);
-bool nsn_file_valid(struct nsn_file file);
-string8 nsn_os_read_entire_file(mem_arena *arena, struct nsn_file file);
-void nsn_os_file_close(struct nsn_file file);
+nsn_file_t nsn_os_file_open(string_t filename, enum nsn_file_flag flags);
+bool       nsn_file_valid(nsn_file_t file);
+string_t   nsn_os_read_entire_file(mem_arena_t *arena, nsn_file_t file);
+void       nsn_os_file_close(nsn_file_t file);
 
 #endif // NSN_OS_H

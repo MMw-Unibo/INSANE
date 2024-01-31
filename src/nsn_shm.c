@@ -32,10 +32,10 @@ error:
     return NULL;
 }
 
-struct nsn_shm *
-nsn_shm_alloc(const char *name, usize size)
+nsn_shm_t *
+nsn_shm_alloc(mem_arena_t *arena, const char *name, usize size)
 {
-    struct nsn_shm *result = NULL;
+    nsn_shm_t *result = NULL;
 
     int fd;
     void *buffer = _nsn_shm_create_with_flags(name, size, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IRUSR, &fd);
@@ -43,12 +43,10 @@ nsn_shm_alloc(const char *name, usize size)
         goto done;
     }
 
-    result = buffer;
-    memory_zero_struct(result);
+    result = mem_arena_push_struct(arena, nsn_shm_t);
     strncpy(result->name, name, NSN_SHM_NAME_MAX - 1);
     result->base = buffer;
     result->size = size;
-    result->used = sizeof(struct nsn_shm);
     result->fd   = fd;
     at_fadd(&result->ref_count, 1, mo_rlx);
  
@@ -56,10 +54,10 @@ done:
     return result;
 }
 
-struct nsn_shm *
+nsn_shm_t *
 nsn_shm_attach(const char *name, usize size)
 {
-    struct nsn_shm *result = NULL;
+    nsn_shm_t *result = NULL;
 
     int fd;
     void *buffer = _nsn_shm_create_with_flags(name, size, O_RDWR, 0, &fd);
@@ -75,7 +73,7 @@ done:
 }
 
 void 
-nsn_shm_detach(struct nsn_shm *shm)
+nsn_shm_detach(nsn_shm_t *shm)
 {
     if (shm) {
         at_fsub(&shm->ref_count, 1, mo_rlx);
@@ -85,10 +83,10 @@ nsn_shm_detach(struct nsn_shm *shm)
 }
 
 void 
-nsn_shm_release(struct nsn_shm *shm)
+nsn_shm_release(nsn_shm_t *shm)
 {
-    struct nsn_shm tmp;
-    memcpy(&tmp, shm, sizeof(struct nsn_shm));
+    nsn_shm_t tmp;
+    memcpy(&tmp, shm, sizeof(nsn_shm_t));
     if (shm) {
         munmap((void *)tmp.base, tmp.size);
         shm_unlink(tmp.name);
