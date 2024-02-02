@@ -11,8 +11,8 @@ enum nsn_config_opt_type {
     NsnConfigOptType_Boolean,
 };
 
-typedef struct nsn_config_opt nsn_cfg_opt_t;
-struct nsn_config_opt
+typedef struct nsn_cfg_opt nsn_cfg_opt_t;
+struct nsn_cfg_opt
 {
     string_t     key;
     u32         type;
@@ -26,8 +26,8 @@ struct nsn_config_opt
 };
 
 
-typedef struct nsn_config_section nsn_cfg_sec_t;
-struct nsn_config_section
+typedef struct nsn_cfg_sec nsn_cfg_sec_t;
+struct nsn_cfg_sec
 {
     string_t                 name;
     nsn_cfg_sec_t    *parent;
@@ -37,8 +37,8 @@ struct nsn_config_section
     list_head_t   list;
 };
 
-typedef struct nsn_config nsn_cfg_t;
-struct nsn_config 
+typedef struct nsn_cfg nsn_cfg_t;
+struct nsn_cfg
 {
     list_head_t  sections;
 };
