@@ -1,4 +1,4 @@
-#include "string.h"
+#include "nsn_string.h"
 
 // --- Helpers -----------------------------------------------------------------
 usize 
@@ -10,7 +10,7 @@ calc_cstr_len(char *cstr)
 }
 
 int 
-str8_contains(string8 string, string8 match)
+str_contains(string_t string, string_t match)
 {
     if (match.len > string.len) return -1;
 
@@ -36,7 +36,7 @@ str8_contains(string8 string, string8 match)
 }
 
 usize 
-str8_index_of_first(string8 string, string8 match)
+str_index_of_first(string_t string, string_t match)
 {
     if (match.len > string.len) return -1;
 
@@ -57,31 +57,31 @@ str8_index_of_first(string8 string, string8 match)
     return -1;
 }
 
-string8 
-str8_trim_start(string8 string)
+string_t 
+str_trim_start(string_t string)
 {
     usize offset = 0;
     while (char_is_whitespace(string.data[offset])) offset++;
-    return substring8(string, offset, string.len);
+    return str_substring(string, offset, string.len);
 }
 
-string8 
-str8_trim_end(string8 string)
+string_t 
+str_trim_end(string_t string)
 {
     usize offset = string.len - 1;
     while (char_is_whitespace(string.data[offset])) offset--;
-    return substring8(string, 0, offset + 1);
+    return str_substring(string, 0, offset + 1);
 }
 
-string8 
-str8_trim(string8 string)
+string_t 
+str_trim(string_t string)
 {
-    return str8_trim_start(str8_trim_end(string));
+    return str_trim_start(str_trim_end(string));
 }
 
 // --- Numbers
 f64 
-f64_from_str8(string8 value)
+f64_from_str(string_t value)
 {
     char str[64] = {0};
     usize len    = value.len;
@@ -92,17 +92,17 @@ f64_from_str8(string8 value)
 }
 
 // --- Constructors ------------------------------------------------------------
-string8 
-str8(char *cstr, usize len)
+string_t 
+make_string(char *cstr, usize len)
 {
-    string8 str = {0};
+    string_t str = {0};
     str.data = (u8 *)cstr;
     str.len  = len;
     return str;
 }
 
-string8 
-substring8(string8 string, usize start, usize end)
+string_t 
+str_substring(string_t string, usize start, usize end)
 {
     usize min = start;
     usize max = end;
@@ -114,18 +114,18 @@ substring8(string8 string, usize start, usize end)
         max = tmp;
     }
 
-    string8 sub = {0};
+    string_t sub = {0};
     sub.data = string.data + min;
     sub.len  = max - min;
     return sub;
 }
 
-string8_list 
-str8_split(mem_arena *arena, string8 string, string8 *delimiters, usize delimiter_count)
+string_list_t 
+str_split(mem_arena_t *arena, string_t string, string_t *delimiters, usize delimiter_count)
 {
-    string8_list list  = {0};
-    string8_node *node = NULL;
-    string8 sub        = {0};
+    string_list_t list  = {0};
+    string_node_t *node = NULL;
+    string_t sub        = {0};
     usize start            = 0;
     usize end              = 0;
 
@@ -134,10 +134,10 @@ str8_split(mem_arena *arena, string8 string, string8 *delimiters, usize delimite
             if (string.data[i] == delimiters[j].data[0]) {
                 end = i;
                 if (start != end) {
-                    sub          = substring8(string, start, end);
-                    node         = mem_arena_push_struct(arena, string8_node);
+                    sub          = str_substring(string, start, end);
+                    node         = mem_arena_push_struct(arena, string_node_t);
                     node->string = sub;
-                    str8_list_push_node(&list, node);
+                    str_list_push_node(&list, node);
                 }
                 
                 start = i + 1;
@@ -146,10 +146,10 @@ str8_split(mem_arena *arena, string8 string, string8 *delimiters, usize delimite
     }
 
     if (start < string.len) {
-        sub          = substring8(string, start, string.len);
-        node         = mem_arena_push_struct(arena, string8_node);
+        sub          = str_substring(string, start, string.len);
+        node         = mem_arena_push_struct(arena, string_node_t);
         node->string = sub;
-        str8_list_push_node(&list, node);
+        str_list_push_node(&list, node);
     }
 
     return list;
@@ -158,7 +158,7 @@ str8_split(mem_arena *arena, string8 string, string8 *delimiters, usize delimite
 
 // --- Comparisons -------------------------------------------------------------
 bool
-str8_match(string8 string, string8 match)
+str_eq(string_t string, string_t match)
 {
     if (string.len != match.len) return false;
     for (usize i = 0; i < string.len; i++) {
@@ -169,10 +169,10 @@ str8_match(string8 string, string8 match)
 }
 
 bool 
-str8_match_one_of(string8 string, string8 *matches, usize match_count)
+str_match_one_of(string_t string, string_t *matches, usize match_count)
 {
     for (usize i = 0; i < match_count; i++) {
-        if (str8_match(string, matches[i])) return true;
+        if (str_eq(string, matches[i])) return true;
     }
 
     return false;
@@ -180,7 +180,7 @@ str8_match_one_of(string8 string, string8 *matches, usize match_count)
 
 
 bool 
-str8_starts_with(string8 string, string8 prefix)
+str_starts_with(string_t string, string_t prefix)
 {
     if (prefix.len > string.len) return false;
     for (usize i = 0; i < prefix.len; i++) {
@@ -191,7 +191,7 @@ str8_starts_with(string8 string, string8 prefix)
 }
 
 bool 
-str8_ends_with(string8 string, string8 suffix)
+str_ends_with(string_t string, string_t suffix)
 {
     if (suffix.len > string.len) return false;
     for (usize i = 0; i < suffix.len; i++) {
@@ -204,7 +204,7 @@ str8_ends_with(string8 string, string8 suffix)
 // --- String Collections ------------------------------------------------------
 
 void
-str8_list_push_node(string8_list *list, string8_node *node)
+str_list_push_node(string_list_t *list, string_node_t *node)
 {
     nsn_list_push(list->head, list->tail, node);
     list->count += 1;
@@ -212,9 +212,9 @@ str8_list_push_node(string8_list *list, string8_node *node)
 }
 
 void 
-str8_list_push(mem_arena *arena, string8_list *list, string8 string)
+str_list_push(mem_arena_t *arena, string_list_t *list, string_t string)
 {
-    string8_node *node = mem_arena_push_struct(arena, string8_node);
+    string_node_t *node = mem_arena_push_struct(arena, string_node_t);
     node->string = string;
-    str8_list_push_node(list, node);
+    str_list_push_node(list, node);
 }

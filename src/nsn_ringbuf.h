@@ -2,7 +2,7 @@
 #define NSN_RINGBUF_H
 
 #include "nsn_types.h"
-#
+#include "nsn_string.h"
 
 struct nsn_ring_headtail
 {
@@ -10,9 +10,11 @@ struct nsn_ring_headtail
     atu32 tail;
 };
 
-struct nsn_ringbuf
+typedef struct nsn_ringbuf nsn_ringbuf_t;
+nsn_cache_aligned struct nsn_ringbuf
 {
     void *data; /**< Data buffer. */
+    string_t name;
 
     u32 size;  /**< Size of ring. */
     u32 mask;  /**< Mask (size-1) of ring. */
@@ -29,12 +31,12 @@ struct nsn_ringbuf
     char __pad2 nsn_cache_aligned;
 };
 
-inline struct nsn_ringbuf *nsn_ringbuf_create(void *memory, u32 count);
+nsn_ringbuf_t *nsn_ringbuf_create(void *memory, string_t name, u32 count);
 
-u32 nsn_ringbuf_get_capacity(const struct nsn_ringbuf *rb);
-u32 nsn_ringbuf_count(const struct nsn_ringbuf *rb);
+u32 nsn_ringbuf_get_capacity(nsn_ringbuf_t *rb);
+u32 nsn_ringbuf_count(nsn_ringbuf_t *rb);
 
-u32 nsn_ringbuf_enqueue_burst(struct nsn_ringbuf *rb, const void *obj_table, u32 n, u32 *free_space);
-u32 nsn_ringbuf_dequeue_burst(struct nsn_ringbuf *rb, void *obj_table, u32 n, u32 *available);
+u32 nsn_ringbuf_enqueue_burst(nsn_ringbuf_t *rb, const void *obj_table, u32 esize, u32 n, u32 *free_space);
+u32 nsn_ringbuf_dequeue_burst(nsn_ringbuf_t *rb, void *obj_table, u32 esize, u32 n, u32 *available);
 
 #endif // NSN_RINGBUF_H

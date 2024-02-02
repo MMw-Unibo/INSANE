@@ -2,13 +2,15 @@
 #define NSN_PLATFORM_H
 
 #if defined(__linux__)
-# define NSN_OS_LINUX 1
+# define NSN_OS_LINUX   1
+#elif defined(_WIN32) || defined(_WIN64)
+# define NSN_OS_WINDOWS 1
 #else
 # error "Unsupported platform"
 #endif
 
 #if defined(__GNUC__)
-# define NSN_COMPILER_GCC 1
+# define NSN_COMPILER_GCC   1
 #elif defined(__clang__)
 # define NSN_COMPILER_CLANG 1
 #else
@@ -17,9 +19,9 @@
 
 #if NSN_COMPILER_GCC || NSN_COMPILER_CLANG
 # if defined(__x86_64__) || defined(__amd64__)
-#  define NSN_ARCH_X86_64 1
+#  define NSN_ARCH_X86_64   1
 # elif defined(__i386__)
-#  define NSN_ARCH_X86 1
+#  define NSN_ARCH_X86      1
 # else
 #  error "Unsupported architecture"
 # endif
@@ -42,6 +44,12 @@
 # define nsn_likely(x)          __builtin_expect(!!(x), 1)
 # define nsn_unlikely(x)        __builtin_expect(!!(x), 0)
 # define nsn_thread_local       __thread
+# define nsn_fallthrough        __attribute__((fallthrough)) 
+# if NSN_ARCH_X86_64 || NSN_ARCH_X86
+#  define nsn_pause()           __asm__ __volatile__("pause")
+# else
+#  error "Unsupported architecture"
+# endif
 #else
 # error "Unsupported compiler"
 #endif

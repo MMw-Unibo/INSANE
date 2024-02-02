@@ -32,34 +32,32 @@ error:
     return NULL;
 }
 
-struct nsn_shm *
-nsn_shm_alloc(const char *name, usize size)
+nsn_shm_t *
+nsn_shm_alloc(mem_arena_t *arena, const char *name, usize size)
 {
-    struct nsn_shm *result = NULL;
+    nsn_shm_t *shm = NULL;
 
     int fd;
-    void *buffer = _nsn_shm_create_with_flags(name, size, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IRUSR, &fd);
+    void *buffer = _nsn_shm_create_with_flags(name, size, O_CREAT | O_EXCL | O_RDWR, S_IRUSR, &fd);
     if (!buffer) {
         goto done;
     }
 
-    result = buffer;
-    memory_zero_struct(result);
-    strncpy(result->name, name, NSN_SHM_NAME_MAX - 1);
-    result->base = buffer;
-    result->size = size;
-    result->used = sizeof(struct nsn_shm);
-    result->fd   = fd;
-    at_fadd(&result->ref_count, 1, mo_rlx);
+    shm = mem_arena_push_struct(arena, nsn_shm_t);
+    strncpy(shm->name, name, NSN_SHM_NAME_MAX - 1);
+    shm->base = buffer;
+    shm->size = size;
+    shm->fd   = fd;
+    at_fadd(&shm->ref_count, 1, mo_rlx);
  
 done:
-    return result;
+    return shm;
 }
 
-struct nsn_shm *
-nsn_shm_attach(const char *name, usize size)
+nsn_shm_t *
+nsn_shm_attach(mem_arena_t *arena, const char *name, usize size)
 {
-    struct nsn_shm *result = NULL;
+    nsn_shm_t *shm = NULL;
 
     int fd;
     void *buffer = _nsn_shm_create_with_flags(name, size, O_RDWR, 0, &fd);
@@ -67,15 +65,19 @@ nsn_shm_attach(const char *name, usize size)
         goto done;
     }
 
-    result = buffer;
-    at_fadd(&result->ref_count, 1, mo_rlx);
+    shm = mem_arena_push_struct(arena, nsn_shm_t);
+    shm->base = buffer;
+    shm->size = size;
+    shm->fd   = fd;
+    strncpy(shm->name, name, NSN_SHM_NAME_MAX - 1);
+    at_fadd(&shm->ref_count, 1, mo_rlx);
 
 done:
-    return result;
+    return shm;
 }
 
 void 
-nsn_shm_detach(struct nsn_shm *shm)
+nsn_shm_detach(nsn_shm_t *shm)
 {
     if (shm) {
         at_fsub(&shm->ref_count, 1, mo_rlx);
@@ -84,15 +86,53 @@ nsn_shm_detach(struct nsn_shm *shm)
     }
 }
 
-void 
-nsn_shm_release(struct nsn_shm *shm)
+int
+nsn_shm_release(nsn_shm_t *shm)
 {
-    struct nsn_shm tmp;
-    memcpy(&tmp, shm, sizeof(struct nsn_shm));
     if (shm) {
-        munmap((void *)tmp.base, tmp.size);
-        shm_unlink(tmp.name);
-        close(tmp.fd);
-    }
+        nsn_shm_t tmp;
+        memcpy(&tmp, shm, sizeof(nsn_shm_t));
+        if (at_fsub(&shm->ref_count, 1, mo_rlx) == 0) {
+            munmap((void *)shm->base, shm->size);
+            shm_unlink(shm->name);
+            close(shm->fd);
+            return 0;
+        }
+    } 
+
+    return -1;
 }
 
+// --- Shared Memory Page Allocator --------------------------------------------
+
+nsn_shm_page_allocator_t *
+nsn_shm_page_allocator_from_shm(mem_arena_t *arena, nsn_shm_t *shm, usize page_size)
+{
+    nsn_shm_page_allocator_t *allocator = mem_arena_push_struct(arena, nsn_shm_page_allocator_t);
+    allocator->shm        = shm;
+    allocator->page_size  = page_size;
+    allocator->page_count = nsn_shm_size(shm) / page_size;
+    allocator->page_pos   = 0;
+
+    return allocator;
+}
+
+void 
+nsn_shm_page_allocator_release(nsn_shm_page_allocator_t *allocator)
+{
+    // TODO: implement
+    nsn_unused(allocator);
+}
+
+void 
+*nsn_shm_page_alloc(nsn_shm_page_allocator_t *allocator)
+{
+    nsn_unused(allocator);    
+    return NULL;
+}
+
+void  nsn_shm_page_free(nsn_shm_page_allocator_t *allocator, void *page)
+{
+    nsn_unused(allocator);
+    nsn_unused(page);
+}

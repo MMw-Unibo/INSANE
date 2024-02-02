@@ -1,6 +1,14 @@
 #include "nsn_os.h"
 
 // --- Time --------------------------------------------------------------------
+u64 
+nsn_os_get_cycles(void)
+{
+    u64 hi, low;
+    __asm__ __volatile__ ("rdtsc" : "=a"(low), "=d"(hi));
+    return (hi << 32) | low;
+}
+
 i64 
 nsn_os_get_time_ns(void)
 {
@@ -112,6 +120,18 @@ nsn_os_mutex_init(struct nsn_mutex *mutex)
     return pthread_mutex_init(&mutex->handle, 0);    
 }
 
+void
+nsn_os_mutex_lock(struct nsn_mutex *mutex)
+{
+    pthread_mutex_lock(&mutex->handle);
+}
+
+void
+nsn_os_mutex_unlock(struct nsn_mutex *mutex)
+{
+    pthread_mutex_unlock(&mutex->handle);
+}
+
 int
 nsn_os_conditional_variable_init(struct nsn_conditional_variable *cv)
 {
@@ -123,8 +143,8 @@ nsn_os_conditional_variable_init(struct nsn_conditional_variable *cv)
 }
 
 // --- File --------------------------------------------------------------------
-struct nsn_file
-nsn_os_file_open(string8 filename, enum nsn_file_flag flags)
+nsn_file_t
+nsn_os_file_open(string_t filename, enum nsn_file_flag flags)
 {
     int mode = 0;
     if (flags & NsnFileFlag_Read) {
@@ -143,22 +163,22 @@ nsn_os_file_open(string8 filename, enum nsn_file_flag flags)
         mode |= O_APPEND;
     }
 
-    struct nsn_file result = {0};
+    nsn_file_t result = {0};
     result.handle = open((const char *)filename.data, mode, 0644);
     return result;
 }
 
 bool 
-nsn_file_valid(struct nsn_file file)
+nsn_file_valid(nsn_file_t file)
 {
     return file.handle != -1;
 }
 
 
-string8 
-nsn_os_read_entire_file(struct mem_arena *arena, struct nsn_file file)
+string_t
+nsn_os_read_entire_file(mem_arena_t *arena, nsn_file_t file)
 {
-    string8 result = {0};
+    string_t result = {0};
 
     struct stat file_stat = {0};
     if (fstat(file.handle, &file_stat) == -1) {

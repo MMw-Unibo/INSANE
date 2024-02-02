@@ -11,38 +11,40 @@ enum nsn_config_opt_type {
     NsnConfigOptType_Boolean,
 };
 
-typedef struct nsn_config_opt nsn_config_opt;
+typedef struct nsn_config_opt nsn_cfg_opt_t;
 struct nsn_config_opt
 {
-    string8     key;
+    string_t     key;
     u32         type;
     union {
-        string8     string;
+        string_t     string;
         f64         number;
         bool        boolean;
     };
 
-    list_head   list;
+    list_head_t   list;
 };
 
 
-typedef struct nsn_config_section nsn_config_section;
+typedef struct nsn_config_section nsn_cfg_sec_t;
 struct nsn_config_section
 {
-    string8             name;
-    nsn_config_section *parent;
+    string_t                 name;
+    nsn_cfg_sec_t    *parent;
 
-    list_head   sub_sections;
-    list_head   opts;
-    list_head   list;
+    list_head_t   sub_sections;
+    list_head_t   opts;
+    list_head_t   list;
 };
 
-typedef struct nsn_config nsn_config;
+typedef struct nsn_config nsn_cfg_t;
 struct nsn_config 
 {
-    list_head   sections;
+    list_head_t  sections;
 };
 
-nsn_config *nsn_load_config(mem_arena *arena, string8 path);
+nsn_cfg_t *nsn_load_config(mem_arena_t *arena, string_t path);
+
+int nsn_config_get_int(nsn_cfg_t *config, string_t section, string_t key, int *out_value);
 
 #endif // NSN_CONFIG_H

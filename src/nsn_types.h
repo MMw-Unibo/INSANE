@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
+#include <time.h>
 
 typedef int8_t      i8;
 typedef int16_t     i16;
@@ -66,12 +67,13 @@ typedef atomic_uint_fast64_t    atu64;
 #define mo_acq_rel  memory_order_acq_rel
 #define mo_seq      memory_order_seq_cst
 
-#define at_load(a, mo)                  atomic_load_explicit(a, mo)
-#define at_store(a, v, mo)              atomic_store_explicit(a, v, mo)
-#define at_xchg(a, v, mo)               atomic_exchange_explicit(a, v, mo)
-#define at_cas(a, e, v, mo_s, mo_f)     atomic_compare_exchange_strong_explicit(a, e, v, mo_s, mo_f)
-#define at_fadd(a, v, mo)               atomic_fetch_add_explicit(a, v, mo)
-#define at_fsub(a, v, mo)               atomic_fetch_sub_explicit(a, v, mo)
+#define at_load(a, mo)                      atomic_load_explicit(a, mo)
+#define at_store(a, v, mo)                  atomic_store_explicit(a, v, mo)
+#define at_xchg(a, v, mo)                   atomic_exchange_explicit(a, v, mo)
+#define at_cas(a, e, v, mo_s, mo_f)         atomic_compare_exchange_strong_explicit(a, e, v, mo_s, mo_f)
+#define at_cas_weak(a, e, v, mo_s, mo_f)    atomic_compare_exchange_weak_explicit(a, e, v, mo_s, mo_f)
+#define at_fadd(a, v, mo)                   atomic_fetch_add_explicit(a, v, mo)
+#define at_fsub(a, v, mo)                   atomic_fetch_sub_explicit(a, v, mo)
 
 // -----------------------------------------------------------------------------
 
@@ -110,19 +112,19 @@ static inline bool  is_power_of_two(usize value)             { return (value & (
 
 // --- Collections Helpers -----------------------------------------------------
 
-typedef struct list_head list_head;
+typedef struct list_head list_head_t;
 struct list_head
 {
-    list_head *next;
-    list_head *prev;
+    list_head_t *next;
+    list_head_t *prev;
 };
 
-#define list_head_init(name)        ((list_head){ &(name), &(name) })
-#define list_head(name)             list_head name = list_head_init(name)
+#define list_head_init(name)        ((list_head_t){ &(name), &(name) })
+#define list_head(name)             list_head_t name = list_head_init(name)
 
-static inline void list_add(list_head *h, list_head *n)         { n->next = h->next; n->prev = h; h->next->prev = n; h->next = n; }
-static inline void list_add_tail(list_head *h, list_head *n)    { n->next = h; n->prev = h->prev; h->prev->next = n; h->prev = n; }
-static inline bool list_empty(list_head *h)                     { return h->next == h; }
+static inline void list_add(list_head_t *h, list_head_t *n)         { n->next = h->next; n->prev = h; h->next->prev = n; h->next = n; }
+static inline void list_add_tail(list_head_t *h, list_head_t *n)    { n->next = h; n->prev = h->prev; h->prev->next = n; h->prev = n; }
+static inline bool list_empty(list_head_t *h)                     { return h->next == h; }
 
 #ifndef typeof
 #define typeof __typeof__

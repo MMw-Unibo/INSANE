@@ -7,6 +7,12 @@
 #include <string.h>
 #include <time.h>
 
+#if __linux__
+# include <sys/time.h>
+#else
+# error "Unsupported operating system"
+#endif
+
 //--------------------------------------------------------------------------------------------------
 // Colors
 #define ANSI_COLOR_RED     "\x1b[31m"
@@ -42,19 +48,19 @@ enum logger_level
 };
 
 #ifdef NSN_ENABLE_LOGGER
-# define log(level, ...) logger_log(level, ##__VA_ARGS__)
-# define log_trace(...)  logger_log(LOGGER_LEVEL_TRACE, ##__VA_ARGS__)
-# define log_debug(...)  logger_log(LOGGER_LEVEL_DEBUG, ##__VA_ARGS__)
-# define log_info(...)   logger_log(LOGGER_LEVEL_INFO, ##__VA_ARGS__)
-# define log_warn(...)   logger_log(LOGGER_LEVEL_WARN, ##__VA_ARGS__)
-# define log_error(...)  logger_log(LOGGER_LEVEL_ERROR, ##__VA_ARGS__)
+# define log(level, fmt, ...) logger_log(level, fmt, ##__VA_ARGS__)
+# define log_trace(fmt, ...)  logger_log(LOGGER_LEVEL_TRACE, fmt, ##__VA_ARGS__)
+# define log_debug(fmt, ...)  logger_log(LOGGER_LEVEL_DEBUG, fmt, ##__VA_ARGS__)
+# define log_info(fmt, ...)   logger_log(LOGGER_LEVEL_INFO, fmt, ##__VA_ARGS__)
+# define log_warn(fmt, ...)   logger_log(LOGGER_LEVEL_WARN, fmt, ##__VA_ARGS__)
+# define log_error(fmt, ...)  logger_log(LOGGER_LEVEL_ERROR, fmt, ##__VA_ARGS__)
 #else
-# define log(level, ...)
-# define log_trace(...)
-# define log_debug(...)
-# define log_info(...)
-# define log_warn(...)
-# define log_error(...)
+# define log(level, fmt, ...)
+# define log_trace(fmt, ...)
+# define log_debug(fmt, ...)
+# define log_info(fmt, ...)
+# define log_warn(fmt, ...)
+# define log_error(fmt, ...)
 #endif // NSN_ENABLE_LOGGER
 
 int  logger_init(struct logger_config *config);
@@ -157,9 +163,12 @@ logger_log(int level, char *fmt, ...)
 
     if (s_config.ts)
     {
-        time_t     t  = time(NULL);
-        struct tm *tm = localtime(&t);
-        buflen += strftime(buf + buflen, sizeof(buf) - buflen, "%Y-%m-%d %H:%M:%S ", tm);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        struct tm *tm = localtime(&ts.tv_sec);
+
+        buflen += strftime(buf + buflen, sizeof(buf) - buflen, "%Y-%m-%d %H:%M:%S", tm);
+        buflen += snprintf(buf + buflen, sizeof(buf) - buflen, ".%09ld ", ts.tv_nsec);
     }
 
     if (s_config.color)

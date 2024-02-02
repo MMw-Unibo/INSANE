@@ -5,6 +5,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// --- Error Codes ----------------------------------------------------------------
+#define NSN_ERROR_ALREADY_INITIALIZED   1
+#define NSN_ERROR_NOT_INITIALIZED       2
+
 //--------------------------------------------------------------------------------------------------
 // INSANE Buffer
 //--------------------------------------------------------------------------------------------------
@@ -57,10 +61,9 @@ typedef struct nsn_options {
 typedef uint32_t nsn_sink_t;
 typedef uint32_t nsn_source_t;
 
-typedef struct nsn_stream
-{
-    nsn_options_t options;
-} nsn_stream_t;
+#define NSN_INVALID_STREAM_HANDLE  0
+typedef uint32_t nsn_stream_t;
+
 typedef void *handle_data_cb;
 
 //--------------------------------------------------------------------------------------------------
@@ -79,6 +82,13 @@ int nsn_close();
  * @returns  The handler to the created stream
  */
 nsn_stream_t nsn_create_stream(nsn_options_t *opts);
+
+/**
+ * @brief    Close an INSANE stream
+ * @param    stream     The stream to be closed
+ * @returns  The outcome of the close operation
+ */
+int nsn_destroy_stream(nsn_stream_t stream);
 
 /**
  * @brief    Open an INSANE source
