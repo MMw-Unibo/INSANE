@@ -3,12 +3,14 @@
 #include "nsn.h"
 #include "nsn_os.h"
 #include "nsn_os_inc.h"
+#include "nsn_string.h"
 
 // --- c files -----------------------------------------------------------------
 #include "nsn.c"
 #include "nsn_memory.c"
 #include "nsn_os_inc.c"
 #include "nsn_shm.c"
+#include "nsn_string.c"
 
 #define NSN_LOG_IMPLEMENTATION_H
 #include "nsn_log.h"

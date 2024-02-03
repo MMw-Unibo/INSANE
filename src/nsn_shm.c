@@ -1,5 +1,7 @@
 #include "nsn_shm.h"
 
+#define NSN_HUGETLBFS_PATH "/dev/hugepages"
+
 static void *
 _nsn_shm_create_with_flags(const char *name, usize size, int flags, int mode, int *out_fd)
 {
@@ -9,18 +11,27 @@ _nsn_shm_create_with_flags(const char *name, usize size, int flags, int mode, in
     }
 
     // TODO: use OS layer
-    int shm_fd = shm_open(name, flags, mode);
+    // int shm_fd = shm_open(name, flags, mode);
+
+    char fullpath[128];
+    snprintf(fullpath, sizeof(fullpath), "%s/%s", NSN_HUGETLBFS_PATH, name);
+
+    int shm_fd = open(fullpath, flags, mode);
     if (shm_fd == -1) {
         log_error("shm_open() failed to create mem '%s': %s\n", name, strerror(errno));
         return NULL;
     }
 
     if (ftruncate(shm_fd, size) == -1) {
+        log_error("ftruncate() failed to create mem '%s': %s\n", name, strerror(errno));
         goto error;
     }
 
-    void *buffer = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    // Set the MAP_HUGETLB flag to use 2MB huge pages
+    void *buffer = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_LOCKED | MAP_HUGETLB, shm_fd, 0);
+    // void *buffer = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (!buffer) {
+        log_error("mmap() failed to create mem '%s': %s\n", name, strerror(errno));
         goto error;
     }
 
@@ -28,7 +39,8 @@ _nsn_shm_create_with_flags(const char *name, usize size, int flags, int mode, in
     return buffer;
 
 error:
-    shm_unlink(name);
+    close(shm_fd);
+    shm_unlink(fullpath);
     return NULL;
 }
 
@@ -45,7 +57,7 @@ nsn_shm_alloc(mem_arena_t *arena, const char *name, usize size)
 
     shm = mem_arena_push_struct(arena, nsn_shm_t);
     strncpy(shm->name, name, NSN_SHM_NAME_MAX - 1);
-    shm->base = buffer;
+    shm->data = buffer;
     shm->size = size;
     shm->fd   = fd;
     at_fadd(&shm->ref_count, 1, mo_rlx);
@@ -66,7 +78,7 @@ nsn_shm_attach(mem_arena_t *arena, const char *name, usize size)
     }
 
     shm = mem_arena_push_struct(arena, nsn_shm_t);
-    shm->base = buffer;
+    shm->data = buffer;
     shm->size = size;
     shm->fd   = fd;
     strncpy(shm->name, name, NSN_SHM_NAME_MAX - 1);
@@ -81,7 +93,7 @@ nsn_shm_detach(nsn_shm_t *shm)
 {
     if (shm) {
         at_fsub(&shm->ref_count, 1, mo_rlx);
-        munmap((void *)shm->base, shm->size);
+        munmap((void *)shm->data, shm->size);
         close(shm->fd);
     }
 }
@@ -93,46 +105,17 @@ nsn_shm_release(nsn_shm_t *shm)
         nsn_shm_t tmp;
         memcpy(&tmp, shm, sizeof(nsn_shm_t));
         if (at_fsub(&shm->ref_count, 1, mo_rlx) == 0) {
-            munmap((void *)shm->base, shm->size);
-            shm_unlink(shm->name);
+            munmap((void *)shm->data, shm->size);
+            // shm_unlink(shm->name);
             close(shm->fd);
+
+            // remove the file
+            char fullpath[128];
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", NSN_HUGETLBFS_PATH, shm->name);
+            unlink(fullpath);
             return 0;
         }
     } 
 
     return -1;
-}
-
-// --- Shared Memory Page Allocator --------------------------------------------
-
-nsn_shm_page_allocator_t *
-nsn_shm_page_allocator_from_shm(mem_arena_t *arena, nsn_shm_t *shm, usize page_size)
-{
-    nsn_shm_page_allocator_t *allocator = mem_arena_push_struct(arena, nsn_shm_page_allocator_t);
-    allocator->shm        = shm;
-    allocator->page_size  = page_size;
-    allocator->page_count = nsn_shm_size(shm) / page_size;
-    allocator->page_pos   = 0;
-
-    return allocator;
-}
-
-void 
-nsn_shm_page_allocator_release(nsn_shm_page_allocator_t *allocator)
-{
-    // TODO: implement
-    nsn_unused(allocator);
-}
-
-void 
-*nsn_shm_page_alloc(nsn_shm_page_allocator_t *allocator)
-{
-    nsn_unused(allocator);    
-    return NULL;
-}
-
-void  nsn_shm_page_free(nsn_shm_page_allocator_t *allocator, void *page)
-{
-    nsn_unused(allocator);
-    nsn_unused(page);
 }

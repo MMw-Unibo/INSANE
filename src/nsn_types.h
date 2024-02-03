@@ -15,6 +15,8 @@
 # include <sys/stat.h>
 # include <sys/types.h>
 # include <sys/un.h>
+
+# include <linux/mman.h>
 #else
 # error "Unsupported operating system"
 #endif
@@ -122,6 +124,7 @@ struct list_head
 #define list_head_init(name)        ((list_head_t){ &(name), &(name) })
 #define list_head(name)             list_head_t name = list_head_init(name)
 
+static inline void list_init(list_head_t *h)                        { h->next = h; h->prev = h; }
 static inline void list_add(list_head_t *h, list_head_t *n)         { n->next = h->next; n->prev = h; h->next->prev = n; h->next = n; }
 static inline void list_add_tail(list_head_t *h, list_head_t *n)    { n->next = h; n->prev = h->prev; h->prev->next = n; h->prev = n; }
 static inline bool list_empty(list_head_t *h)                     { return h->next == h; }

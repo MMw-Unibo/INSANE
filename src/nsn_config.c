@@ -4,8 +4,8 @@ nsn_cfg_t *
 nsn_load_config(mem_arena_t *arena, string_t path)
 {
     nsn_cfg_t *config = mem_arena_push_struct(arena, nsn_cfg_t);
-    config->sections     = list_head_init(config->sections);
-
+    list_init(&config->sections);
+    
     nsn_file_t config_file = nsn_os_file_open(path, NsnFileFlag_Read);
     if (!nsn_file_valid(config_file)) {
         return NULL;
@@ -35,8 +35,8 @@ nsn_load_config(mem_arena_t *arena, string_t path)
 
             nsn_cfg_sec_t *new_section = mem_arena_push_struct(arena, nsn_cfg_sec_t);
             new_section->name               = sections_string.head->string;
-            new_section->opts               = list_head_init(new_section->opts);
-            new_section->sub_sections       = list_head_init(new_section->sub_sections);
+            list_init(&new_section->opts);
+            list_init(&new_section->sub_sections);       
             list_add_tail(&config->sections, &new_section->list);
 
             current_section = new_section;
@@ -44,7 +44,7 @@ nsn_load_config(mem_arena_t *arena, string_t path)
             if (sections_string.count == 2) {
                 nsn_cfg_sec_t *sub_section = mem_arena_push_struct(arena, nsn_cfg_sec_t);
                 sub_section->name               = sections_string.head->next->string;
-                sub_section->opts               = list_head_init(sub_section->opts);
+                list_init(&sub_section->opts);
                 list_add_tail(&new_section->sub_sections, &sub_section->list);
                 sub_section->parent             = new_section;
 

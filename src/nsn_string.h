@@ -63,6 +63,7 @@ string_t str_trim(string_t string);
 f64 f64_from_str(string_t value);
 
 // --- Comparisons -------------------------------------------------------------
+bool cstr_eq(char *cstr, string_t match);
 bool str_eq(string_t string, string_t match);
 bool str_match_one_of(string_t string, string_t *matches, usize match_count);
 bool str_starts_with(string_t string, string_t prefix);

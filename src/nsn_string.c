@@ -157,6 +157,12 @@ str_split(mem_arena_t *arena, string_t string, string_t *delimiters, usize delim
 
 
 // --- Comparisons -------------------------------------------------------------
+bool 
+cstr_eq(char *cstr, string_t match)
+{
+    return str_eq(make_string(cstr, calc_cstr_len(cstr)), match);
+}
+
 bool
 str_eq(string_t string, string_t match)
 {

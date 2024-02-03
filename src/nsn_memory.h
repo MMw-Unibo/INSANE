@@ -60,7 +60,7 @@ struct fixed_mem_arena {
     usize size;
     usize pos;
     usize align;
-};
+} nsn_cache_aligned;
 
 fixed_mem_arena_t *fixed_mem_arena_alloc_with_alignement(void *memory, usize size, usize align);
 #define fixed_mem_arena_alloc(memory, size)       fixed_mem_arena_alloc_with_alignement(memory, size, MEM_ARENA_DEFAULT_ALIGNEMENT)
