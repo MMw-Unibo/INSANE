@@ -24,6 +24,8 @@ nsn_os_load_library(const char *path, int flags)
 {
     int mode = NsnOsLibraryFlag_Lazy;
     if (flags & NsnOsLibraryFlag_Now) {
+        // RTLD_NOW: Resolve all symbols at load time.
+        // RTLD_GLOBAL: Symbols are available for relocation processing of other modules.
         mode = RTLD_NOW;
     }
 
@@ -112,6 +114,28 @@ nsn_os_thread_create(nsn_os_thread_proc proc, void *arg)
     }
 
     return thread;
+}
+
+int
+nsn_os_thread_join(struct nsn_os_thread thread)
+{
+    return pthread_join(thread.handle, 0);
+}
+
+struct nsn_os_thread
+nsn_os_get_current_thread(void)
+{
+    struct nsn_os_thread thread = {
+        .handle = pthread_self()
+    };
+
+    return thread;
+}
+
+int 
+nsn_os_current_thread_id(void)
+{
+    return gettid();
 }
 
 int

@@ -2,7 +2,7 @@
 CC=gcc
 CFLAGS="-g -Wall -Wextra -Werror -pedantic -std=c11 -fPIC -Wno-unused-function -Wno-unused-variable"
 
-DPDK=`pkg-config --cflags --libs libdpdk`
+DPDK=`pkg-config --cflags --libs libdpdk --static`
 
 $CC $CFLAGS -c dpdk.c -o dpdk.o
 $CC $CFLAGS -shared -o libdpdk.so dpdk.o $DPDK 

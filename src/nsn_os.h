@@ -56,6 +56,7 @@ int nsn_os_get_process_id(void);
 
 // --- Thread ------------------------------------------------------------------
 
+typedef struct nsn_os_thread nsn_os_thread_t;
 struct nsn_os_thread
 {
 #if NSN_OS_LINUX
@@ -70,6 +71,9 @@ typedef void *(*nsn_os_thread_proc)(void *arg);
 #define NSN_OS_INVALID_THREAD_HANDLE ((struct nsn_os_thread){0})
 
 struct nsn_os_thread nsn_os_thread_create(nsn_os_thread_proc proc, void *arg);
+int nsn_os_thread_join(struct nsn_os_thread thread);
+struct nsn_os_thread nsn_os_get_current_thread(void);
+int nsn_os_current_thread_id(void);
 
 typedef struct nsn_mutex nsn_mutex_t;
 struct nsn_mutex

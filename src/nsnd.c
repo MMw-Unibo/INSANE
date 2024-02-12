@@ -21,6 +21,16 @@
 #include "nsn_shm.c"
 #include "nsn_string.c"
 
+#define NSN_DEFAULT_CONFIG_FILE     "nsnd.cfg"
+
+#define NSN_CFG_DEFAULT_SECTION                 "global"
+#define NSN_CFG_DEFAULT_SHM_NAME                "nsnd_datamem"
+#define NSN_CFG_DEFAULT_IO_BUFS_NUM             1024
+#define NSN_CFG_DEFAULT_IO_BUFS_SIZE            2048
+#define NSN_CFG_DEFAULT_SHM_SIZE                64      // in MB
+#define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME         "tx_io_buffer_pool"
+
 // #include "nsn_thread_pool.c"
 
 /**
@@ -94,9 +104,9 @@ signal_handler(int signum)
 
 struct datapath_ops
 {
-    nsn_datapath_init *init;
-    nsn_datapath_tx *tx;
-    nsn_datapath_deinit *deinit;
+    nsn_datapath_init       *init;
+    nsn_datapath_tx         *tx;
+    nsn_datapath_deinit     *deinit;
 };
 
 ////////
@@ -164,8 +174,8 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
     // the pointer to the next zone, the pointer to the previous zone, and the pointer to the first block of the zone.
 
     usize io_buf_pool_size = cfg->io_buffer_pool_size * cfg->io_buffer_size;
-    nsn_memory_manager_create_zone(mem, str_lit("rx_io_buffer_pool"), io_buf_pool_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
-    nsn_memory_manager_create_zone(mem, str_lit("tx_io_buffer_pool"), io_buf_pool_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+    nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME), io_buf_pool_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+    nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME), io_buf_pool_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
 
     return mem;
 }
@@ -214,11 +224,97 @@ nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size
     return zone;
 }
 
+// --- Data Plane Thread -------------------------------------------------------
+
+enum nsn_dataplane_thread_state
+{
+    NSN_DATAPLANE_THREAD_STATE_WAIT,
+    NSN_DATAPLANE_THREAD_STATE_RUNNING,
+    NSN_DATAPLANE_THREAD_STATE_STOP,
+};
+
+struct nsn_dataplane_thread_args
+{
+    nsn_mem_manager_t *mm;
+    atu32              state;
+    string_t           datapath_name;
+};
+
+void *
+dataplane_thread_proc(void *arg)
+{
+    struct nsn_dataplane_thread_args *args = (struct nsn_dataplane_thread_args *)arg;
+    nsn_mem_manager_t *mem = args->mm;
+    nsn_unused(mem);
+
+    int self = nsn_os_current_thread_id();
+    u32 state;
+
+    int running = 0;
+
+wait: while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_WAIT) {
+        usleep(10);
+    } 
+
+    if (state == NSN_DATAPLANE_THREAD_STATE_STOP) {
+        return NULL;
+    }
+
+    // TODO: start the data plane
+    string_t datapath_name = args->datapath_name;
+    log_debug("[thread %d] dataplane thread started for datapath: " str_fmt "\n", self, str_varg(datapath_name));                 
+    char datapath_lib[256];
+    snprintf(datapath_lib, sizeof(datapath_lib), "./datapaths/lib%s.so", to_cstr(datapath_name));
+    struct nsn_os_module module = nsn_os_load_library(datapath_lib, NsnOsLibraryFlag_Now);
+    if (module.handle == NULL) {
+        log_error("[thread %d] Failed to load library: %s\n", self, datapath_lib);
+        goto quit;
+    }
+
+    struct datapath_ops ops = {
+        .init   = (nsn_datapath_init*)  nsn_os_get_proc_address(module, "dpdk_datapath_init"),
+        .tx     = (nsn_datapath_tx*)    nsn_os_get_proc_address(module, "dpdk_datapath_tx"),
+        .deinit = (nsn_datapath_deinit*)nsn_os_get_proc_address(module, "dpdk_datapath_deinit"),
+    };
+    
+    struct nsn_datapath_ctx ctx = {
+        .running = running,
+    };
+
+    log_debug("[thread %d] init: %d\n", self, ops.init(&ctx));
+
+    while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_RUNNING) {
+        // TODO: dpdk example, in the final code the string "dpdk" should be replaced by the name of the datapath
+        // and has to be done in a parameterized way. 
+        log_trace("[thread %d] tx: %d\n", self, ops.tx(&ctx));
+        sleep(1);
+    }
+
+    log_debug("[thread %d] deinit\n", self);
+    if (ops.deinit(NULL)) {
+        log_error("[thread %d] Failed to deinit\n", self);
+    }
+
+    log_debug("[thread %d] unloading library\n", self);
+    nsn_os_unload_library(module);
+
+    if ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_WAIT) {
+        running = 1;
+        goto wait;
+    }
+
+quit:
+    return NULL;
+}
+
 // --- Main -------------------------------------------------------------------
 
 int 
-main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
+main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg, 
+    struct nsn_dataplane_thread_args *dp_args, usize dp_args_count)
 {
+    nsn_unused(dp_args_count);
+
     // send a message to the daemon to create a new instance
     int res = 0;
     temp_mem_arena_t temp_arena = nsn_thread_scratch_begin(NULL, 0);
@@ -279,10 +375,19 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
         case NSN_CMSG_TYPE_CREATE_STREAM:
         {
             log_debug("received new stream message from app %d\n", app_id);
+
+            // start the first data plane thread
+            dp_args[0].datapath_name = str_lit("dpdk");
+            at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+
         } break;
         case NSN_CMSG_TYPE_DESTROY_STREAM:
         {
             log_debug("received destroy stream message from app %d\n", app_id);
+
+            // stop the first data plane thread
+            at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
+
         } break;
         case NSN_CMSG_TYPE_DISCONNECT:
         {
@@ -341,15 +446,13 @@ main(int argc, char *argv[])
     logger_init(NULL);
     logger_set_level(LOGGER_LEVEL_TRACE);
 
-    log_info("sizeof nsn_ringbuffer_t: %zu\n", sizeof(nsn_ringbuf_t));
-
-    instance_id    = nsn_os_get_process_id();
-    scratch_arena  = mem_arena_alloc(gigabytes(1));
+    instance_id   = nsn_os_get_process_id();
+    scratch_arena = mem_arena_alloc(gigabytes(1));
 
     for (int i = 0; i < argc; i++)
         str_list_push(scratch_arena, &arg_list, str_cstr(argv[i]));
 
-    string_t config_filename = str_lit("nsnd.cfg");
+    string_t config_filename = str_lit(NSN_DEFAULT_CONFIG_FILE);
     for (string_node_t *node = arg_list.head; node; node = node->next) {
         if (str_eq(str_lit("--config"), node->string) || str_eq(str_lit("-c"), node->string)) {
             if (node->next) {
@@ -364,12 +467,10 @@ main(int argc, char *argv[])
         exit(1);
     }
  
-    log_debug("instance id: %d\n", instance_id);
-
     int app_num      = 64;
-    int io_bufs_num  = 0;
-    int io_bufs_size = 1024;   
-    int shm_size     = 64; // in MB
+    int io_bufs_num  = NSN_CFG_DEFAULT_IO_BUFS_NUM;
+    int io_bufs_size = NSN_CFG_DEFAULT_IO_BUFS_SIZE;   
+    int shm_size     = NSN_CFG_DEFAULT_SHM_SIZE;
     
     nsn_config_get_int(config, str_lit("global"), str_lit("app_num"), &app_num);      
     nsn_config_get_int(config, str_lit("global"), str_lit("io_bufs_num"), &io_bufs_num);
@@ -392,7 +493,7 @@ main(int argc, char *argv[])
 
     // create the shared memory
     nsn_mem_manager_cfg_t mem_cfg = {
-        .shm_name            = str_lit("nsnd_datamem"),
+        .shm_name            = str_lit(NSN_CFG_DEFAULT_SHM_NAME),
         .shm_size            = megabytes(shm_size),
         .io_buffer_pool_size = io_bufs_num,
         .io_buffer_size      = io_bufs_size,
@@ -425,42 +526,34 @@ main(int argc, char *argv[])
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
+    // --- Create some threads
+    struct nsn_dataplane_thread_args dp_args[2] = {
+        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT },
+        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT }
+    };
+
+    nsn_os_thread_t threads[1];
+    for (usize i = 0; i < array_count(threads); i++) {
+        log_trace("creating thread %d\n", i);
+        threads[i] = nsn_os_thread_create(dataplane_thread_proc, &dp_args[i]);
+    }
+
     while (g_running) 
     {
-        if (main_thread_control_ipc(sockfd, mem_cfg) < 0)
+        if (main_thread_control_ipc(sockfd, mem_cfg, dp_args, array_count(dp_args)) < 0)
             log_warn("Failed to handle control ipc\n");
 
         usleep(1);
     }
 
-    // struct nsn_os_module module = nsn_os_load_library("./datapaths/libdpdk.so", 0);
-    // if (module.handle == NULL) {
-    //     log_error("Failed to load library: %s\n", strerror(errno));
-    //     // return -1;
-    // }
+    // Tell the threads to stop
+    for (usize i = 0; i < array_count(threads); i++) {
+        at_store(&dp_args[i].state, NSN_DATAPLANE_THREAD_STATE_STOP, mo_rlx);
+    }
 
-    // // TODO: dpdk example, in the final code the string "dpdk" should be replaced by the name of the datapath
-    // // and has to be done in a parameterized way. 
-    // struct datapath_ops ops = {
-    //     .init   = (nsn_datapath_init*)  nsn_os_get_proc_address(module, "dpdk_datapath_init"),
-    //     .tx     = (nsn_datapath_tx*)    nsn_os_get_proc_address(module, "dpdk_datapath_tx"),
-    //     .deinit = (nsn_datapath_deinit*)nsn_os_get_proc_address(module, "dpdk_datapath_deinit"),
-    // };
-
-    // void *rawdata = nsn_shm_rawdata(shm);
-    // log_debug("%p == %p", (void*)shm->base, rawdata);
-
-    // struct nsn_datapath_ctx ctx = {
-    //     .running          = 1,
-    //     .data_memory      = rawdata,
-    //     .data_memory_size = nsn_shm_size(shm),
-    // };
-
-    // log_debug("init: %d\n", ops.init(&ctx));
-    // log_debug("tx: %d\n", ops.tx(NULL));
-
-    // log_debug("deinit: %d\n", ops.deinit(NULL));
-    // nsn_os_unload_library(module);
+    for (usize i = 0; i < array_count(threads); i++) {
+        nsn_os_thread_join(threads[i]);
+    }
 
     // cleanup
 clear_and_quit:
