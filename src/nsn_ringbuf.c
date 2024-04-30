@@ -17,6 +17,8 @@ nsn_ringbuf_create_elem(void *memory, string_t name, usize esize, u32 count)
     rb->mask     = count - 1;
     rb->capacity = rb->mask;
 
+    log_trace("create ringbuf %.*s with %u elements\n", str_varg(name), count);
+
     // set the head and tail to 0
     rb->prod.head = 0;
     rb->prod.tail = 0;
@@ -38,6 +40,12 @@ nsn_ringbuf_get_capacity(nsn_ringbuf_t *rb)
     return rb->capacity;
 }
 
+u32
+nsn_ringbuf_get_size(nsn_ringbuf_t *rb)
+{
+    return rb->size;
+}
+
 u32 
 nsn_ringbuf_count(nsn_ringbuf_t *rb)
 {
@@ -49,34 +57,27 @@ nsn_ringbuf_count(nsn_ringbuf_t *rb)
 }
 
 static inline u32
-__nsn_ringbuf_move_prod_head(nsn_ringbuf_t *rb, u32 n, u32 *old_head, u32 *new_head, u32 *free_entries)
+__nsn_ringbuf_move_prod_head(nsn_ringbuf_t *rb, u32 n, atu32 *old_head, atu32 *new_head, u32 *free_entries)
 {
     const u32 capacity = rb->capacity;
-    u32 cons_tail;
-    u32 max = n;
-
+    u32 max            = n;
     int success;
 
-    *old_head = at_load(&rb->prod.head, mo_rlx);
     do
     {
-        n = max;
+        n         = max;
+        *old_head = rb->prod.head;
 
-        atomic_thread_fence(memory_order_acquire);
+        nsn_compiler_barrier();
 
-        cons_tail = at_load(&rb->cons.tail, mo_acq);
+        *free_entries = (capacity + rb->cons.tail - *old_head);
 
-        *free_entries = capacity - (*old_head - cons_tail);
-
-        // if (nsn_unlikely(n > *free_entries))
-            // n = (behavior == nsn_RB_BEHAVIOR_FIXED) ? 0 : *free_entries;
-
-        if (nsn_unlikely(n == 0))
-            return 0;
+        if (nsn_unlikely(n > *free_entries))    n = 0;
+        if (nsn_unlikely(n == 0))               return 0;
 
         *new_head = *old_head + n;
 
-        success = at_cas_weak(&rb->prod.head, (atu32 *)old_head, *new_head, mo_rlx, mo_rlx);
+        success = at_cas_weak(&rb->prod.head, old_head, *new_head, mo_rlx, mo_rlx);
     } while (nsn_unlikely(success == 0));
 
     return n;
@@ -129,13 +130,13 @@ __nsn_ringbuf_enqueue_elems(nsn_ringbuf_t *rb, u32 prod_head, const void *obj_ta
 static inline u32
 __nsn_ringbuf_do_enqueue_elems(nsn_ringbuf_t *rb, const void *obj_table, u32 esize, u32 n, u32 *free_space)
 {
-    u32 prod_head, prod_next;
+    atu32 prod_head, prod_next;
     u32 free_entries;
 
     n = __nsn_ringbuf_move_prod_head(rb, n, &prod_head, &prod_next, &free_entries);
     if (n == 0)
     {
-        log_trace("no free entries in ringbuf\n");
+        log_warn("no free entries in ringbuf\n");
         goto end;
     }
 
@@ -143,8 +144,9 @@ __nsn_ringbuf_do_enqueue_elems(nsn_ringbuf_t *rb, const void *obj_table, u32 esi
     __nsn_ringbuf_enqueue_elems(rb, prod_head, obj_table, esize, n);
 
     // update producer tail
-    while (at_load(&rb->prod.tail, mo_rlx) != prod_head)
+    while (at_load(&rb->prod.tail, mo_rlx) != prod_head) {
         nsn_pause();
+    }
 
     at_store(&rb->prod.tail, prod_next, mo_rlx);
 
@@ -162,31 +164,26 @@ nsn_ringbuf_enqueue_burst(nsn_ringbuf_t *rb, const void *obj_table, u32 esize, u
 }
 
 static inline u32
-__nsn_ringbuf_move_cons_head(nsn_ringbuf_t *rb, u32 n, u32 *old_head, u32 *new_head, u32 *entries)
+__nsn_ringbuf_move_cons_head(nsn_ringbuf_t *rb, u32 n, atu32 *old_head, atu32 *new_head, u32 *entries)
 {
-    u32 prod_tail;
     u32 max = n;
-
     int success;
 
-    *old_head = at_load(&rb->cons.head, mo_rlx);
     do {
         n = max;
 
-        atomic_thread_fence(memory_order_acquire);
+        *old_head = rb->cons.head;
 
-        prod_tail = at_load(&rb->prod.tail, mo_acq);
-        *entries  = prod_tail - *old_head;
+        nsn_compiler_barrier();
 
-        if (nsn_unlikely(n > *entries))
-            // n = (behavior == nsn_RB_BEHAVIOR_FIXED) ? 0 : *entries;
+        *entries = (rb->prod.tail - *old_head);
 
-        if (nsn_unlikely(n == 0))
-            return 0;
+        if (nsn_unlikely(n > *entries))     n = 0;
+        if (nsn_unlikely(n == 0))           return 0;
 
         *new_head = *old_head + n;
 
-        success = at_cas_weak(&rb->cons.head, (atu32 *)old_head, *new_head, mo_rlx, mo_rlx);
+        success = at_cas_weak(&rb->cons.head, old_head, *new_head, mo_rlx, mo_rlx);
     } while (nsn_unlikely(success == 0));
 
     return n;
@@ -234,7 +231,7 @@ __nsn_ringbuf_dequeue_elems(nsn_ringbuf_t *rb, u32 cons_head, void *obj_table, u
 static inline u32
 __nsn_ringbuf_do_dequeue_elems(nsn_ringbuf_t *rb, void *obj_table, u32 esize, u32 n, u32 *available)
 {
-    u32 cons_head, cons_next;
+    atu32 cons_head, cons_next;
     u32 entries;
 
     n = __nsn_ringbuf_move_cons_head(rb, n, &cons_head, &cons_next, &entries);

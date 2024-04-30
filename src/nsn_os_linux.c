@@ -198,6 +198,39 @@ nsn_file_valid(nsn_file_t file)
     return file.handle != -1;
 }
 
+string_t 
+nsn_os_read_entire_pseudofile(mem_arena_t *arena, nsn_file_t file)
+{
+    // a pseudofile is a file that is not a real file, but a file-like interface to a kernel subsystem
+    // for example /proc/cpuinfo, /proc/meminfo, /proc/self/maps, etc.
+
+    char buffer[4096];
+    bool is_first = true;
+    u8 *start     = NULL;
+    usize len     = 0;
+    while (true) {
+        ssize_t bytes_read = read(file.handle, buffer, sizeof(buffer));
+        if (bytes_read == -1) {
+            log_error("Failed to read pseudofile: %s", strerror(errno));
+            return (string_t){0};
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+
+        if (is_first) {
+            start   = mem_arena_push_array(arena, u8, bytes_read);
+            is_first = false;
+        } else {
+            start = mem_arena_push_array(arena, u8, len + bytes_read);
+        }
+
+        memory_copy(start, buffer, bytes_read);
+        len += bytes_read;        
+    }
+
+    return (string_t){ start, len };
+}
 
 string_t
 nsn_os_read_entire_file(mem_arena_t *arena, nsn_file_t file)
@@ -206,16 +239,26 @@ nsn_os_read_entire_file(mem_arena_t *arena, nsn_file_t file)
 
     struct stat file_stat = {0};
     if (fstat(file.handle, &file_stat) == -1) {
+        log_error("Failed to get file stat: %s", strerror(errno));
         return result;
     }
+
+    // log_debug("Reading file: %s, size: %ld", file_stat.st_size, file_stat.st_size);
 
     result.len  = file_stat.st_size;
     result.data = mem_arena_push_array(arena, u8, result.len);
 
     if ((usize)read(file.handle, result.data, result.len) != result.len) {
+        log_error("Failed to read file: %s", strerror(errno));
         result.data = NULL;
         result.len  = 0;
     }
 
     return result;
+}
+
+void       
+nsn_os_file_close(nsn_file_t file)
+{
+    close(file.handle);
 }

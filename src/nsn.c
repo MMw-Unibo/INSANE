@@ -102,23 +102,23 @@ nsn_init()
         goto exit_error;
     }
 
-    i64 start_time = nsn_os_get_time_ns();
-    nsn_mm_zone_list_t *zones   = (nsn_mm_zone_list_t *)(nsn_shm_rawdata(shm) + sizeof(fixed_mem_arena_t)); // TODO: this is a hack, we should have a proper way to get the zones
-    nsn_mm_zone_t *rx_bufs = nsn_find_zone_by_name(zones, str_lit("rx_io_buffer_pool"));
-    if (rx_bufs == NULL) {
-        log_error("failed to find the rx_io_buffer_pool zone\n");
-    } else {
-        i64 end_time = nsn_os_get_time_ns();
-        log_info("nsn_find_zone_by_name() took %.2f us\n", (end_time - start_time) / 1000.0);
-        print_zone(rx_bufs);
-    } 
+    // i64 start_time = nsn_os_get_time_ns();
+    // nsn_mm_zone_list_t *zones = (nsn_mm_zone_list_t *)(nsn_shm_rawdata(shm) + sizeof(fixed_mem_arena_t)); // TODO: this is a hack, we should have a proper way to get the zones
+    // nsn_mm_zone_t *rx_bufs    = nsn_find_zone_by_name(zones, str_lit("rx_io_buffer_pool"));
+    // if (rx_bufs == NULL) {
+    //     log_error("failed to find the rx_io_buffer_pool zone\n");
+    // } else {
+    //     i64 end_time = nsn_os_get_time_ns();
+    //     log_info("nsn_find_zone_by_name() took %.2f us\n", (end_time - start_time) / 1000.0);
+    //     print_zone(rx_bufs);
+    // } 
     
-    nsn_mm_zone_t *tx_bufs = nsn_find_zone_by_name(zones, str_lit("tx_io_buffer_pool"));
-    if (tx_bufs == NULL) {
-        log_error("failed to find the tx_io_buffer_pool zone\n");
-    } else {
-        print_zone(tx_bufs);
-    }
+    // nsn_mm_zone_t *tx_bufs = nsn_find_zone_by_name(zones, str_lit("tx_io_buffer_pool"));
+    // if (tx_bufs == NULL) {
+    //     log_error("failed to find the tx_io_buffer_pool zone\n");
+    // } else {
+    //     print_zone(tx_bufs);
+    // }
 
     temp_mem_arena_end(temp);
     return 0;

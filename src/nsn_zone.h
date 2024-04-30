@@ -7,13 +7,13 @@
 enum nsn_mm_zone_type
 {
     NSN_MM_ZONE_TYPE_IO_BUFFER_POOL,
-    NSN_MM_ZONE_TYPE_RING_BUFFER,
+    NSN_MM_ZONE_TYPE_RINGS,
 };
 
 typedef struct nsn_mm_zone nsn_mm_zone_t;
 struct nsn_mm_zone
 {
-    char         name[64];
+    char         name[32];
     u32          type;
 
     usize        base_offset;
@@ -34,14 +34,20 @@ struct nsn_mm_zone_list
     usize          count;
 } nsn_cache_aligned;
 
+static inline void* 
+nsn_mm_zone_get_ptr(void *mem, nsn_mm_zone_t *zone)
+{
+    return ((u8 *)mem + zone->first_block_offset);
+}
+
 void
 nsn_zone_list_add_tail(nsn_mm_zone_list_t *list, nsn_mm_zone_t *zone)
 {
     byte *memory = (byte *)list;
     if (list->count == 0)
     {
-        list->head_offset = (usize)zone - (usize)memory;
-        list->count = 1;
+        list->head_offset      = (usize)zone - (usize)memory;
+        list->count            = 1;
         zone->next_zone_offset = 0;
     }
     else

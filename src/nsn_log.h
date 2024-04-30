@@ -64,7 +64,7 @@ enum logger_level
 #endif // NSN_ENABLE_LOGGER
 
 int  logger_init(struct logger_config *config);
-void logger_log(int level, char *fmt, ...);
+void logger_log(int level, const char *fmt, ...);
 void logger_close();
 void logger_set_level(int level);
 void logger_set_title(char *title);
@@ -139,7 +139,7 @@ logger_close()
 }
 
 void
-logger_log(int level, char *fmt, ...)
+logger_log(int level, const char *fmt, ...)
 {
     if (level > s_config.level)
     {

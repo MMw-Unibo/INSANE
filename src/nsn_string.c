@@ -93,7 +93,7 @@ f64_from_str(string_t value)
 
 // --- Constructors ------------------------------------------------------------
 string_t 
-make_string(char *cstr, usize len)
+make_string(const char *cstr, usize len)
 {
     string_t str = {0};
     str.data = (u8 *)cstr;

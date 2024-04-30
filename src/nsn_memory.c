@@ -123,8 +123,8 @@ void *
 fixed_mem_arena_push_no_zero(fixed_mem_arena_t *arena, usize size)
 {
     void *ptr = NULL;
-    byte *base            = (byte *)arena->base;
-    usize post_align_pos  = align_to(arena->pos, arena->align);
+    byte *base           = (byte *)arena->base;
+    usize post_align_pos = align_to(arena->pos, arena->align);
     assert(post_align_pos + size <= arena->size && "Not enough space in the fixed memory arena");
 
     ptr        = base + post_align_pos;

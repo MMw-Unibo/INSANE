@@ -46,7 +46,9 @@
 # define nsn_thread_local       __thread
 # define nsn_fallthrough        __attribute__((fallthrough)) 
 # if NSN_ARCH_X86_64 || NSN_ARCH_X86
-#  define nsn_pause()           __asm__ __volatile__("pause")
+#  define nsn_pause()               __asm__ __volatile__("pause")
+#  define nsn_yield()               __asm__ __volatile__("rep; nop")
+#  define nsn_compiler_barrier()    __asm__ __volatile__("" ::: "memory")
 # else
 #  error "Unsupported architecture"
 # endif

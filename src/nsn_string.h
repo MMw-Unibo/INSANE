@@ -73,9 +73,10 @@ bool str_ends_with(string_t string, string_t suffix);
 #define str_fmt             "%.*s"
 #define str_varg(string)    (int)(string).len, (string).data
 
-string_t make_string(char *cstr, usize len);
+string_t make_string(const char *cstr, usize len);
 #define str_cstr(cstr)     make_string(cstr, calc_cstr_len(cstr))
 #define str_lit(cstr)      make_string(cstr, sizeof(cstr) - 1)
+#define str_lit_compound(cstr) (string_t){ .data = (u8 *)cstr, .len = sizeof(cstr) - 1 }
 #define to_cstr(string)     ((char *)(string).data)
 
 string_t str_substring(string_t string, usize start, usize end);

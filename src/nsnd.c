@@ -21,6 +21,8 @@
 #include "nsn_shm.c"
 #include "nsn_string.c"
 
+// --- gax: deps ---------------------------------------------------------------
+
 #define NSN_DEFAULT_CONFIG_FILE     "nsnd.cfg"
 
 #define NSN_CFG_DEFAULT_SECTION                 "global"
@@ -28,53 +30,15 @@
 #define NSN_CFG_DEFAULT_IO_BUFS_NUM             1024
 #define NSN_CFG_DEFAULT_IO_BUFS_SIZE            2048
 #define NSN_CFG_DEFAULT_SHM_SIZE                64      // in MB
-#define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
 #define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME         "tx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_RINGS_ZONE_NAME         "rings_zone"
+#define NSN_CFG_DEFAULT_TX_RING_CONS_NAME       "tx_ring_cons"
+#define NSN_CFG_DEFAULT_TX_RING_PROD_NAME       "tx_ring_prod"
+
+static i64 cpu_hz = -1;
 
 // #include "nsn_thread_pool.c"
-
-/**
- * TODOs:
- *  - Each application that connects to the daemon should have a unique id.
- *  - Each application can create one or more stream, each stream should have a unique id.
- *  - Each stream have a single tx queue that is associated to a specific packet scheduler,
- *    e.g, a FIFO scheduler, a priority scheduler, a weighted fair queue scheduler, etc.
- *  - Each application can create one or more source and sink for each stream.
- *      - A source is associated to a specific tx queue, but because each stream have a single tx queue,
- *        no matter how many source are created, they will all be associated to the same tx queue.
- *      - A sink is associated to a specific rx queue, so each time a sink is created, a rx queue is created.
- *  - When the daemon is created it allocates a pool of rx queues and a number of tx queues equal to the number of schedulers.
- *  - Also when the daemon is created it allocates a pool of applications and a pool of threads.
- *  - Each thread in the pool can be used by one of the data plane tasks, e.g, DPDK, RDMA, etc.
- * 
- *  - In the receive path, the daemon should be able to receive packets from the data plane and forward them to the application.
- *    Because the application can retain the packet for a long time, the daemon should have a pool of receive buffers.
- */
-
-// #include <rte_eal.h>
-
-// static void 
-// dpdk(void)
-// {
-//     char *rte_argv[] = {
-//         "nsnd",
-//         "-c 0x1",
-//         "-n 4",
-//         "--proc-type=auto",
-//     };
-
-//     size_t rte_argc = array_count(rte_argv);
-
-//     int ret = rte_eal_init(rte_argc, rte_argv);
-
-//     printf("hello %d\n", ret);
-
-//     sleep(2);
-
-//     printf("cleanup\n");
-
-//     rte_eal_cleanup();
-// }
 
 typedef struct nsn_app nsn_app_t;
 struct nsn_app
@@ -92,6 +56,21 @@ struct nsn_app_pool
     usize        used;
 };
 
+bool 
+app_pool_try_alloc_slot(nsn_app_pool_t *pool, int app_id)
+{
+    for (usize i = 0; i < pool->count; i++) {
+        if (pool->free_apps_slots[i]) {
+            pool->free_apps_slots[i]  = false;
+            pool->apps[i].app_id      = app_id;
+            pool->used               += 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+
 static volatile bool g_running = true;
 
 void 
@@ -106,18 +85,19 @@ struct datapath_ops
 {
     nsn_datapath_init       *init;
     nsn_datapath_tx         *tx;
+    nsn_datapath_rx         *rx;
     nsn_datapath_deinit     *deinit;
 };
 
 ////////
 // insane daemon state
 
-int instance_id     = 0;
-mem_arena_t *scratch_arena = NULL;
-nsn_app_pool_t app_pool = {0};
+int instance_id          = 0;
+mem_arena_t *state_arena = NULL;
+nsn_app_pool_t app_pool  = {0};
 
 string_list_t arg_list = {0};
-nsn_cfg_t *config   = NULL;
+nsn_cfg_t *config      = NULL;
 ////////
 
 // --- Memory Manager --------------------------------------------------
@@ -130,6 +110,19 @@ struct nsn_mem_manager_cfg
     usize        io_buffer_pool_size;
     usize        io_buffer_size;
 };
+
+
+typedef struct nsn_ringbuf_pool nsn_ringbuf_pool_t;
+struct nsn_ringbuf_pool
+{
+    nsn_mm_zone_t *zone;
+    char           name[32];            // the name of the pool
+    usize          count;               // the number of ring buffers in the pool
+    usize          esize;               // the size of the elements in the ring buffer
+    usize          ecount;              // the number of elements in the ring buffer    
+    usize         *free_slots;          // if free_slots[i] == 0, then the slot is free
+    usize          free_slots_count;
+} nsn_cache_aligned;
 
 // --- Memory Manager ---------------------------------------------------------
 //  The memory manager is responsible for creating and managing the shared memory.
@@ -149,6 +142,32 @@ struct nsn_mem_manager
 };
 
 nsn_mm_zone_t *nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size, usize type);
+
+nsn_ringbuf_pool_t *
+nsn_ringbuf_pool_create(nsn_mem_manager_t *mem, string_t name, usize count, usize esize, usize ecount)
+{
+    usize zone_size = sizeof(nsn_ringbuf_pool_t)           // the size of the pool header
+                    + (count * sizeof(usize))              // the size of the free slots
+                    + sizeof(nsn_ringbuf_t) * count        // the size of the ring buffers
+                    + (esize * ecount) * count;            // the size of the elements in the ring buffers
+
+    nsn_mm_zone_t *zone = nsn_memory_manager_create_zone(mem, name, zone_size, NSN_MM_ZONE_TYPE_RINGS);
+    if (!zone) {
+        log_error("Failed to create zone for ring buffer pool\n");
+        return NULL;
+    }
+
+    nsn_ringbuf_pool_t *pool = (nsn_ringbuf_pool_t *)nsn_mm_zone_get_ptr(mem->shm_arena->base, zone);
+    pool->zone             = zone;
+    pool->count            = count;
+    pool->esize            = esize;
+    pool->ecount           = ecount;
+    pool->free_slots       = (usize *)(pool + 1);
+    pool->free_slots_count = count;
+    strncpy(pool->name, to_cstr(name), sizeof(pool->name) - 1);
+
+    return pool;
+}
 
 nsn_mem_manager_t *
 nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
@@ -174,8 +193,23 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
     // the pointer to the next zone, the pointer to the previous zone, and the pointer to the first block of the zone.
 
     usize io_buf_pool_size = cfg->io_buffer_pool_size * cfg->io_buffer_size;
-    nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME), io_buf_pool_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
     nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME), io_buf_pool_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+    nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME), io_buf_pool_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+
+    // Create a pool of ring buffers inside the ring zone
+    nsn_ringbuf_pool_create(mem, str_lit("rings_zone"), 16, sizeof(usize), cfg->io_buffer_pool_size);
+
+    // Create the two tx ring buffers, one for the consumer(s) (applications) and one for the producer (the daemon)
+    //  - The applications are consumers because they ask for a pointer to the io buffer to fill with data
+    //  - The daemon is the producer because it provides the pointers to free io buffers
+
+
+    // Fill the ring buffer with the pointers to the io buffers, the pointers are actually the offset from the start of the zone
+    // u64 table[16];
+    // for (usize i = 0; i < nsn_ringbuf_get_size(mem->tx_ring); i++) {
+    //     table[0] = i;
+    //     nsn_ringbuf_enqueue_burst(mem->tx_ring, &table, sizeof(u64), 1, NULL);
+    // } 
 
     return mem;
 }
@@ -203,7 +237,7 @@ nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size
     usize zone_size = align_to(size + sizeof(nsn_mm_zone_t), page_size);
 
     // create the zone in the shared memory
-    usize base_offset = mem->shm_arena->pos;
+    usize base_offset   = mem->shm_arena->pos;
     nsn_mm_zone_t *zone = fixed_mem_arena_push_struct(mem->shm_arena, nsn_mm_zone_t);
     if (!zone) {
         return NULL;
@@ -216,7 +250,7 @@ nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size
     zone->size               = zone->total_size - sizeof(nsn_mm_zone_t);
     zone->type               = type;
     zone->first_block_offset = base_offset + sizeof(nsn_mm_zone_t);
-    strncpy(zone->name, to_cstr(name), 63);
+    strncpy(zone->name, to_cstr(name), sizeof(zone->name) - 1);
 
     // add the zone to the list of zones
     nsn_zone_list_add_tail(mem->zones, zone);
@@ -231,6 +265,12 @@ enum nsn_dataplane_thread_state
     NSN_DATAPLANE_THREAD_STATE_WAIT,
     NSN_DATAPLANE_THREAD_STATE_RUNNING,
     NSN_DATAPLANE_THREAD_STATE_STOP,
+};
+
+const char *nsn_dataplane_thread_state_str[] = {
+    "WAIT",
+    "RUNNING",
+    "STOP",
 };
 
 struct nsn_dataplane_thread_args
@@ -250,13 +290,14 @@ dataplane_thread_proc(void *arg)
     int self = nsn_os_current_thread_id();
     u32 state;
 
-    int running = 0;
-
-wait: while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_WAIT) {
+wait: 
+    log_debug("[thread %d] waiting for a message\n", self);
+    while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_WAIT) {
         usleep(10);
     } 
 
     if (state == NSN_DATAPLANE_THREAD_STATE_STOP) {
+        log_debug("[thread %d] stopping\n", self);
         return NULL;
     }
 
@@ -271,23 +312,61 @@ wait: while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STA
         goto quit;
     }
 
-    struct datapath_ops ops = {
-        .init   = (nsn_datapath_init*)  nsn_os_get_proc_address(module, "dpdk_datapath_init"),
-        .tx     = (nsn_datapath_tx*)    nsn_os_get_proc_address(module, "dpdk_datapath_tx"),
-        .deinit = (nsn_datapath_deinit*)nsn_os_get_proc_address(module, "dpdk_datapath_deinit"),
-    };
-    
-    struct nsn_datapath_ctx ctx = {
-        .running = running,
-    };
+    char fn_name[256];
 
-    log_debug("[thread %d] init: %d\n", self, ops.init(&ctx));
+    struct datapath_ops ops;
+    memory_zero_struct(&ops);
+    snprintf(fn_name, sizeof(fn_name), "%s_datapath_init", to_cstr(datapath_name));
+    ops.init   = (nsn_datapath_init*)nsn_os_get_proc_address(module, fn_name);
+    snprintf(fn_name, sizeof(fn_name), "%s_datapath_tx", to_cstr(datapath_name));
+    ops.tx     = (nsn_datapath_tx*)nsn_os_get_proc_address(module, fn_name);
+    snprintf(fn_name, sizeof(fn_name), "%s_datapath_rx", to_cstr(datapath_name));
+    ops.rx     = (nsn_datapath_rx*)nsn_os_get_proc_address(module, fn_name);
+    snprintf(fn_name, sizeof(fn_name), "%s_datapath_deinit", to_cstr(datapath_name));
+    ops.deinit = (nsn_datapath_deinit*)nsn_os_get_proc_address(module, fn_name);
+
+    nsn_datapath_ctx_t ctx;
+    memory_zero_struct(&ctx);
+    snprintf(ctx.configs, sizeof(ctx.configs) - 1, "10.0.0.212:9999");
+    ops.init(&ctx);
 
     while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_RUNNING) {
         // TODO: dpdk example, in the final code the string "dpdk" should be replaced by the name of the datapath
         // and has to be done in a parameterized way. 
-        log_trace("[thread %d] tx: %d\n", self, ops.tx(&ctx));
-        sleep(1);
+
+        // TODO: check if there are io buffers that can be freed
+        //  - in order to be freed, an io buffer must not be referenced by any ring buffer
+        //  - how do we know if an io buffer is referenced by a ring buffer?
+
+        // TODO: get an array of pointers to the io buffers that can be used to store the received packets
+        // ops.rx(&ctx);
+
+        nsn_buf_t io_buffs[] = {
+            { .data = "hello\n", .size = 6 },
+            { .data = "world\n", .size = 6 },
+        };
+        int tx_count = ops.tx(io_buffs, array_count(io_buffs));
+        if (tx_count < 0) {
+            log_error("[thread %d] Failed to transmit\n", self);
+        } 
+
+        // check if there are local sinks that need to be notified
+        //  - the local sinks are the applications that are connected to the daemon
+
+        // for_each_io_buffer(io_buff) {
+        //     bool is_free = true;
+        //     for_each_local_sink(sink) {
+        //         if (io_buff.source_id == sink->source_id) {
+        //             nsn_ringbuf_enqueue_burst(sink->rx_ring, io_buff);
+        //             is_free = false;
+        //         }
+        //     }
+        
+
+        //     if (is_free) {
+        //         io_buff_free(io_buff);
+        //     }
+        // }
     }
 
     log_debug("[thread %d] deinit\n", self);
@@ -298,12 +377,46 @@ wait: while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STA
     log_debug("[thread %d] unloading library\n", self);
     nsn_os_unload_library(module);
 
-    if ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_WAIT) {
-        running = 1;
+    state = at_load(&args->state, mo_rlx);
+    log_debug("[thread %d] state: %s (%d)\n", self, nsn_dataplane_thread_state_str[state], state);
+
+    if (state == NSN_DATAPLANE_THREAD_STATE_WAIT)
+    {
+        log_debug("[thread %d] moving to wait state\n", self);
         goto wait;
     }
 
 quit:
+    log_info("[thread %d] done\n", self);
+    return NULL;
+}
+
+// --- Test Application Thread --------------------------------------------------
+
+typedef struct test_app_thread_args test_app_thread_args_t;
+struct test_app_thread_args
+{
+    nsn_mem_manager_t *mm;
+};
+
+void *
+test_app_thread_proc(void *arg)
+{
+    test_app_thread_args_t *args = (test_app_thread_args_t *)arg;
+    nsn_mem_manager_t *mem = args->mm;
+    nsn_unused(mem);
+
+    log_info("thread [test app] started\n");
+
+    i64 cycles_start = nsn_os_get_cycles();
+    // for (usize i = 0; i < 100; i++) {
+    //     u64 table[16];
+    //     nsn_ringbuf_dequeue_burst(mem->tx_ring, table, sizeof(u64), 1, NULL);
+    // }
+    i64 cycles_end = nsn_os_get_cycles();
+    f64 elapsed_ns = (cycles_end - cycles_start) / (f64)(cpu_hz / 1000000000.0);
+    log_info("nsn_ringbuf_dequeue_burst() took %f ns (%ld cycles)\n", elapsed_ns / 100, cycles_end - cycles_start);
+
     return NULL;
 }
 
@@ -313,6 +426,8 @@ int
 main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg, 
     struct nsn_dataplane_thread_args *dp_args, usize dp_args_count)
 {
+    TracyCZoneN(s_tracy_ctx, "main_thread_control_ipc", 1);
+
     nsn_unused(dp_args_count);
 
     // send a message to the daemon to create a new instance
@@ -345,31 +460,21 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
     {
         case NSN_CMSG_TYPE_CONNECT:
         {
-            // check if there are free slots in the app pool
-            int slot = -1;
-            for (usize i = 0; i < app_pool.count; i++) {
-                if (app_pool.free_apps_slots[i]) {
-                    slot = i;                
-                    break;
-                }
-                    
-            }
+            if (app_pool_try_alloc_slot(&app_pool, app_id)) {
+                log_debug("app %d connected\n", app_id);
 
-            if (slot == -1) {
+                cmsghdr->type             = NSN_CMSG_TYPE_CONNECTED;
+                nsn_cmsg_connect_t *reply = (nsn_cmsg_connect_t *)(cmsghdr + 1);
+                reply->shm_size           = mem_cfg.shm_size;
+                snprintf(reply->shm_name, NSN_MAX_PATH_SIZE, "nsnd_datamem");
+                
+                reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_connect_t);
+            } else {
                 cmsghdr->type   = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
                 *error_code     = 1;
-                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int); 
-            } else {                    
-                log_debug("app %d connected\n", app_id);
-                app_pool.used                  += 1;
-                app_pool.free_apps_slots[slot]  = false;
-                app_pool.apps[slot].app_id      = app_id;                    
-                nsn_cmsg_connect_t *reply = (nsn_cmsg_connect_t *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                snprintf(reply->shm_name, NSN_MAX_PATH_SIZE, "nsnd_datamem");
-                reply->shm_size = mem_cfg.shm_size;
-                cmsghdr->type = NSN_CMSG_TYPE_CONNECTED;
-                reply_len     = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_connect_t);
+
+                reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
             }
         } break;        
         case NSN_CMSG_TYPE_CREATE_STREAM:
@@ -377,7 +482,6 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             log_debug("received new stream message from app %d\n", app_id);
 
             // start the first data plane thread
-            dp_args[0].datapath_name = str_lit("dpdk");
             at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
 
         } break;
@@ -387,6 +491,18 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
 
             // stop the first data plane thread
             at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
+
+        } break;
+        case NSN_CMSG_TYPE_CREATE_SOURCE:
+        {
+            log_debug("received new source message from app %d\n", app_id);
+
+        } break;
+        case NSN_CMSG_TYPE_CREATE_SINK:
+        {
+            log_debug("received new sink message from app %d\n", app_id);
+
+            // allocate a new rx ring buffer
 
         } break;
         case NSN_CMSG_TYPE_DISCONNECT:
@@ -429,8 +545,51 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
 
 clean_and_next: 
     nsn_thread_scratch_end(temp_arena);
-
     return res;
+}
+
+
+// --- Os Initialization --------------------------------------------------------
+
+void
+os_init(void)
+{
+    // read the file /proc/cpuinfo to get the cpu MHz
+    nsn_file_t file = nsn_os_file_open(str_lit("/proc/cpuinfo"), NsnFileFlag_Read);
+    if (!nsn_file_valid(file)) {
+        log_error("Failed to open /proc/cpuinfo\n");
+        return;
+    }
+
+    temp_mem_arena_t temp = nsn_thread_scratch_begin(NULL, 0);
+    string_t cpuinfo      = nsn_os_read_entire_pseudofile(temp.arena, file);
+
+    string_t delims[]   = { str_lit("\n") };
+    string_list_t lines = str_split(temp.arena, cpuinfo, delims, array_count(delims));
+
+    u64 cpu_mhz    = 0;
+    string_t match = str_lit("cpu MHz"); 
+    for (string_node_t *node = lines.head; node; node = node->next) {
+        if (str_contains(node->string, match)) {
+            log_debug("found match: " str_fmt "\n", str_varg(node->string));
+
+            string_t delims[]   = { str_lit(":") };   
+            string_list_t parts = str_split(temp.arena, node->string, delims, array_count(delims));
+            
+            // take the key and the value
+            // string_t key   = parts.head->string;
+            string_t value = str_trim(parts.head->next->string);
+            cpu_mhz        = f64_from_str(value);
+
+            break;
+        }
+    }
+    
+    nsn_thread_scratch_end(temp);
+
+    nsn_os_file_close(file);
+
+    cpu_hz = (i64)(cpu_mhz * 1000000);
 }
 
 int 
@@ -446,11 +605,19 @@ main(int argc, char *argv[])
     logger_init(NULL);
     logger_set_level(LOGGER_LEVEL_TRACE);
 
+    os_init();
+    printf("### INSANE stats:\n"
+           "  - CPU frequency: %ld\n"
+           "  - sizeof(nsn_zone): %ld\n"
+           "  - sizeof(nsn_ringbuf): %ld\n"
+           "  - sizeof(nsn_ringbuf_pool): %ld\n",
+           cpu_hz, sizeof(nsn_mm_zone_t), sizeof(nsn_ringbuf_t), sizeof(nsn_ringbuf_pool_t));
+
     instance_id   = nsn_os_get_process_id();
-    scratch_arena = mem_arena_alloc(gigabytes(1));
+    state_arena = mem_arena_alloc(gigabytes(1));
 
     for (int i = 0; i < argc; i++)
-        str_list_push(scratch_arena, &arg_list, str_cstr(argv[i]));
+        str_list_push(state_arena, &arg_list, str_cstr(argv[i]));
 
     string_t config_filename = str_lit(NSN_DEFAULT_CONFIG_FILE);
     for (string_node_t *node = arg_list.head; node; node = node->next) {
@@ -461,7 +628,7 @@ main(int argc, char *argv[])
         }
     }
 
-    config = nsn_load_config(scratch_arena, config_filename);
+    config = nsn_load_config(state_arena, config_filename);
     if (!config) {
         log_error("Failed to load config file: " str_fmt "\n", str_varg(config_filename));
         exit(1);
@@ -495,8 +662,8 @@ main(int argc, char *argv[])
     nsn_mem_manager_cfg_t mem_cfg = {
         .shm_name            = str_lit(NSN_CFG_DEFAULT_SHM_NAME),
         .shm_size            = megabytes(shm_size),
-        .io_buffer_pool_size = io_bufs_num,
-        .io_buffer_size      = io_bufs_size,
+        .io_buffer_pool_size = (usize)io_bufs_num,
+        .io_buffer_size      = (usize)io_bufs_size,
     };
     nsn_mem_manager_t *mem = nsn_memory_manager_create(arena, &mem_cfg);
     if (!mem) {
@@ -528,8 +695,8 @@ main(int argc, char *argv[])
 
     // --- Create some threads
     struct nsn_dataplane_thread_args dp_args[2] = {
-        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT },
-        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT }
+        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") },
+        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") }
     };
 
     nsn_os_thread_t threads[1];
@@ -537,6 +704,10 @@ main(int argc, char *argv[])
         log_trace("creating thread %d\n", i);
         threads[i] = nsn_os_thread_create(dataplane_thread_proc, &dp_args[i]);
     }
+
+    nsn_os_thread_t test_app_thread;
+    test_app_thread_args_t test_args = { .mm = mem };
+    test_app_thread = nsn_os_thread_create(test_app_thread_proc, &test_args);
 
     while (g_running) 
     {
@@ -555,13 +726,15 @@ main(int argc, char *argv[])
         nsn_os_thread_join(threads[i]);
     }
 
+    nsn_os_thread_join(test_app_thread);
+
     // cleanup
 clear_and_quit:
     if (sockfd != -1) close(sockfd);
     unlink(NSNAPP_TO_NSND_IPC);
     nsn_memory_manager_destroy(mem);
 quit:
-    mem_arena_release(scratch_arena);
+    mem_arena_release(state_arena);
     mem_arena_release(arena);
 
     log_debug("done\n");

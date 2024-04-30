@@ -26,8 +26,16 @@ enum nsn_cmsg_type
     NSN_CMSG_TYPE_CONNECTED,
     // message from app to daemon to create a new stream
     NSN_CMSG_TYPE_CREATE_STREAM,
-    // message from daemon to app to confirm the creation of a new stream
+    // message from app to daemon to destroy a stream
     NSN_CMSG_TYPE_DESTROY_STREAM,
+    // message from app to daemon to create a new source
+    NSN_CMSG_TYPE_CREATE_SOURCE,
+    // message from app to daemon to destroy a source
+    NSN_CMSG_TYPE_DESTROY_SOURCE,
+    // message from app to daemon to create a new sink
+    NSN_CMSG_TYPE_CREATE_SINK,
+    // message from app to daemon to destroy a sink
+    NSN_CMSG_TYPE_DESTROY_SINK,
     // message from app to daemon to destroy an instance
     NSN_CMSG_TYPE_DISCONNECT,
     // message from daemon to app to confirm the destruction of an instance

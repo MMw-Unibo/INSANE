@@ -13,6 +13,8 @@
 
 struct rte_mempool *direct_pool;
 int initialized = 0;
+int port_id     = 0;
+int queue_id    = 0;
 
 NSN_DATAPATH_INIT(dpdk)
 {
@@ -57,10 +59,41 @@ NSN_DATAPATH_INIT(dpdk)
     return result;
 }
 
+#define TX_BUFS_BATCH_SIZE 16
+
 NSN_DATAPATH_TX(dpdk)
 {
-    nsn_unused(ctx);
-    // do tx here
+    nsn_unused(bufs);
+    nsn_unused(buf_count);
+
+    struct rte_mbuf *rte_mbufs[TX_BUFS_BATCH_SIZE];
+    memory_zero_array(rte_mbufs);
+
+    // TODO(garbu): Get the number of buffers to send
+    usize n_bufs = 0;
+
+    for (usize i = 0; i < n_bufs; i++) {
+        // bufs[i].index = tmp_index[i];
+        // bufs[i].data  = (u8 *)mm->dpdk_ctx->tx_mbuf[bufs[i].index];
+        // rte_mbufs[i]       = (struct rte_mbuf *)bufs[i].data;
+
+        u8 *data           = rte_pktmbuf_mtod(rte_mbufs[i], u8 *);
+
+        rte_mbufs[i]->pkt_len  = 0; // TODO: set the packet length, comprising the headers and the payload
+        rte_mbufs[i]->next     = NULL;
+        rte_mbufs[i]->data_len = rte_mbufs[i]->pkt_len;
+        rte_mbufs[i]->nb_segs  = 1;
+    }
+
+    i32 ret = rte_eth_tx_burst(port_id, queue_id, rte_mbufs, n_bufs);
+    return ret;
+}
+
+NSN_DATAPATH_RX(dpdk)
+{
+    nsn_unused(bufs);
+    nsn_unused(buf_count);
+    // do rx here
     return 0;
 }
 
