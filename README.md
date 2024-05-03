@@ -34,7 +34,7 @@ The code for the available *datapath plugin* is in the [`datapath`](datapaths) f
 
 ### Running the daemon
 
-Before starting the daemon, you need to provide a few configuration parameters in a configuration file. An [example](configs/nsnd.cfg) is provided. By default, the daemon will look for a `nsnd.cfg` file in its working directory. You can change the file location by using the `--config` command line argument. You need to fill out the configuration file with the correct parameters for your machine.
+Before starting the daemon, you need to provide a few configuration parameters in a configuration file. An [example](configs/nsnd.cfg) is provided. By default, the daemon will look for a `nsnd.cfg` file in its working directory. You can specify a different file location by using the `--config` command line argument. You need to fill out the configuration file with the correct parameters for your machine.
 
 Then, invoke the the daemon executable (`nsnd`).
 

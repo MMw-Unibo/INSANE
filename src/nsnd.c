@@ -327,7 +327,8 @@ wait:
 
     nsn_datapath_ctx_t ctx;
     memory_zero_struct(&ctx);
-    snprintf(ctx.configs, sizeof(ctx.configs) - 1, "10.0.0.212:9999");
+    // TODO: make this a configuration parameter
+    snprintf(ctx.configs, sizeof(ctx.configs) - 1, "10.0.0.211:9999");
     ops.init(&ctx);
 
     while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_RUNNING) {
@@ -426,8 +427,6 @@ int
 main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg, 
     struct nsn_dataplane_thread_args *dp_args, usize dp_args_count)
 {
-    TracyCZoneN(s_tracy_ctx, "main_thread_control_ipc", 1);
-
     nsn_unused(dp_args_count);
 
     // send a message to the daemon to create a new instance
