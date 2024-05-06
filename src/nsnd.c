@@ -287,6 +287,10 @@ dataplane_thread_proc(void *arg)
     nsn_mem_manager_t *mem = args->mm;
     nsn_unused(mem);
 
+    nsn_thread_ctx_t this_thread = nsn_thread_ctx_alloc();
+    this_thread.is_main_thread   = false;
+    nsn_thread_set_ctx(&this_thread);
+
     int self = nsn_os_current_thread_id();
     u32 state;
 
@@ -301,7 +305,7 @@ wait:
         return NULL;
     }
 
-    // TODO: start the data plane
+    // Load the datapath plugin
     string_t datapath_name = args->datapath_name;
     log_debug("[thread %d] dataplane thread started for datapath: " str_fmt "\n", self, str_varg(datapath_name));                 
     char datapath_lib[256];
@@ -327,8 +331,13 @@ wait:
 
     nsn_datapath_ctx_t ctx;
     memory_zero_struct(&ctx);
-    // TODO: make this a configuration parameter
-    snprintf(ctx.configs, sizeof(ctx.configs) - 1, "10.0.0.211:9999");
+ 
+    string_t socket_ip;
+    int socket_port;
+    nsn_config_get_string(config, str_lit("global"), str_lit("socket_ip"), &socket_ip);
+    nsn_config_get_int(config, str_lit("global"), str_lit("socket_port"), &socket_port);
+    snprintf(ctx.configs, sizeof(ctx.configs) - 1, "%.*s:%d", (int)socket_ip.len, to_cstr(socket_ip), socket_port);
+
     ops.init(&ctx);
 
     while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_RUNNING) {
@@ -692,7 +701,7 @@ main(int argc, char *argv[])
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
-    // --- Create some threads
+    // --- Create the thread pool. Currently, one thread only, bound to the udpsock datapath plugin.
     struct nsn_dataplane_thread_args dp_args[2] = {
         { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") },
         { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") }
@@ -704,9 +713,11 @@ main(int argc, char *argv[])
         threads[i] = nsn_os_thread_create(dataplane_thread_proc, &dp_args[i]);
     }
 
+    //--- This is a test, to be removed
     nsn_os_thread_t test_app_thread;
     test_app_thread_args_t test_args = { .mm = mem };
     test_app_thread = nsn_os_thread_create(test_app_thread_proc, &test_args);
+    //---
 
     while (g_running) 
     {
