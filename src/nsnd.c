@@ -38,39 +38,6 @@
 
 static i64 cpu_hz = -1;
 
-// #include "nsn_thread_pool.c"
-
-typedef struct nsn_app nsn_app_t;
-struct nsn_app
-{
-    int app_id;
-};
-
-typedef struct nsn_app_pool nsn_app_pool_t;
-struct nsn_app_pool
-{
-    mem_arena_t *arena;
-    nsn_app_t   *apps;
-    bool        *free_apps_slots;
-    usize        count;
-    usize        used;
-};
-
-bool 
-app_pool_try_alloc_slot(nsn_app_pool_t *pool, int app_id)
-{
-    for (usize i = 0; i < pool->count; i++) {
-        if (pool->free_apps_slots[i]) {
-            pool->free_apps_slots[i]  = false;
-            pool->apps[i].app_id      = app_id;
-            pool->used               += 1;
-            return true;
-        }
-    }
-    return false;
-}
-
-
 static volatile bool g_running = true;
 
 void 
@@ -88,17 +55,6 @@ struct datapath_ops
     nsn_datapath_rx         *rx;
     nsn_datapath_deinit     *deinit;
 };
-
-////////
-// insane daemon state
-
-int instance_id          = 0;
-mem_arena_t *state_arena = NULL;
-nsn_app_pool_t app_pool  = {0};
-
-string_list_t arg_list = {0};
-nsn_cfg_t *config      = NULL;
-////////
 
 // --- Memory Manager --------------------------------------------------
 
@@ -178,7 +134,7 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
     //              ring buffers used for the receive and transmit queues.
     nsn_shm_t *shm = nsn_shm_alloc(arena, to_cstr(cfg->shm_name), cfg->shm_size);
     if (!shm) {
-        log_error("Failed to create shared memeory\n");
+        log_error("Failed to create shared memory\n");
         return NULL;
     }
 
@@ -258,6 +214,85 @@ nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size
     return zone;
 }
 
+typedef struct nsn_app nsn_app_t;
+struct nsn_app
+{
+    int app_id;
+    mem_arena_t *arena;
+    nsn_mem_manager_t* mem;
+};
+
+typedef struct nsn_app_pool nsn_app_pool_t;
+struct nsn_app_pool
+{
+    mem_arena_t *arena;
+    nsn_app_t   *apps;
+    bool        *free_apps_slots;
+    usize        count;
+    usize        used;
+};
+
+bool 
+app_pool_init_slot(nsn_app_pool_t *pool, int app_slot, nsn_mem_manager_cfg_t* mem_cfg)
+{
+    if (app_slot < 0) {
+        return false;
+    }
+    // TODO: maybe restrict the access permissions to those two processes with mprotect?)
+    nsn_app_t *app = &pool->apps[app_slot];
+    app->arena = mem_arena_alloc(megabytes(500));
+    if (!app->arena) {
+        log_error("Failed to create memory arena for app %d\n", app->app_id);
+        return false;
+    }
+
+    char shm_name_app[NSN_MAX_PATH_SIZE];
+    snprintf(shm_name_app, NSN_MAX_PATH_SIZE, "%s_%d", mem_cfg->shm_name.data, app->app_id);
+    mem_cfg->shm_name = str_lit(shm_name_app);
+
+    app->mem = nsn_memory_manager_create(app->arena, mem_cfg);
+    if (!app->mem) {
+        log_error("Failed to create shared memory for app \n");
+        return false;
+    }
+    return true;
+}
+
+int 
+app_pool_try_alloc_slot(nsn_app_pool_t *pool, int app_id)
+{
+    for (usize i = 0; i < pool->count; i++) {
+        if (pool->free_apps_slots[i]) {
+            pool->free_apps_slots[i]  = false;
+            pool->apps[i].app_id      = app_id;
+            pool->used               += 1;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+bool 
+app_pool_try_alloc_and_init_slot(nsn_app_pool_t *pool, int app_id, nsn_mem_manager_cfg_t mem_cfg)
+{
+    int slot = app_pool_try_alloc_slot(pool, app_id);
+    if (slot < 0) {
+        return false;
+    }
+    return app_pool_init_slot(pool, slot, &mem_cfg);
+}
+
+////////
+// insane daemon state
+
+int instance_id          = 0;
+mem_arena_t *state_arena = NULL;
+nsn_app_pool_t app_pool  = {0};
+
+string_list_t arg_list = {0};
+nsn_cfg_t *config      = NULL;
+////////
+
 // --- Data Plane Thread -------------------------------------------------------
 
 enum nsn_dataplane_thread_state
@@ -275,7 +310,7 @@ const char *nsn_dataplane_thread_state_str[] = {
 
 struct nsn_dataplane_thread_args
 {
-    nsn_mem_manager_t *mm;
+    // nsn_mem_manager_t *mm;
     atu32              state;
     string_t           datapath_name;
 };
@@ -284,8 +319,8 @@ void *
 dataplane_thread_proc(void *arg)
 {
     struct nsn_dataplane_thread_args *args = (struct nsn_dataplane_thread_args *)arg;
-    nsn_mem_manager_t *mem = args->mm;
-    nsn_unused(mem);
+    // nsn_mem_manager_t *mem = args->mm;
+    // nsn_unused(mem);
 
     nsn_thread_ctx_t this_thread = nsn_thread_ctx_alloc();
     this_thread.is_main_thread   = false;
@@ -468,13 +503,13 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
     {
         case NSN_CMSG_TYPE_CONNECT:
         {
-            if (app_pool_try_alloc_slot(&app_pool, app_id)) {
+            if (app_pool_try_alloc_and_init_slot(&app_pool, app_id, mem_cfg)) {
                 log_debug("app %d connected\n", app_id);
 
                 cmsghdr->type             = NSN_CMSG_TYPE_CONNECTED;
                 nsn_cmsg_connect_t *reply = (nsn_cmsg_connect_t *)(cmsghdr + 1);
                 reply->shm_size           = mem_cfg.shm_size;
-                snprintf(reply->shm_name, NSN_MAX_PATH_SIZE, "nsnd_datamem");
+                snprintf(reply->shm_name, NSN_MAX_PATH_SIZE, "nsnd_datamem_%d", app_id);
                 
                 reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_connect_t);
             } else {
@@ -525,6 +560,11 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                     app_pool.free_apps_slots[i]  = true;
                     app_pool.used               -= 1;
                     found                        = true;
+
+                    // Release the memory shared with the app
+                    nsn_memory_manager_destroy(app_pool.apps[i].mem);
+                    mem_arena_release(app_pool.apps[i].arena);
+
                     break;
                 }
             }
@@ -622,7 +662,7 @@ main(int argc, char *argv[])
            cpu_hz, sizeof(nsn_mm_zone_t), sizeof(nsn_ringbuf_t), sizeof(nsn_ringbuf_pool_t));
 
     instance_id   = nsn_os_get_process_id();
-    state_arena = mem_arena_alloc(gigabytes(1));
+    state_arena = mem_arena_alloc(megabytes(1));
 
     for (int i = 0; i < argc; i++)
         str_list_push(state_arena, &arg_list, str_cstr(argv[i]));
@@ -653,7 +693,7 @@ main(int argc, char *argv[])
     nsn_config_get_int(config, str_lit("global"), str_lit("shm_size"), &shm_size);
 
     // init the memory arena
-    mem_arena_t *arena = mem_arena_alloc(gigabytes(1));
+    mem_arena_t *arena = mem_arena_alloc(megabytes(1));
     app_pool.count           = app_num;
     app_pool.apps            = mem_arena_push_array(arena, nsn_app_t, app_pool.count);
     app_pool.free_apps_slots = mem_arena_push_array(arena, bool, app_pool.count);
@@ -673,11 +713,6 @@ main(int argc, char *argv[])
         .io_buffer_pool_size = (usize)io_bufs_num,
         .io_buffer_size      = (usize)io_bufs_size,
     };
-    nsn_mem_manager_t *mem = nsn_memory_manager_create(arena, &mem_cfg);
-    if (!mem) {
-        log_error("Failed to create shared memory\n");
-        goto quit;
-    }
 
     // create the control socket
     int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -703,8 +738,8 @@ main(int argc, char *argv[])
 
     // --- Create the thread pool. Currently, one thread only, bound to the udpsock datapath plugin.
     struct nsn_dataplane_thread_args dp_args[2] = {
-        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") },
-        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") }
+        { .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") },
+        { .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") }
     };
 
     nsn_os_thread_t threads[1];
@@ -713,11 +748,11 @@ main(int argc, char *argv[])
         threads[i] = nsn_os_thread_create(dataplane_thread_proc, &dp_args[i]);
     }
 
-    //--- This is a test, to be removed
-    nsn_os_thread_t test_app_thread;
-    test_app_thread_args_t test_args = { .mm = mem };
-    test_app_thread = nsn_os_thread_create(test_app_thread_proc, &test_args);
-    //---
+    // //--- This is a test, to be removed
+    // nsn_os_thread_t test_app_thread;
+    // test_app_thread_args_t test_args = { .mm = mem };
+    // test_app_thread = nsn_os_thread_create(test_app_thread_proc, &test_args);
+    // //---
 
     while (g_running) 
     {
@@ -736,14 +771,13 @@ main(int argc, char *argv[])
         nsn_os_thread_join(threads[i]);
     }
 
-    nsn_os_thread_join(test_app_thread);
+    // nsn_os_thread_join(test_app_thread);
 
     // cleanup
 clear_and_quit:
     if (sockfd != -1) close(sockfd);
     unlink(NSNAPP_TO_NSND_IPC);
-    nsn_memory_manager_destroy(mem);
-quit:
+// quit:
     mem_arena_release(state_arena);
     mem_arena_release(arena);
 

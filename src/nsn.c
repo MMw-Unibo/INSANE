@@ -95,12 +95,12 @@ nsn_init()
 
     nsn_cmsg_connect_t *resp = (nsn_cmsg_connect_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
 
-    printf("connected to nsnd, the shm is at /dev/shm/%s, with size %zu\n", resp->shm_name, resp->shm_size);
     shm = nsn_shm_attach(arena, resp->shm_name, resp->shm_size);
     if (shm == NULL) {
         fprintf(stderr, "failed to attach to the shared memory segment\n");
         goto exit_error;
     }
+    printf("connected to nsnd, the shm is at /dev/shm/%s, with size %zu\n", resp->shm_name, resp->shm_size);
 
     // i64 start_time = nsn_os_get_time_ns();
     // nsn_mm_zone_list_t *zones = (nsn_mm_zone_list_t *)(nsn_shm_rawdata(shm) + sizeof(fixed_mem_arena_t)); // TODO: this is a hack, we should have a proper way to get the zones
