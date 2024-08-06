@@ -282,12 +282,29 @@ app_pool_try_alloc_and_init_slot(nsn_app_pool_t *pool, int app_id, nsn_mem_manag
     return app_pool_init_slot(pool, slot, &mem_cfg);
 }
 
+typedef struct nsn_plugin nsn_plugin_t;
+struct nsn_plugin
+{
+    string_t name;
+    nsn_os_thread_t* threads;
+    usize thread_count;
+    usize active_channels;    
+};
+
+typedef struct nsn_plugin_set nsn_plugin_set_t;
+struct nsn_plugin_set 
+{
+    nsn_plugin_t *plugins;
+    usize         count;
+};
+
 ////////
 // insane daemon state
 
 int instance_id          = 0;
 mem_arena_t *state_arena = NULL;
 nsn_app_pool_t app_pool  = {0};
+nsn_plugin_set_t plugin_set = {0};
 
 string_list_t arg_list = {0};
 nsn_cfg_t *config      = NULL;
@@ -523,27 +540,39 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         case NSN_CMSG_TYPE_CREATE_STREAM:
         {
             log_debug("received new stream message from app %d\n", app_id);
+            
+            // TODO(lr): Here we should put the logic for the QoS-to-plugin mapping.
+            // For the moment, just use the first one
+            uint16_t stream_idx = 0;
 
-            // start the first data plane thread
-            at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+            // Return stream handler: the index of the plugin corresponding to the QoS 
+            // of the creation request.
+            cmsghdr->type = NAN_CSMG_TYPE_CREATED_STREAM;
+            nsn_cmsg_create_stream_t *reply = (nsn_cmsg_create_stream_t*)(cmsghdr + 1);
+            reply->stream_idx = stream_idx;
 
         } break;
         case NSN_CMSG_TYPE_DESTROY_STREAM:
         {
-            log_debug("received destroy stream message from app %d\n", app_id);
 
-            // stop the first data plane thread
-            at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
+            log_debug("received destroy stream message from app %d\n", app_id);
+            // TODO: should we do something here?
 
         } break;
         case NSN_CMSG_TYPE_CREATE_SOURCE:
         {
             log_debug("received new source message from app %d\n", app_id);
 
+            // if first ch in the stream, start the first data plane thread
+            at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+
         } break;
         case NSN_CMSG_TYPE_CREATE_SINK:
         {
             log_debug("received new sink message from app %d\n", app_id);
+
+            // if first ch in the stream, start the first data plane thread
+            at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
 
             // allocate a new rx ring buffer
 
@@ -699,6 +728,16 @@ main(int argc, char *argv[])
     app_pool.free_apps_slots = mem_arena_push_array(arena, bool, app_pool.count);
     for (usize i = 0; i < app_pool.count; i++)    app_pool.free_apps_slots[i] = true;
 
+    // TODO: Automatically detect which plugins are available and can be used by the daemon.
+    // Currently, we only consider 1 as available (make it the "udpsock" plugin).
+    plugin_set.plugins = mem_arena_push_array(arena, nsn_plugin_t, 1);
+    plugin_set.count   = 1;
+    for (usize i = 0; i < plugin_set.count; i++) {
+        plugin_set.plugins[i].name = str_lit("udpsock");
+        plugin_set.plugins[i].thread_count = 0;
+        plugin_set.plugins[i].active_channels = 0;
+    }
+
     // init SIG_INT handler
     struct sigaction sa;
     memory_zero_struct(&sa);
@@ -736,10 +775,13 @@ main(int argc, char *argv[])
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
-    // --- Create the thread pool. Currently, one thread only, bound to the udpsock datapath plugin.
-    struct nsn_dataplane_thread_args dp_args[2] = {
-        { .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") },
-        { .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") }
+    // --- Create the thread pool. Currently, one thread only. We do not set here the dp_args.name, 
+    // as the thread pool exists independently of the associated plugin. However, it is important that
+    // the name is set when the thread moves to the RUNNING state, as it will try to load the dll.
+    // The association is done when a new stream for a new plugin is set, and currently is permanent.
+    // Future work will include a way to dynamically attach/detach threads to/from plugins.
+    struct nsn_dataplane_thread_args dp_args[1] = {
+        { .state = NSN_DATAPLANE_THREAD_STATE_WAIT},
     };
 
     nsn_os_thread_t threads[1];
@@ -747,12 +789,6 @@ main(int argc, char *argv[])
         log_trace("creating thread %d\n", i);
         threads[i] = nsn_os_thread_create(dataplane_thread_proc, &dp_args[i]);
     }
-
-    // //--- This is a test, to be removed
-    // nsn_os_thread_t test_app_thread;
-    // test_app_thread_args_t test_args = { .mm = mem };
-    // test_app_thread = nsn_os_thread_create(test_app_thread_proc, &test_args);
-    // //---
 
     while (g_running) 
     {
@@ -770,8 +806,6 @@ main(int argc, char *argv[])
     for (usize i = 0; i < array_count(threads); i++) {
         nsn_os_thread_join(threads[i]);
     }
-
-    // nsn_os_thread_join(test_app_thread);
 
     // cleanup
 clear_and_quit:

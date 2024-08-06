@@ -197,10 +197,7 @@ nsn_create_stream(nsn_options_t *opts)
             int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
             fprintf(stderr, "failed to create stream with error '%d'\n", error); 
         } else {
-            // // TODO(garbu): get the stream handle from the daemon
-            // stream = *(nsn_stream_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-
-            stream = 1;
+            stream = *(nsn_stream_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
             printf("created stream\n");
         }
     }

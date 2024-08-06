@@ -26,6 +26,8 @@ enum nsn_cmsg_type
     NSN_CMSG_TYPE_CONNECTED,
     // message from app to daemon to create a new stream
     NSN_CMSG_TYPE_CREATE_STREAM,
+    // message from daemon to app to confirm the creation of a new stream
+    NAN_CSMG_TYPE_CREATED_STREAM,
     // message from app to daemon to destroy a stream
     NSN_CMSG_TYPE_DESTROY_STREAM,
     // message from app to daemon to create a new source
@@ -61,7 +63,8 @@ struct nsn_cmsg_connect
 typedef struct nsn_cmsg_create_stream nsn_cmsg_create_stream_t;
 struct nsn_cmsg_create_stream
 {
-    
+    // Index of the stream in the stream table
+    uint16_t stream_idx;
 };
 
 #endif // NSN_IPC_H

@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
 
 // --- Error Codes ----------------------------------------------------------------
 #define NSN_ERROR_ALREADY_INITIALIZED   1
@@ -61,7 +62,7 @@ typedef struct nsn_options {
 typedef uint32_t nsn_sink_t;
 typedef uint32_t nsn_source_t;
 
-#define NSN_INVALID_STREAM_HANDLE  0
+#define NSN_INVALID_STREAM_HANDLE  INT16_MAX
 typedef uint32_t nsn_stream_t;
 
 typedef void *handle_data_cb;
