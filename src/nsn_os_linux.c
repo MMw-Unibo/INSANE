@@ -109,7 +109,7 @@ nsn_os_thread_create(nsn_os_thread_proc proc, void *arg)
     struct nsn_os_thread thread;
     memory_zero_struct(&thread);
 
-    if (pthread_create(&thread.handle, 0, proc, arg) == 0) {
+    if (pthread_create(&thread.handle, 0, proc, arg) != 0) {
         thread = NSN_OS_INVALID_THREAD_HANDLE;
     }
 

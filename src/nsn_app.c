@@ -11,6 +11,7 @@
 #include "nsn_os_inc.c"
 #include "nsn_shm.c"
 #include "nsn_string.c"
+#include "nsn_ringbuf.c"
 
 #define NSN_LOG_IMPLEMENTATION_H
 #include "nsn_log.h"
@@ -36,7 +37,16 @@ main(void)
         goto cleanup;
     }
 
+    nsn_source_t src = nsn_create_source(&stream, 0);
+    if (src == NSN_INVALID_SRC) {
+        printf("nsn_create_source() failed\n");
+        res = -1;
+        goto cleanup;
+    }
+
     sleep(1);
+
+    nsn_destroy_source(src);
 
     nsn_destroy_stream(stream);
 
