@@ -25,7 +25,9 @@ struct nsn_stream_inner {
     nsn_ringbuf_t *rx_cons;
 };
 
-#define NSN_MAX_SOURCES 32
+#define NSN_MAX_SOURCES 8
+#define NSN_MAX_SINKS 8
+
 typedef struct nsn_source_inner nsn_source_inner_t;
 struct nsn_source_inner {
     // The source is valid
@@ -34,6 +36,18 @@ struct nsn_source_inner {
     nsn_stream_t stream;
     // User-provided id
     uint32_t id;
+};
+
+typedef struct nsn_sink_inner nsn_sink_inner_t;
+struct nsn_sink_inner {
+    // The sink is valid
+    bool is_active;
+    // Stream id 
+    nsn_stream_t stream;
+    // User-provided id
+    uint32_t id;
+    // User-provided callbakck
+    handle_data_cb cb;
 };
 
 // nsn app state
@@ -55,6 +69,8 @@ nsn_stream_inner_t streams[NSN_MAX_STREAMS]; //TODO: is there a better way? A li
 uint32_t n_str = 0;
 nsn_source_inner_t sources[NSN_MAX_SOURCES]; //TODO: is there a better way? A list?
 uint32_t n_src = 0;
+nsn_sink_inner_t sinks[NSN_MAX_SINKS];
+uint32_t n_snk = 0;
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -224,6 +240,15 @@ nsn_init()
     }
     n_src = 0;
 
+    // Initialize the local sink state
+    for (uint32_t i = 0; i < array_count(sinks); i++) {
+        sinks[i].is_active = false;
+        sinks[i].id = NSN_INVALID_SNK;
+        sinks[i].stream = NSN_INVALID_STREAM_HANDLE;
+        sinks[i].cb = NULL;
+    }
+    n_snk = 0;
+    
     temp_mem_arena_end(temp);
     return 0;
 
@@ -486,7 +511,7 @@ nsn_destroy_source(nsn_source_t source) {
         return -1;
     }
 
-    // communicate with the daemon to destroy the source, i.e. to destroy the rings and
+    // communicate with the daemon to destroy the source, i.e. to
     // check if some dp threads can be stopped.
     int ok = 0;
     temp_mem_arena_t temp = temp_mem_arena_begin(arena);
@@ -516,6 +541,124 @@ nsn_destroy_source(nsn_source_t source) {
     sources[source_idx].id = NSN_INVALID_SRC;
     sources[source_idx].is_active = false;
     n_src--;
+
+clean_and_exit:
+    temp_mem_arena_end(temp);
+    return ok;
+}
+
+// -----------------------------------------------------------------------------
+nsn_sink_t
+nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb) {
+    if (stream == NULL) {
+        log_warn("invalid argument: stream\n");
+        return NSN_INVALID_SNK;
+    }
+    if (sink_id == NSN_INVALID_SNK) {
+        log_warn("invalid argument: sink_id %u\n", sink_id);
+        return NSN_INVALID_SNK;
+    }
+    uint32_t snk_idx = NSN_INVALID_SNK;
+    if (n_snk == NSN_MAX_SINKS) {
+        log_warn("limit exceeded: too many sinks\n");
+        return NSN_INVALID_SNK;
+    } else {
+        // Get the first available sink descriptor
+        for(uint32_t i = 0; i < array_count(sinks); i++) {
+            if (!sinks[i].is_active) {
+                snk_idx = i;
+                break;
+            }
+        }
+    }
+    
+    temp_mem_arena_t temp = temp_mem_arena_begin(arena);
+    byte *cmsg = mem_arena_push_array(temp.arena, byte, 4096);
+    nsn_cmsg_hdr_t *cmsghdr = (nsn_cmsg_hdr_t *)cmsg;
+    cmsghdr->type   = NSN_CMSG_TYPE_CREATE_SINK;
+    cmsghdr->app_id = app_id;
+
+    // Send the request to the daemon, including the stream id of the sink
+    nsn_cmsg_create_sink_t *msg = (nsn_cmsg_create_sink_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->stream_idx = *stream;
+    msg->sink_id  = sink_id;
+    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_sink_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+
+    // If successful, receive two handlers
+    if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
+        fprintf(stderr, "failed to create sink with error '%s', is it running?\n", strerror(errno));
+        sink_id = NSN_INVALID_SNK;
+        goto exit;
+    } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
+        int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+        fprintf(stderr, "failed to create sink with error '%d'\n", error); 
+        sink_id = NSN_INVALID_SNK;
+        goto exit;
+    }
+    
+    // finalize the sink creation 
+    sinks[snk_idx].id = sink_id;
+    sinks[snk_idx].is_active = true;
+    sinks[snk_idx].stream = *stream;
+    sinks[snk_idx].cb = cb;
+    n_snk++;    
+
+    printf("created sink %u in slot %u with is_active=%d\n", sink_id, snk_idx, sinks[snk_idx].is_active);
+
+exit:
+    temp_mem_arena_end(temp);
+    return sink_id;
+}
+
+// -----------------------------------------------------------------------------
+int
+nsn_destroy_sink(nsn_sink_t sink) {
+    uint32_t sink_idx = NSN_INVALID_SNK;
+    for(uint32_t i = 0; i < array_count(sinks); i++) {
+        if (sinks[i].id == (uint32_t)sink) {
+           sink_idx = i; 
+        }
+    }
+    if (sink_idx == NSN_INVALID_SNK) {
+        log_error("sink not found\n");
+        return -1;
+    }
+    if (!sinks[sink_idx].is_active) {
+        log_error("invalid sink (idx %u, is active %d)\n", sink_idx, sinks[sink_idx].is_active);
+        return -1;
+    }
+
+    // communicate with the daemon to destroy the sink, i.e. to
+    // check if some dp threads can be stopped.
+    int ok = 0;
+    temp_mem_arena_t temp = temp_mem_arena_begin(arena);
+    byte *cmsg = mem_arena_push_array(temp.arena, byte, 4096);
+    nsn_cmsg_hdr_t *cmsghdr = (nsn_cmsg_hdr_t *)cmsg;
+    cmsghdr->type   = NSN_CMSG_TYPE_DESTROY_SINK;
+    cmsghdr->app_id = app_id;
+
+    nsn_cmsg_create_sink_t *msg = (nsn_cmsg_create_sink_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->stream_idx = sinks[sink_idx].stream;
+    msg->sink_id  = sinks[sink_idx].id;
+
+    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_sink_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+
+    if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
+        fprintf(stderr, "failed to create sink with error '%s', is it running?\n", strerror(errno));
+        ok = -1;
+        goto clean_and_exit;
+    } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
+        int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+        fprintf(stderr, "failed to create sink with error '%d'\n", error); 
+        ok = -1;
+        goto clean_and_exit;
+    }
+
+    // If we receive no error, we can proceed to the destruction of the sink
+    sinks[sink_idx].id = NSN_INVALID_SNK;
+    sinks[sink_idx].is_active = false;
+    sinks[sink_idx].cb = NULL;
+    n_snk--;
 
 clean_and_exit:
     temp_mem_arena_end(temp);

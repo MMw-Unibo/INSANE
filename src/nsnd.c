@@ -628,12 +628,108 @@ quit:
 //     return NULL;
 // }
 
+// --- Helper Functions ---------------------------------------------------------
+// Helps creating a source/sink. If necessary, it starts a new thread for the dataplane.
+// Returns 0 on success, -1 on error.
+int
+ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr) 
+{
+    // Check that the app_id exists
+    uint32_t app_idx = UINT32_MAX;
+    for (usize i = 0; i < app_pool.count; i++) {
+        if (app_pool.apps[i].app_id == app_id) {
+            app_idx = (uint32_t)i;
+            break;
+        }
+    }
+    if(app_idx > app_pool.count) {
+        log_error("app %d not found in the pool\n", app_id);
+        return -1;
+    }
+
+    // Check that the stream index is valid
+    nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
+    uint32_t stream_idx = (uint32_t)reply->stream_idx;
+    if (stream_idx >= plugin_set.count) {
+        log_error("stream index %d is out of bounds\n", stream_idx);
+        return -2;
+    }
+    
+    // if this is the first src/snk (=channel) in the stream, start the first 
+    // data plane thread. In the future, this will be delegated to a thread pool manager.
+    if (plugin_set.plugins[stream_idx].active_channels == 0) {
+        // Currenlty, we just consider that thread j is assigned to plugin j.
+        uint32_t thread_idx = stream_idx;
+        struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
+        // It might be the case that the thread is already associated with the plugin,
+        // until we implement a thread pool manager. In this case, no need to add a 
+        // thread to the plugin; just start the existing one.
+        if (plugin_set.plugins[stream_idx].thread_count == 0) {
+            // Keep a pointer to the thread in the plugin
+            plugin_set.plugins[stream_idx].threads[plugin_set.plugins[stream_idx].thread_count] 
+                                        = thread_pool.threads[thread_idx];
+            plugin_set.plugins[stream_idx].thread_count++;
+            // Assign the plugin to the thread
+            dp_args->datapath_name = plugin_set.plugins[stream_idx].name;
+        }
+        // start the thread
+        at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+    }
+
+    // Ref count of the channels (src/snk) active in the stream
+    plugin_set.plugins[stream_idx].active_channels++;
+
+    return 0;
+}
+
+// Helps destroying a source/sink. If necessary, it stops the thread for the dataplane.
+// Returns 0 on success, -1 on error.
+int
+ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr) {
+    // Check that the app_id exists
+    uint32_t app_idx = UINT32_MAX;
+    for (usize i = 0; i < app_pool.count; i++) {
+        if (app_pool.apps[i].app_id == app_id) {
+            app_idx = (uint32_t)i;
+            break;
+        }
+    }
+    if(app_idx > app_pool.count) {
+        log_error("app %d not found in the pool\n", app_id);
+        return -1;
+    }
+
+    // Check that the stream index is valid
+    nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
+    uint32_t stream_idx = (uint32_t)reply->stream_idx;
+    if (stream_idx >= plugin_set.count) {
+        log_error("stream index %d is out of bounds\n", stream_idx);
+        return -2;
+    }
+
+    // Ref count of the channels (src/snk) active in the stream
+    plugin_set.plugins[stream_idx].active_channels--;
+    
+    // if the stream has no more active channels, stop the data plane thread 
+    // (which remains attached to the plugin, until we implement a thread pool manager)
+    // (ideally, the thread should go back into the pool)
+    // Currently, we just consider that thread j is assigned to plugin j.
+    uint32_t thread_idx = stream_idx;
+    struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
+    if(plugin_set.plugins[stream_idx].active_channels == 0) {
+        at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
+    }
+    
+    return 0;
+}
+
 // --- Main -------------------------------------------------------------------
 
 int 
 main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg, 
     struct nsn_dataplane_thread_args *dp_args, usize dp_args_count)
 {
+    nsn_unused(dp_args);
     nsn_unused(dp_args_count);
 
     // send a message to the daemon to create a new instance
@@ -835,59 +931,15 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         case NSN_CMSG_TYPE_CREATE_SOURCE:
         {
             log_debug("received new source message from app %d\n", app_id);
-
-            // Check that the app_id exists
-            uint32_t app_idx = UINT32_MAX;
-            for (usize i = 0; i < app_pool.count; i++) {
-                if (app_pool.apps[i].app_id == app_id) {
-                    app_idx = (uint32_t)i;
-                    break;
-                }
-            }
-            if(app_idx > app_pool.count) {
-                log_error("app %d not found in the pool\n", app_id);
+           
+            int err = 0;
+            if ((err = ipc_create_channel(app_id, cmsghdr)) != 0) {
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 2;
+                *error_code     = -err;
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
                 break;
             }
-
-            // Check that the stream index is valid
-            nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
-            uint32_t stream_idx = (uint32_t)reply->stream_idx;
-            if (stream_idx >= plugin_set.count) {
-                log_error("stream index %d is out of bounds\n", stream_idx);
-                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
-                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 2;
-                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
-                break;
-            }
-          
-            // if this is the first src/snk (=channel) in the stream, start the first 
-            // data plane thread. In the future, this will be delegated to a thread pool manager.
-            if (plugin_set.plugins[stream_idx].active_channels == 0) {
-                // Currenlty, we just consider that thread j is assigned to plugin j.
-                uint32_t thread_idx = stream_idx;
-                struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
-                // It might be the case that the thread is already associated with the plugin,
-                // until we implement a thread pool manager. In this case, no need to add a 
-                // thread to the plugin; just start the existing one.
-                if (plugin_set.plugins[stream_idx].thread_count == 0) {
-                    // Keep a pointer to the thread in the plugin
-                    plugin_set.plugins[stream_idx].threads[plugin_set.plugins[stream_idx].thread_count] 
-                                                = thread_pool.threads[thread_idx];
-                    plugin_set.plugins[stream_idx].thread_count++;
-                    // Assign the plugin to the thread
-                    dp_args->datapath_name = plugin_set.plugins[stream_idx].name;
-                }
-                // start the thread
-                at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
-            }
-
-            // Ref count of the channels (src/snk) active in the stream
-            plugin_set.plugins[stream_idx].active_channels++;
 
             // finalize the answer
             cmsghdr->type = NSN_CMSG_TYPE_CREATED_SOURCE;
@@ -897,45 +949,14 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         {
             log_debug("received destroy source message from app %d\n", app_id);
 
-            // Check that the app_id exists
-            uint32_t app_idx = UINT32_MAX;
-            for (usize i = 0; i < app_pool.count; i++) {
-                if (app_pool.apps[i].app_id == app_id) {
-                    app_idx = (uint32_t)i;
-                    break;
-                }
-            }
-            if(app_idx > app_pool.count) {
-                log_error("app %d not found in the pool\n", app_id);
+            int err = 0;
+            if ((err = ipc_destroy_channel(app_id, cmsghdr)) != 0) {
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 2;
+                *error_code     = -err;
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
                 break;
             }
-
-            // Check that the stream index is valid
-            nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
-            uint32_t stream_idx = (uint32_t)reply->stream_idx;
-            if (stream_idx >= plugin_set.count) {
-                log_error("stream index %d is out of bounds\n", stream_idx);
-                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
-                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 2;
-                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
-                break;
-            }
-
-            // if the stream has no more active channels, stop the data plane thread 
-            // (which remains attached to the plugin, until we implement a thread pool manager)
-            // (ideally, the thread should go back into the pool)
-            // Currently, we just consider that thread j is assigned to plugin j.
-            uint32_t thread_idx = stream_idx;
-            struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
-            at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
-
-            // Ref count of the channels (src/snk) active in the stream
-            plugin_set.plugins[stream_idx].active_channels--;
 
             reply_len = sizeof(nsn_cmsg_hdr_t);
 
@@ -944,10 +965,34 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         {
             log_debug("received new sink message from app %d\n", app_id);
 
-            // if first ch in the stream, start the first data plane thread
-            at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+            int err = 0;
+            if ((err = ipc_create_channel(app_id, cmsghdr)) != 0) {
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = -err;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
 
-            // allocate a new rx ring buffer
+            // finalize the answer
+            cmsghdr->type = NSN_CMSG_TYPE_CREATED_SINK;
+            reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_sink_t);
+
+        } break;
+        case NSN_CMSG_TYPE_DESTROY_SINK:
+        {
+            log_debug("received destroy sink message from app %d\n", app_id);
+
+            int err = 0;
+            if ((err = ipc_destroy_channel(app_id, cmsghdr)) != 0) {
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = -err;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            reply_len = sizeof(nsn_cmsg_hdr_t);
 
         } break;
         case NSN_CMSG_TYPE_DISCONNECT:

@@ -43,6 +43,8 @@ enum nsn_cmsg_type
     NSN_CMSG_TYPE_DESTROY_SOURCE,
     // message from app to daemon to create a new sink
     NSN_CMSG_TYPE_CREATE_SINK,
+    // message from daemon to app to confirm the creation of a sink
+    NSN_CMSG_TYPE_CREATED_SINK,
     // message from app to daemon to destroy a sink
     NSN_CMSG_TYPE_DESTROY_SINK,
     // message from app to daemon to destroy an instance
@@ -87,6 +89,15 @@ struct nsn_cmsg_create_source
     nsn_stream_t stream_idx;
     // Id of the source
     nsn_source_t source_id;
+};
+
+typedef struct nsn_cmsg_create_sink nsn_cmsg_create_sink_t;
+struct nsn_cmsg_create_sink
+{
+    // Index of the associated stream
+    nsn_stream_t stream_idx;
+    // Id of the sink
+    nsn_sink_t sink_id;
 };
 
 #endif // NSN_IPC_H

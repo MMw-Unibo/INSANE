@@ -41,15 +41,23 @@ main(void)
     if (src == NSN_INVALID_SRC) {
         printf("nsn_create_source() failed\n");
         res = -1;
-        goto cleanup;
+        goto cleanup_w_stream;
+    }
+
+    nsn_source_t snk = nsn_create_sink(&stream, 0, NULL);
+    if (src == NSN_INVALID_SNK) {
+        printf("nsn_create_sink() failed\n");
+        res = -1;
+        goto cleanup_w_src;
     }
 
     sleep(1);
 
+    nsn_destroy_sink(snk);
+cleanup_w_src:
     nsn_destroy_source(src);
-
+cleanup_w_stream:
     nsn_destroy_stream(stream);
-
 cleanup:
     nsn_close();
 

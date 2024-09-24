@@ -61,6 +61,7 @@ typedef struct nsn_options {
 } nsn_options_t;
 
 //--------------------------------------------------------------------------------------------------
+#define NSN_INVALID_SNK UINT32_MAX
 typedef uint32_t nsn_sink_t;
 
 #define NSN_INVALID_SRC UINT32_MAX
@@ -166,7 +167,7 @@ int nsn_check_emit_outcome(nsn_source_t source, int id);
                         every new message  for this sink
  * @returns  The handler to the created sink
  */
-nsn_sink_t nsn_create_sink(nsn_stream_t *stream, int64_t source_id, handle_data_cb cb);
+nsn_sink_t nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb);
 
 /**
  * @brief    Close an INSANE sink
