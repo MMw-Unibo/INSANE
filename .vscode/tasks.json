@@ -1,0 +1,25 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build",
+            "type": "shell",
+            "command": "./build.sh",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }            
+        },
+        {
+            "label": "run gdbserver",
+            "type": "shell",
+            "command": "gdbserver :8888 ./build/nsnd -c configs/nsnd.cfg",
+            "group": {
+                "kind": "none",
+                "isDefault": true
+            },
+            "isBackground": true,
+            "dependsOn": "build"
+        }
+    ]
+}

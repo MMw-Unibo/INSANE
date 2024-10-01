@@ -1,0 +1,40 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Launch",
+            "program": "${workspaceFolder}/build/nsnd",
+            "args": [
+                "-c",
+                "configs/nsnd.cfg",
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Remote gdb",
+            "type": "cppdbg",
+            "request": "launch",
+            "miDebuggerServerAddress": ":8888",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "MIMode": "gdb",
+            "program": "${workspaceRoot}/build/nsnd",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-c",
+                "configs/nsnd.cfg",
+            ],
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+        },
+    ]
+}
