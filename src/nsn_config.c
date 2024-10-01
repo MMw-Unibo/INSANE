@@ -160,3 +160,24 @@ nsn_config_get_int(nsn_cfg_t *cfg, string_t sec, string_t key, int *out_value)
     nsn_thread_scratch_end(scratch);
     return 0;
 }
+
+int 
+nsn_config_get_string(nsn_cfg_t *cfg, string_t sec, string_t key, string_t* out_value)
+{
+    temp_mem_arena_t scratch = nsn_thread_scratch_begin(NULL, 0);
+
+    nsn_cfg_opt_t *opt = nsn_config_get_opt(scratch.arena, cfg, sec, key);
+    if (!opt) {
+        return -1;
+    }
+
+    if (opt->type != NsnConfigOptType_String) {
+        return -1;
+    }
+
+    log_debug("found option %.*s.%.*s = %.*s\n", (int)sec.len, sec.data, (int)key.len, key.data, (int)opt->string.len, opt->string.data);
+
+    *out_value = opt->string;
+    nsn_thread_scratch_end(scratch);
+    return 0;
+}

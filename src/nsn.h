@@ -4,6 +4,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
+#include "nsn_ringbuf.h"
+#include "nsn_zone.h"
 
 // --- Error Codes ----------------------------------------------------------------
 #define NSN_ERROR_ALREADY_INITIALIZED   1
@@ -58,13 +61,37 @@ typedef struct nsn_options {
 } nsn_options_t;
 
 //--------------------------------------------------------------------------------------------------
+#define NSN_INVALID_SNK UINT32_MAX
 typedef uint32_t nsn_sink_t;
+
+#define NSN_INVALID_SRC UINT32_MAX
 typedef uint32_t nsn_source_t;
 
-#define NSN_INVALID_STREAM_HANDLE  0
+#define NSN_INVALID_STREAM_HANDLE  UINT32_MAX
 typedef uint32_t nsn_stream_t;
 
 typedef void *handle_data_cb;
+
+//--------------------------------------------------------------------------------------------------
+// Definitions
+// TODO: These are duplicates of the nsnd.h/.c definitions. 
+// Consider passing these names from the daemon to the app via IPC instead,
+// and/or defining the structs in a common file
+#define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME         "tx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_RINGS_ZONE_NAME         "rings_zone"
+#define NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME    "free_slots"
+
+typedef struct nsn_ringbuf_pool nsn_ringbuf_pool_t;
+struct nsn_ringbuf_pool
+{
+    nsn_mm_zone_t *zone;
+    char           name[32];            // the name of the pool
+    usize          count;               // the number of ring buffers in the pool
+    usize          esize;               // the size of the elements in each ring buffer
+    usize          ecount;              // the number of elements in the ring buffer    
+    usize          free_slots_count;
+} nsn_cache_aligned;
 
 //--------------------------------------------------------------------------------------------------
 // INSANE API
@@ -140,7 +167,7 @@ int nsn_check_emit_outcome(nsn_source_t source, int id);
                         every new message  for this sink
  * @returns  The handler to the created sink
  */
-nsn_sink_t nsn_create_sink(nsn_stream_t *stream, int64_t source_id, handle_data_cb cb);
+nsn_sink_t nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb);
 
 /**
  * @brief    Close an INSANE sink

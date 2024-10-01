@@ -3,16 +3,19 @@
 static inline nsn_ringbuf_t *
 nsn_ringbuf_create_elem(void *memory, string_t name, usize esize, u32 count)
 {
-    nsn_unused(esize);
     // TODO: check if memory is aligned and if count is a power of 2
-    // TODO: assert that memory is big enough to hold the ringbuf + data
 
+    // ensure that memory is big enough to hold the ringbuf + data
+    // we assume that the ring data is always right after the ring descriptor
+    explicit_bzero(memory, sizeof(struct nsn_ringbuf) + count * esize);
     struct nsn_ringbuf *rb = (struct nsn_ringbuf *)memory;
 
     // set the data pointer
     rb->data = (void *)((u8 *)rb + sizeof(struct nsn_ringbuf));
 
-    rb->name     = name;
+    // set the name
+    memcpy(rb->name, name.data, name.len);
+
     rb->size     = count;
     rb->mask     = count - 1;
     rb->capacity = rb->mask;
@@ -33,6 +36,23 @@ nsn_ringbuf_create(void *memory, string_t name, u32 count)
 {
     return nsn_ringbuf_create_elem(memory, name, sizeof(void *), count);
 }
+
+u32 
+nsn_ringbuf_destroy(nsn_ringbuf_t *ring)
+{
+    if (ring == NULL)
+    {
+        log_error("invalid ring pointer\n");
+        return EINVAL;
+    }
+
+    // We assume that the ring data is always right after the ring descriptor
+    size_t size = sizeof(struct nsn_ringbuf) + ring->size * ring->esize;
+    explicit_bzero(ring->data, size);
+    
+    return 0;
+}
+
 
 u32 
 nsn_ringbuf_get_capacity(nsn_ringbuf_t *rb)

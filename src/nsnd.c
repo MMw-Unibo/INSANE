@@ -33,43 +33,12 @@
 #define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME         "tx_io_buffer_pool"
 #define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
 #define NSN_CFG_DEFAULT_RINGS_ZONE_NAME         "rings_zone"
-#define NSN_CFG_DEFAULT_TX_RING_CONS_NAME       "tx_ring_cons"
-#define NSN_CFG_DEFAULT_TX_RING_PROD_NAME       "tx_ring_prod"
+#define NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME    "free_slots"
+#define NSN_CFG_DEFAULT_TX_RING_SIZE            4096
+#define NSN_CFG_DEFAULT_RX_RING_SIZE            4096
+#define NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN  2
 
 static i64 cpu_hz = -1;
-
-// #include "nsn_thread_pool.c"
-
-typedef struct nsn_app nsn_app_t;
-struct nsn_app
-{
-    int app_id;
-};
-
-typedef struct nsn_app_pool nsn_app_pool_t;
-struct nsn_app_pool
-{
-    mem_arena_t *arena;
-    nsn_app_t   *apps;
-    bool        *free_apps_slots;
-    usize        count;
-    usize        used;
-};
-
-bool 
-app_pool_try_alloc_slot(nsn_app_pool_t *pool, int app_id)
-{
-    for (usize i = 0; i < pool->count; i++) {
-        if (pool->free_apps_slots[i]) {
-            pool->free_apps_slots[i]  = false;
-            pool->apps[i].app_id      = app_id;
-            pool->used               += 1;
-            return true;
-        }
-    }
-    return false;
-}
-
 
 static volatile bool g_running = true;
 
@@ -89,17 +58,6 @@ struct datapath_ops
     nsn_datapath_deinit     *deinit;
 };
 
-////////
-// insane daemon state
-
-int instance_id          = 0;
-mem_arena_t *state_arena = NULL;
-nsn_app_pool_t app_pool  = {0};
-
-string_list_t arg_list = {0};
-nsn_cfg_t *config      = NULL;
-////////
-
 // --- Memory Manager --------------------------------------------------
 
 typedef struct nsn_mem_manager_cfg nsn_mem_manager_cfg_t;
@@ -112,22 +70,10 @@ struct nsn_mem_manager_cfg
 };
 
 
-typedef struct nsn_ringbuf_pool nsn_ringbuf_pool_t;
-struct nsn_ringbuf_pool
-{
-    nsn_mm_zone_t *zone;
-    char           name[32];            // the name of the pool
-    usize          count;               // the number of ring buffers in the pool
-    usize          esize;               // the size of the elements in the ring buffer
-    usize          ecount;              // the number of elements in the ring buffer    
-    usize         *free_slots;          // if free_slots[i] == 0, then the slot is free
-    usize          free_slots_count;
-} nsn_cache_aligned;
-
 // --- Memory Manager ---------------------------------------------------------
 //  The memory manager is responsible for creating and managing the shared memory.
 //  It uses a Page Allocator to allocate memory from the shared memory.
-//  In particular, the manged memory is used to store:
+//  In particular, the managed memory is used to store:
 //   - The io buffer pools: used to store the packets received and transmitted 
 //     from and to the data plane and the applications
 //   - The ring buffers: use to exchange the pointers to the io buffers between 
@@ -144,11 +90,11 @@ struct nsn_mem_manager
 nsn_mm_zone_t *nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size, usize type);
 
 nsn_ringbuf_pool_t *
-nsn_ringbuf_pool_create(nsn_mem_manager_t *mem, string_t name, usize count, usize esize, usize ecount)
+nsn_memory_manager_create_ringbuf_pool(nsn_mem_manager_t *mem, string_t name, usize count, usize esize, usize ecount)
 {
     usize zone_size = sizeof(nsn_ringbuf_pool_t)           // the size of the pool header
-                    + (count * sizeof(usize))              // the size of the free slots
-                    + sizeof(nsn_ringbuf_t) * count        // the size of the ring buffers
+                    + (count * sizeof(bool))               // keeps track of the free slots
+                    + sizeof(nsn_ringbuf_t) * count        // the number of ring buffers
                     + (esize * ecount) * count;            // the size of the elements in the ring buffers
 
     nsn_mm_zone_t *zone = nsn_memory_manager_create_zone(mem, name, zone_size, NSN_MM_ZONE_TYPE_RINGS);
@@ -158,15 +104,140 @@ nsn_ringbuf_pool_create(nsn_mem_manager_t *mem, string_t name, usize count, usiz
     }
 
     nsn_ringbuf_pool_t *pool = (nsn_ringbuf_pool_t *)nsn_mm_zone_get_ptr(mem->shm_arena->base, zone);
-    pool->zone             = zone;
-    pool->count            = count;
-    pool->esize            = esize;
-    pool->ecount           = ecount;
-    pool->free_slots       = (usize *)(pool + 1);
-    pool->free_slots_count = count;
+    pool->zone              = zone;
+    pool->count             = count;
+    pool->esize             = esize;
+    pool->ecount            = ecount;
+    pool->free_slots_count  = count;
     strncpy(pool->name, to_cstr(name), sizeof(pool->name) - 1);
 
     return pool;
+}
+
+nsn_ringbuf_pool_t* nsn_memory_manager_get_ringbuf_pool(nsn_mem_manager_t* mem) {
+    nsn_mm_zone_t* zone = nsn_find_zone_by_name(mem->zones, str_lit("rings_zone"));
+    if (!zone) {
+        log_error("Zone \"rings_zone\" not found\n");
+        return NULL;
+    }
+
+    return (nsn_ringbuf_pool_t*)nsn_mm_zone_get_ptr(mem->shm_arena->base, zone);
+}
+
+// @param pool: the pool of ring buffers
+// @param ring_name: the name of the ring buffer
+// @param count: the number of elements in the ring buffer
+// @return: a pointer to the ring buffer
+nsn_ringbuf_t * 
+nsn_memory_manager_create_ringbuf(nsn_ringbuf_pool_t* pool, string_t ring_name, u32 count) {
+
+    if(pool->free_slots_count == 0) {
+        log_error("No more free slots in the ring buffer pool\n");
+        return NULL;
+    }
+
+    // check which slots are free
+    bool* ring_tracker = (bool*)(pool + 1);
+
+    // find a free slot
+    int slot = -1;
+    for (usize i = 0; i < pool->count; ++i) {
+        if (ring_tracker[i] == false) {
+            ring_tracker[i] = true;
+            slot = i;
+            break;
+        }
+    }
+
+    // create the ring buffer in the shared memory
+    char* ring_data = (char*)(ring_tracker + pool->count);  
+    usize ring_size = sizeof(nsn_ringbuf_t) + (pool->ecount * pool->esize);
+    nsn_ringbuf_t* ring = nsn_ringbuf_create(&ring_data[slot*ring_size], ring_name, count);
+
+    // fill in the descriptorsfor this ring in the pool    
+    pool->free_slots_count--;
+
+    log_info("Ring buffer %.*s created at %p\n", str_varg(ring_name), ring);
+    return ring;
+}
+
+// @param mem: the memory manager
+// @param ring_name: the name of the ring buffer to retrieve
+// @return: a pointer to the ring buffer, NULL if the ring buffer was not found
+nsn_ringbuf_t *
+nsn_memory_manager_lookup_ringbuf(nsn_mem_manager_t* mem, string_t ring_name) {
+    nsn_ringbuf_pool_t* pool = nsn_memory_manager_get_ringbuf_pool(mem);
+    if (!pool) {
+        log_error("Failed to get the ring buffer pool\n");
+        return NULL;
+    }
+    
+    // check which slots are free
+    bool* ring_tracker = (bool*)(pool + 1);
+    char* ring_data = (char*)(ring_tracker + pool->count);  
+    usize ring_size = sizeof(nsn_ringbuf_t) + (pool->ecount * pool->esize);
+
+    // find the ring buffer to destroy
+    nsn_ringbuf_t* ring = 0;
+    for (usize i = 0; i < pool->count; i++) {
+        if (ring_tracker[i] == true) {
+            ring = (nsn_ringbuf_t*)(&ring_data[i*ring_size]);
+            if (strcmp(ring->name, to_cstr(ring_name)) == 0) {
+                break;
+            } else {
+                ring = NULL;
+            }
+        }
+    }
+
+    if (!ring) {
+        log_error("Lookup: Ring buffer %.*s not found\n", str_varg(ring_name));
+        return NULL;
+    }
+
+    return ring;
+}
+
+// @param pool: the pool of ring buffers
+// @param ring_name: the name of the ring buffer to destroy
+// @return: 0 if the ring buffer was destroyed, <0 otherwise (errno value)
+int 
+nsn_memory_manager_destroy_ringbuf(nsn_ringbuf_pool_t* pool, string_t ring_name) {
+    if (!pool) {
+        log_error("Invalid ring buffer pool\n");
+        return -1;
+    }
+
+    // check which slots are free
+    bool* ring_tracker = (bool*)(pool + 1);
+    char* ring_data = (char*)(ring_tracker + pool->count);  
+    usize ring_size = sizeof(nsn_ringbuf_t) + (pool->ecount * pool->esize);
+
+    // find the ring buffer to destroy
+    nsn_ringbuf_t* ring = 0;
+    for (usize i = 0; i < pool->count; i++) {
+        if (ring_tracker[i] == true) {
+            ring = (nsn_ringbuf_t*)(&ring_data[i*ring_size]);
+            if (strcmp(ring->name, to_cstr(ring_name)) == 0) {
+                break;
+            } else {
+                ring = NULL;
+            }
+        }
+    }
+
+    if (!ring) {
+        log_error("Lookup: Ring buffer %.*s not found\n", str_varg(ring_name));
+        return -1;
+    }
+
+    // destroy the ring buffer
+    int error = nsn_ringbuf_destroy(ring);
+    if (!error) {
+        pool->free_slots_count++;
+    }
+
+    return -error;
 }
 
 nsn_mem_manager_t *
@@ -178,7 +249,7 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
     //              ring buffers used for the receive and transmit queues.
     nsn_shm_t *shm = nsn_shm_alloc(arena, to_cstr(cfg->shm_name), cfg->shm_size);
     if (!shm) {
-        log_error("Failed to create shared memeory\n");
+        log_error("Failed to create shared memory\n");
         return NULL;
     }
 
@@ -192,24 +263,33 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
     // each zone will have a header with the size of the zone, the name of the zone, the type of the zone, 
     // the pointer to the next zone, the pointer to the previous zone, and the pointer to the first block of the zone.
 
-    usize io_buf_pool_size = cfg->io_buffer_pool_size * cfg->io_buffer_size;
-    nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME), io_buf_pool_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
-    nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME), io_buf_pool_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+    usize total_zone_size = cfg->io_buffer_pool_size * cfg->io_buffer_size;
+    nsn_mm_zone_t *tx_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+    if (!tx_zone) {
+        log_error("failed to create the tx_zone\n");
+        return NULL;
+    }
+    // nsn_mm_zone_t *rx_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
 
     // Create a pool of ring buffers inside the ring zone
-    nsn_ringbuf_pool_create(mem, str_lit("rings_zone"), 16, sizeof(usize), cfg->io_buffer_pool_size);
+    usize max_rings = 16;
+    nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_create_ringbuf_pool(mem, str_lit(NSN_CFG_DEFAULT_RINGS_ZONE_NAME), max_rings, sizeof(usize), cfg->io_buffer_pool_size);
 
-    // Create the two tx ring buffers, one for the consumer(s) (applications) and one for the producer (the daemon)
-    //  - The applications are consumers because they ask for a pointer to the io buffer to fill with data
-    //  - The daemon is the producer because it provides the pointers to free io buffers
-
-
-    // Fill the ring buffer with the pointers to the io buffers, the pointers are actually the offset from the start of the zone
-    // u64 table[16];
-    // for (usize i = 0; i < nsn_ringbuf_get_size(mem->tx_ring); i++) {
-    //     table[0] = i;
-    //     nsn_ringbuf_enqueue_burst(mem->tx_ring, &table, sizeof(u64), 1, NULL);
-    // } 
+    // Create the ring that keeps the free slot descriptors.
+    // TODO: The free_slots can be split into a tx/rx couple of rings, if we decide to keep both the tx and rx memory areas separated. Now we keep 1 zone for slots (tx_zone) and 1 ring for its indexing (NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME).
+    usize total_free_slots = 2 * cfg->io_buffer_pool_size;
+    nsn_ringbuf_t *free_slots_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME), total_free_slots);
+    if (!free_slots_ring) {
+        log_error("Failed to create the free_slots ring\n");
+        // TODO: Should we clean the things we created so far? E.g., zones etc?
+        return NULL;
+    }
+    log_trace("Successfully created the free_slots ring at %p with name %s\n", free_slots_ring, free_slots_ring->name);
+    
+    // Fill the ring buffer with the index of the tx slots 
+    for (usize i = 0; i < total_free_slots; i+=cfg->io_buffer_size) {
+        nsn_ringbuf_enqueue_burst(free_slots_ring, &i, sizeof(u64), 1, NULL);
+    } 
 
     return mem;
 }
@@ -258,7 +338,104 @@ nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size
     return zone;
 }
 
-// --- Data Plane Thread -------------------------------------------------------
+// Return the offset of a managed element with respect to the memory arena base address.
+usize
+nsn_memory_manager_offset_of(nsn_mem_manager_t *mem, void* element) {
+    log_info("element: %p\n", (char*)element);
+    log_info("shm->data: %p\n", mem->shm->data);
+    return (usize)element - (usize)mem->shm->data;
+}
+
+typedef struct nsn_app nsn_app_t;
+struct nsn_app
+{
+    int app_id;
+    mem_arena_t *arena;
+    nsn_mem_manager_t* mem;
+};
+
+typedef struct nsn_app_pool nsn_app_pool_t;
+struct nsn_app_pool
+{
+    mem_arena_t *arena;
+    nsn_app_t   *apps;
+    bool        *free_apps_slots;
+    usize        count;
+    usize        used;
+};
+
+bool 
+app_pool_init_slot(nsn_app_pool_t *pool, int app_slot, nsn_mem_manager_cfg_t* mem_cfg)
+{
+    if (app_slot < 0) {
+        return false;
+    }
+    // TODO: maybe restrict the access permissions to those two processes with mprotect?)
+    nsn_app_t *app = &pool->apps[app_slot];
+    app->arena = mem_arena_alloc(megabytes(500));
+    if (!app->arena) {
+        log_error("Failed to create memory arena for app %d\n", app->app_id);
+        return false;
+    }
+
+    log_debug("Created memory arena for app %d at %p\n base %u (%p)\n pos %u\n com_pos %u\n", app->app_id, app->arena, 
+        app->arena->base, (char*)app->arena->base,
+        app->arena->pos,
+        app->arena->com_pos);
+
+    char shm_name_app[NSN_MAX_PATH_SIZE];
+    snprintf(shm_name_app, NSN_MAX_PATH_SIZE, "%s_%d", mem_cfg->shm_name.data, app->app_id);
+    mem_cfg->shm_name = str_lit(shm_name_app);
+
+    app->mem = nsn_memory_manager_create(app->arena, mem_cfg);
+    if (!app->mem) {
+        log_error("Failed to create shared memory for app \n");
+        return false;
+    }
+    return true;
+}
+
+int 
+app_pool_try_alloc_slot(nsn_app_pool_t *pool, int app_id)
+{
+    for (usize i = 0; i < pool->count; i++) {
+        if (pool->free_apps_slots[i]) {
+            pool->free_apps_slots[i]  = false;
+            pool->apps[i].app_id      = app_id;
+            pool->used               += 1;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+bool 
+app_pool_try_alloc_and_init_slot(nsn_app_pool_t *pool, int app_id, nsn_mem_manager_cfg_t mem_cfg)
+{
+    int slot = app_pool_try_alloc_slot(pool, app_id);
+    if (slot < 0) {
+        return false;
+    }
+    return app_pool_init_slot(pool, slot, &mem_cfg);
+}
+
+typedef struct nsn_plugin nsn_plugin_t;
+struct nsn_plugin
+{
+    string_t name;
+    nsn_os_thread_t* threads;
+    usize thread_count;
+    usize active_channels;    
+};
+
+typedef struct nsn_plugin_set nsn_plugin_set_t;
+struct nsn_plugin_set 
+{
+    nsn_plugin_t *plugins;
+    usize         count;
+};
+
+// --- Thread Pool -------------------------------------------------------
 
 enum nsn_dataplane_thread_state
 {
@@ -275,17 +452,42 @@ const char *nsn_dataplane_thread_state_str[] = {
 
 struct nsn_dataplane_thread_args
 {
-    nsn_mem_manager_t *mm;
+    // nsn_mem_manager_t *mm;
     atu32              state;
     string_t           datapath_name;
 };
+
+typedef struct nsn_thread_pool nsn_thread_pool_t;
+struct nsn_thread_pool
+{
+    nsn_os_thread_t *threads;
+    struct nsn_dataplane_thread_args *thread_args;
+    usize            count;
+};
+
+////////
+// --- INSANE daemon state ----------------------------------------------------
+
+int instance_id          = 0;
+mem_arena_t *state_arena = NULL;
+nsn_app_pool_t app_pool  = {0};
+nsn_plugin_set_t plugin_set = {0};
+nsn_thread_pool_t thread_pool = {0};
+
+string_list_t arg_list = {0};
+nsn_cfg_t *config      = NULL;
+////////
 
 void *
 dataplane_thread_proc(void *arg)
 {
     struct nsn_dataplane_thread_args *args = (struct nsn_dataplane_thread_args *)arg;
-    nsn_mem_manager_t *mem = args->mm;
-    nsn_unused(mem);
+    // nsn_mem_manager_t *mem = args->mm;
+    // nsn_unused(mem);
+
+    nsn_thread_ctx_t this_thread = nsn_thread_ctx_alloc();
+    this_thread.is_main_thread   = false;
+    nsn_thread_set_ctx(&this_thread);
 
     int self = nsn_os_current_thread_id();
     u32 state;
@@ -301,7 +503,7 @@ wait:
         return NULL;
     }
 
-    // TODO: start the data plane
+    // Load the datapath plugin
     string_t datapath_name = args->datapath_name;
     log_debug("[thread %d] dataplane thread started for datapath: " str_fmt "\n", self, str_varg(datapath_name));                 
     char datapath_lib[256];
@@ -327,7 +529,13 @@ wait:
 
     nsn_datapath_ctx_t ctx;
     memory_zero_struct(&ctx);
-    snprintf(ctx.configs, sizeof(ctx.configs) - 1, "10.0.0.212:9999");
+ 
+    string_t socket_ip;
+    int socket_port;
+    nsn_config_get_string(config, str_lit("global"), str_lit("socket_ip"), &socket_ip);
+    nsn_config_get_int(config, str_lit("global"), str_lit("socket_port"), &socket_port);
+    snprintf(ctx.configs, sizeof(ctx.configs) - 1, "%.*s:%d", (int)socket_ip.len, to_cstr(socket_ip), socket_port);
+
     ops.init(&ctx);
 
     while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_RUNNING) {
@@ -391,33 +599,128 @@ quit:
     return NULL;
 }
 
-// --- Test Application Thread --------------------------------------------------
+// // --- Test Application Thread --------------------------------------------------
 
-typedef struct test_app_thread_args test_app_thread_args_t;
-struct test_app_thread_args
+// typedef struct test_app_thread_args test_app_thread_args_t;
+// struct test_app_thread_args
+// {
+//     nsn_mem_manager_t *mm;
+// };
+
+// void *
+// test_app_thread_proc(void *arg)
+// {
+//     test_app_thread_args_t *args = (test_app_thread_args_t *)arg;
+//     nsn_mem_manager_t *mem = args->mm;
+//     nsn_unused(mem);
+
+//     log_info("thread [test app] started\n");
+
+//     i64 cycles_start = nsn_os_get_cycles();
+//     // for (usize i = 0; i < 100; i++) {
+//     //     u64 table[16];
+//     //     nsn_ringbuf_dequeue_burst(mem->tx_ring, table, sizeof(u64), 1, NULL);
+//     // }
+//     i64 cycles_end = nsn_os_get_cycles();
+//     f64 elapsed_ns = (cycles_end - cycles_start) / (f64)(cpu_hz / 1000000000.0);
+//     log_info("nsn_ringbuf_dequeue_burst() took %f ns (%ld cycles)\n", elapsed_ns / 100, cycles_end - cycles_start);
+
+//     return NULL;
+// }
+
+// --- Helper Functions ---------------------------------------------------------
+// Helps creating a source/sink. If necessary, it starts a new thread for the dataplane.
+// Returns 0 on success, -1 on error.
+int
+ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr) 
 {
-    nsn_mem_manager_t *mm;
-};
+    // Check that the app_id exists
+    uint32_t app_idx = UINT32_MAX;
+    for (usize i = 0; i < app_pool.count; i++) {
+        if (app_pool.apps[i].app_id == app_id) {
+            app_idx = (uint32_t)i;
+            break;
+        }
+    }
+    if(app_idx > app_pool.count) {
+        log_error("app %d not found in the pool\n", app_id);
+        return -1;
+    }
 
-void *
-test_app_thread_proc(void *arg)
-{
-    test_app_thread_args_t *args = (test_app_thread_args_t *)arg;
-    nsn_mem_manager_t *mem = args->mm;
-    nsn_unused(mem);
+    // Check that the stream index is valid
+    nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
+    uint32_t stream_idx = (uint32_t)reply->stream_idx;
+    if (stream_idx >= plugin_set.count) {
+        log_error("stream index %d is out of bounds\n", stream_idx);
+        return -2;
+    }
+    
+    // if this is the first src/snk (=channel) in the stream, start the first 
+    // data plane thread. In the future, this will be delegated to a thread pool manager.
+    if (plugin_set.plugins[stream_idx].active_channels == 0) {
+        // Currenlty, we just consider that thread j is assigned to plugin j.
+        uint32_t thread_idx = stream_idx;
+        struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
+        // It might be the case that the thread is already associated with the plugin,
+        // until we implement a thread pool manager. In this case, no need to add a 
+        // thread to the plugin; just start the existing one.
+        if (plugin_set.plugins[stream_idx].thread_count == 0) {
+            // Keep a pointer to the thread in the plugin
+            plugin_set.plugins[stream_idx].threads[plugin_set.plugins[stream_idx].thread_count] 
+                                        = thread_pool.threads[thread_idx];
+            plugin_set.plugins[stream_idx].thread_count++;
+            // Assign the plugin to the thread
+            dp_args->datapath_name = plugin_set.plugins[stream_idx].name;
+        }
+        // start the thread
+        at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+    }
 
-    log_info("thread [test app] started\n");
+    // Ref count of the channels (src/snk) active in the stream
+    plugin_set.plugins[stream_idx].active_channels++;
 
-    i64 cycles_start = nsn_os_get_cycles();
-    // for (usize i = 0; i < 100; i++) {
-    //     u64 table[16];
-    //     nsn_ringbuf_dequeue_burst(mem->tx_ring, table, sizeof(u64), 1, NULL);
-    // }
-    i64 cycles_end = nsn_os_get_cycles();
-    f64 elapsed_ns = (cycles_end - cycles_start) / (f64)(cpu_hz / 1000000000.0);
-    log_info("nsn_ringbuf_dequeue_burst() took %f ns (%ld cycles)\n", elapsed_ns / 100, cycles_end - cycles_start);
+    return 0;
+}
 
-    return NULL;
+// Helps destroying a source/sink. If necessary, it stops the thread for the dataplane.
+// Returns 0 on success, -1 on error.
+int
+ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr) {
+    // Check that the app_id exists
+    uint32_t app_idx = UINT32_MAX;
+    for (usize i = 0; i < app_pool.count; i++) {
+        if (app_pool.apps[i].app_id == app_id) {
+            app_idx = (uint32_t)i;
+            break;
+        }
+    }
+    if(app_idx > app_pool.count) {
+        log_error("app %d not found in the pool\n", app_id);
+        return -1;
+    }
+
+    // Check that the stream index is valid
+    nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
+    uint32_t stream_idx = (uint32_t)reply->stream_idx;
+    if (stream_idx >= plugin_set.count) {
+        log_error("stream index %d is out of bounds\n", stream_idx);
+        return -2;
+    }
+
+    // Ref count of the channels (src/snk) active in the stream
+    plugin_set.plugins[stream_idx].active_channels--;
+    
+    // if the stream has no more active channels, stop the data plane thread 
+    // (which remains attached to the plugin, until we implement a thread pool manager)
+    // (ideally, the thread should go back into the pool)
+    // Currently, we just consider that thread j is assigned to plugin j.
+    uint32_t thread_idx = stream_idx;
+    struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
+    if(plugin_set.plugins[stream_idx].active_channels == 0) {
+        at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
+    }
+    
+    return 0;
 }
 
 // --- Main -------------------------------------------------------------------
@@ -426,8 +729,7 @@ int
 main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg, 
     struct nsn_dataplane_thread_args *dp_args, usize dp_args_count)
 {
-    TracyCZoneN(s_tracy_ctx, "main_thread_control_ipc", 1);
-
+    nsn_unused(dp_args);
     nsn_unused(dp_args_count);
 
     // send a message to the daemon to create a new instance
@@ -456,17 +758,25 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
     usize reply_len         = 0;
     nsn_cmsg_hdr_t *cmsghdr = (nsn_cmsg_hdr_t *)buffer;
     int app_id              = cmsghdr->app_id;
+
+    // TODO: except from the CONNECT case, we should check that the app_id is valid.
+    // and, if not, we should TERMINATE the application issuing the request.
+    // We should also introduce some mechanism to ensure that no app is sending us a different
+    // app_id than the one it was assigned. It would be a big security issue.
+
     switch (cmsghdr->type)
     {
         case NSN_CMSG_TYPE_CONNECT:
         {
-            if (app_pool_try_alloc_slot(&app_pool, app_id)) {
+            if (app_pool_try_alloc_and_init_slot(&app_pool, app_id, mem_cfg)) {
                 log_debug("app %d connected\n", app_id);
 
+                // Complete the reply
                 cmsghdr->type             = NSN_CMSG_TYPE_CONNECTED;
                 nsn_cmsg_connect_t *reply = (nsn_cmsg_connect_t *)(cmsghdr + 1);
                 reply->shm_size           = mem_cfg.shm_size;
-                snprintf(reply->shm_name, NSN_MAX_PATH_SIZE, "nsnd_datamem");
+                strcpy(reply->free_slots_ring, NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME);
+                snprintf(reply->shm_name, NSN_MAX_PATH_SIZE, "nsnd_datamem_%d", app_id);
                 
                 reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_connect_t);
             } else {
@@ -480,29 +790,209 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         case NSN_CMSG_TYPE_CREATE_STREAM:
         {
             log_debug("received new stream message from app %d\n", app_id);
+            
+            // Check that the app_id exists
+            uint32_t app_idx = UINT32_MAX;
+            for (usize i = 0; i < app_pool.count; i++) {
+                if (app_pool.apps[i].app_id == app_id) {
+                    app_idx = (uint32_t)i;
+                    break;
+                }
+            }
+            if(app_idx > app_pool.count) {
+                log_error("app %d not found in the pool\n", app_id);
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 2;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
 
-            // start the first data plane thread
-            at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+            // TODO(lr): Here we should put the logic for the QoS-to-plugin mapping.
+            // For the moment, just use the first one
+            uint16_t stream_idx = 0;
+
+            // Return the index of the plugin as stream handler
+            nsn_cmsg_create_stream_t *reply = (nsn_cmsg_create_stream_t*)(cmsghdr + 1);
+            reply->stream_idx = stream_idx;
+
+            // Create the ring buffers, where the consumer and producer definitions are relative to the application.
+            // The tx_cons and the rx_prod are the same ring, the free_slots ring, which is already available to the app.
+            // The tx_prod is created here for this plugin, allowing the app to send data to the plugin.
+            snprintf(reply->tx_prod, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%u", stream_idx);
+            // The rx_cons is created here for this plugin, allowing the app to receive data from the plugin.
+            snprintf(reply->rx_cons, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "rx_cons_%u", stream_idx);
+            
+            nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
+            nsn_ringbuf_t *tx_prod_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(reply->tx_prod), NSN_CFG_DEFAULT_TX_RING_SIZE);
+            if (!tx_prod_ring) {
+                log_error("Failed to create the tx_prod ring\n", tx_prod_ring);
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 3;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            nsn_ringbuf_t *rx_cons_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(reply->rx_cons), NSN_CFG_DEFAULT_RX_RING_SIZE);
+            if (!rx_cons_ring) {
+                log_error("Failed to create the rx_cons ring\n", rx_cons_ring);
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 3;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // TODO: Where do we put this ring? We should make the plugin thread aware of it. HOW?
+           
+            // Successful operation: return success
+            cmsghdr->type = NAN_CSMG_TYPE_CREATED_STREAM;
+            reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_stream_t);
 
         } break;
         case NSN_CMSG_TYPE_DESTROY_STREAM:
         {
             log_debug("received destroy stream message from app %d\n", app_id);
 
-            // stop the first data plane thread
-            at_store(&dp_args[0].state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
+            // Check that the app_id exists
+            uint32_t app_idx = UINT32_MAX;
+            for (usize i = 0; i < app_pool.count; i++) {
+                if (app_pool.apps[i].app_id == app_id) {
+                    app_idx = (uint32_t)i;
+                    break;
+                }
+            }
+            if(app_idx > app_pool.count) {
+                log_error("app %d not found in the pool\n", app_id);
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 2;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // Check that the stream index is valid
+            nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
+            uint32_t stream_idx = (uint32_t)reply->stream_idx;
+            if (stream_idx >= plugin_set.count) {
+                log_error("stream index %d is out of bounds\n", stream_idx);
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 2;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // check that no channel is active for this stream
+            if (plugin_set.plugins[stream_idx].active_channels > 0) {
+                log_error("stream %d has active channels (src/snk)\n", stream_idx);
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 3;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // 3) [Future Work] Detach the thread(s) associated with this stream. Here, or proactively at channel destruction.
+
+            // 4) destroy the tx/rx rings
+            nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
+            char tx_prod_ring_name[NSN_CFG_RINGBUF_MAX_NAME_SIZE];
+            snprintf(tx_prod_ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%u", stream_idx);
+            int err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(tx_prod_ring_name));
+            if (err < 0) {
+                log_error("Failed to destroy the tx_prod ring\n");
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 4;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // 5) destroy the rx_cons ring
+            char rx_cons_ring_name[NSN_CFG_RINGBUF_MAX_NAME_SIZE];
+            snprintf(rx_cons_ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "rx_cons_%u", stream_idx);
+            err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(rx_cons_ring_name));
+            if (err < 0) {
+                log_error("Failed to destroy the rx_cons ring\n");
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 4;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // Return success
+            cmsghdr->type = NSN_CMSG_TYPE_DESTROYED_STREAM;
+            reply_len = sizeof(nsn_cmsg_hdr_t);
 
         } break;
         case NSN_CMSG_TYPE_CREATE_SOURCE:
         {
             log_debug("received new source message from app %d\n", app_id);
+           
+            int err = 0;
+            if ((err = ipc_create_channel(app_id, cmsghdr)) != 0) {
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = -err;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // finalize the answer
+            cmsghdr->type = NSN_CMSG_TYPE_CREATED_SOURCE;
+            reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_source_t);
+        } break;
+        case NSN_CMSG_TYPE_DESTROY_SOURCE: 
+        {
+            log_debug("received destroy source message from app %d\n", app_id);
+
+            int err = 0;
+            if ((err = ipc_destroy_channel(app_id, cmsghdr)) != 0) {
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = -err;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            reply_len = sizeof(nsn_cmsg_hdr_t);
 
         } break;
         case NSN_CMSG_TYPE_CREATE_SINK:
         {
             log_debug("received new sink message from app %d\n", app_id);
 
-            // allocate a new rx ring buffer
+            int err = 0;
+            if ((err = ipc_create_channel(app_id, cmsghdr)) != 0) {
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = -err;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // finalize the answer
+            cmsghdr->type = NSN_CMSG_TYPE_CREATED_SINK;
+            reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_sink_t);
+
+        } break;
+        case NSN_CMSG_TYPE_DESTROY_SINK:
+        {
+            log_debug("received destroy sink message from app %d\n", app_id);
+
+            int err = 0;
+            if ((err = ipc_destroy_channel(app_id, cmsghdr)) != 0) {
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = -err;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            reply_len = sizeof(nsn_cmsg_hdr_t);
 
         } break;
         case NSN_CMSG_TYPE_DISCONNECT:
@@ -517,6 +1007,13 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                     app_pool.free_apps_slots[i]  = true;
                     app_pool.used               -= 1;
                     found                        = true;
+
+                    // Release the memory shared with the app.
+                    // This will destroy whatever is in the shared memory,
+                    // including the ring buffers, the zones, etc.
+                    nsn_memory_manager_destroy(app_pool.apps[i].mem);
+                    mem_arena_release(app_pool.apps[i].arena);
+
                     break;
                 }
             }
@@ -614,7 +1111,7 @@ main(int argc, char *argv[])
            cpu_hz, sizeof(nsn_mm_zone_t), sizeof(nsn_ringbuf_t), sizeof(nsn_ringbuf_pool_t));
 
     instance_id   = nsn_os_get_process_id();
-    state_arena = mem_arena_alloc(gigabytes(1));
+    state_arena = mem_arena_alloc(megabytes(1));
 
     for (int i = 0; i < argc; i++)
         str_list_push(state_arena, &arg_list, str_cstr(argv[i]));
@@ -645,11 +1142,23 @@ main(int argc, char *argv[])
     nsn_config_get_int(config, str_lit("global"), str_lit("shm_size"), &shm_size);
 
     // init the memory arena
-    mem_arena_t *arena = mem_arena_alloc(gigabytes(1));
+    mem_arena_t *arena = mem_arena_alloc(megabytes(1));
     app_pool.count           = app_num;
     app_pool.apps            = mem_arena_push_array(arena, nsn_app_t, app_pool.count);
     app_pool.free_apps_slots = mem_arena_push_array(arena, bool, app_pool.count);
     for (usize i = 0; i < app_pool.count; i++)    app_pool.free_apps_slots[i] = true;
+
+    // TODO: Automatically detect which plugins are available and can be used by the daemon.
+    // Currently, we only consider 1 as available (make it the "udpsock" plugin).
+    plugin_set.plugins = mem_arena_push_array(arena, nsn_plugin_t, 1);
+    plugin_set.count   = 1;
+    for (usize i = 0; i < plugin_set.count; i++) {
+        plugin_set.plugins[i].name = str_lit("udpsock");
+        plugin_set.plugins[i].thread_count = 0;
+        plugin_set.plugins[i].threads = mem_arena_push_array(arena, nsn_os_thread_t,
+                                                    NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN);
+        plugin_set.plugins[i].active_channels = 0;
+    }
 
     // init SIG_INT handler
     struct sigaction sa;
@@ -665,11 +1174,6 @@ main(int argc, char *argv[])
         .io_buffer_pool_size = (usize)io_bufs_num,
         .io_buffer_size      = (usize)io_bufs_size,
     };
-    nsn_mem_manager_t *mem = nsn_memory_manager_create(arena, &mem_cfg);
-    if (!mem) {
-        log_error("Failed to create shared memory\n");
-        goto quit;
-    }
 
     // create the control socket
     int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -693,47 +1197,50 @@ main(int argc, char *argv[])
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
-    // --- Create some threads
-    struct nsn_dataplane_thread_args dp_args[2] = {
-        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") },
-        { .mm = mem, .state = NSN_DATAPLANE_THREAD_STATE_WAIT, .datapath_name = str_lit_compound("udpsock") }
-    };
-
-    nsn_os_thread_t threads[1];
-    for (usize i = 0; i < array_count(threads); i++) {
+    // --- Init the thread pool. Currently, one thread only. We do not set here the dp_args.name, 
+    // as the thread pool exists independently of the associated plugin. However, it is important that
+    // the name is set when the thread moves to the RUNNING state, as it will try to load the dll.
+    // The association is done when a new stream for a new plugin is set, and currently is permanent.
+    // Future work will include a way to dynamically attach/detach threads to/from plugins.
+    thread_pool.count = 1;
+    thread_pool.threads = mem_arena_push_array(arena, nsn_os_thread_t, thread_pool.count);
+    thread_pool.thread_args = mem_arena_push_array(arena, struct nsn_dataplane_thread_args, 
+                                                        thread_pool.count);
+    for (usize i = 0; i < thread_pool.count; i++) {
         log_trace("creating thread %d\n", i);
-        threads[i] = nsn_os_thread_create(dataplane_thread_proc, &dp_args[i]);
+        thread_pool.thread_args[i] = 
+            (struct nsn_dataplane_thread_args){ .state = NSN_DATAPLANE_THREAD_STATE_WAIT};
+        thread_pool.threads[i] = nsn_os_thread_create(dataplane_thread_proc, &thread_pool.thread_args[i]);
+        if (thread_pool.threads[i].handle == 0) {
+            log_error("Failed to create thread %d\n", i);
+            goto clear_and_quit;
+        }
     }
 
-    nsn_os_thread_t test_app_thread;
-    test_app_thread_args_t test_args = { .mm = mem };
-    test_app_thread = nsn_os_thread_create(test_app_thread_proc, &test_args);
-
+    // Control path
+    struct nsn_dataplane_thread_args cp_args = { .state = NSN_DATAPLANE_THREAD_STATE_WAIT  };
     while (g_running) 
     {
-        if (main_thread_control_ipc(sockfd, mem_cfg, dp_args, array_count(dp_args)) < 0)
+        if (main_thread_control_ipc(sockfd, mem_cfg, &cp_args, 1) < 0)
             log_warn("Failed to handle control ipc\n");
 
         usleep(1);
     }
 
-    // Tell the threads to stop
-    for (usize i = 0; i < array_count(threads); i++) {
-        at_store(&dp_args[i].state, NSN_DATAPLANE_THREAD_STATE_STOP, mo_rlx);
+    // Stop the threads in the thread pool
+    for (usize i = 0; i < thread_pool.count; i++) {
+        at_store(&thread_pool.thread_args[i].state, NSN_DATAPLANE_THREAD_STATE_STOP, mo_rlx);
     }
 
-    for (usize i = 0; i < array_count(threads); i++) {
-        nsn_os_thread_join(threads[i]);
+    for (usize i = 0; i < thread_pool.count; i++) {
+        nsn_os_thread_join(thread_pool.threads[i]);
     }
-
-    nsn_os_thread_join(test_app_thread);
 
     // cleanup
 clear_and_quit:
     if (sockfd != -1) close(sockfd);
     unlink(NSNAPP_TO_NSND_IPC);
-    nsn_memory_manager_destroy(mem);
-quit:
+// quit:
     mem_arena_release(state_arena);
     mem_arena_release(arena);
 

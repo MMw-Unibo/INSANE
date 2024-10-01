@@ -7,38 +7,118 @@
 #include "nsn_shm.h"
 #include "nsn_zone.h"
 
-// struct nsn_app_context
-// {
-//     int id;
+// internals
+#define NSN_MAX_STREAMS 8
+typedef struct nsn_stream_inner nsn_stream_inner_t;
+struct nsn_stream_inner {
+    // The stream is valid
+    bool is_active;
+    // Stream id 
+    nsn_stream_t stream_id;
+    // send tx slot to the daemon
+    nsn_ringbuf_t *tx_prod;
+    // receive tx slot from the daemon
+    nsn_ringbuf_t *tx_cons;
+    // send rx slot to the daemon
+    nsn_ringbuf_t *rx_prod;
+    // receive rx slot from the daemon
+    nsn_ringbuf_t *rx_cons;
+};
 
-//     // nsn_meminfo_t    info;
-//     // nsn_meminfo_tx_t tx_info[2];
+#define NSN_MAX_SOURCES 8
+#define NSN_MAX_SINKS 8
 
-//     i32                ctrl_sockfd;
-//     struct sockaddr_un req_addr;
-//     struct sockaddr_un res_addr;
-//     char               ctrl_path[IPC_MAX_PATH_SIZE];
+typedef struct nsn_source_inner nsn_source_inner_t;
+struct nsn_source_inner {
+    // The source is valid
+    bool is_active;
+    // Stream id 
+    nsn_stream_t stream;
+    // User-provided id
+    uint32_t id;
+};
 
-//     // TODO: this should a list of memory pools or a single abstracted memory pool???
-//     // /* Memory Pools */
-//     // // DPDK
-//     // struct rte_mempool *dpdk_pool;
-//     // nsn_ioctx_dpdk_t   *dpdk_ctx;
-//     // // Socket
-//     // nsn_meminfo_t     *socket_pool;
-//     // nsn_ioctx_socket_t socket_ctx;
-// };
+typedef struct nsn_sink_inner nsn_sink_inner_t;
+struct nsn_sink_inner {
+    // The sink is valid
+    bool is_active;
+    // Stream id 
+    nsn_stream_t stream;
+    // User-provided id
+    uint32_t id;
+    // User-provided callbakck
+    handle_data_cb cb;
+};
 
-
+// nsn app state
 mem_arena_t *arena = NULL;
 int app_id         = -1;
 int sockfd         = -1;
 struct sockaddr_un nsn_app_addr;
 struct sockaddr_un nsnd_addr;
 nsn_shm_t *shm            = NULL;
+
+// Slots management
+nsn_mm_zone_t *tx_bufs;
+// nsn_mm_zone_t *rx_bufs;
+nsn_mm_zone_t *rings_zone;
+nsn_ringbuf_t *free_slots_ring;
+
 nsn_mutex_t nsn_app_mutex = NSN_OS_MUTEX_INITIALIZER;
+nsn_stream_inner_t streams[NSN_MAX_STREAMS]; //TODO: is there a better way? A list?
+uint32_t n_str = 0;
+nsn_source_inner_t sources[NSN_MAX_SOURCES]; //TODO: is there a better way? A list?
+uint32_t n_src = 0;
+nsn_sink_inner_t sinks[NSN_MAX_SINKS];
+uint32_t n_snk = 0;
 
 // -----------------------------------------------------------------------------
+// Helpers
+// @param zone: the zone to search in
+// @param ring_name: the name of the ring buffer to retrieve from the zone
+// @return: a pointer to the ring buffer, NULL if the ring buffer was not found
+static nsn_ringbuf_t *
+nsn_lookup_ringbuf(nsn_mm_zone_t* rings_zone, string_t ring_name) {
+    if (!rings_zone) {
+        log_error("Invalid zone\n");
+        return NULL;
+    }
+
+    nsn_ringbuf_pool_t* pool = (nsn_ringbuf_pool_t*)nsn_mm_zone_get_ptr(shm->data, rings_zone);
+    if (!pool) {
+        log_error("Failed to get the ring buffer pool\n");
+        return NULL;
+    }
+    log_debug("Ring pool found at %p, with %lu free slots\n", pool, pool->free_slots_count);
+
+    // check which slots are free
+    bool* ring_tracker = (bool*)(pool + 1);
+    char* ring_data = (char*)(ring_tracker + pool->count);  
+    usize ring_size = sizeof(nsn_ringbuf_t) + (pool->ecount * pool->esize);
+
+    // find the ring buffer to retrieve
+    nsn_ringbuf_t* ring = 0;
+    for (usize i = 0; i < pool->count; ++i) {
+        if (ring_tracker[i] == true) {
+            ring = (nsn_ringbuf_t*)(&ring_data[i*ring_size]);
+            if (strcmp(ring->name, to_cstr(ring_name)) == 0) {
+                break;
+            } else {
+                ring = NULL;
+            }
+        }
+    }
+
+    if (!ring) {
+        log_error("Lookup: Ring buffer %.*s not found\n", str_varg(ring_name));
+        return NULL;
+    }
+
+    return ring;
+}
+
+// -----------------------------------------------------------------------------
+// API
 int 
 nsn_init()
 {
@@ -95,33 +175,86 @@ nsn_init()
 
     nsn_cmsg_connect_t *resp = (nsn_cmsg_connect_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
 
-    printf("connected to nsnd, the shm is at /dev/shm/%s, with size %zu\n", resp->shm_name, resp->shm_size);
     shm = nsn_shm_attach(arena, resp->shm_name, resp->shm_size);
     if (shm == NULL) {
         fprintf(stderr, "failed to attach to the shared memory segment\n");
         goto exit_error;
     }
+    printf("connected to nsnd, the shm is at /dev/shm/%s, with size %zu\n", resp->shm_name, resp->shm_size);
 
-    // i64 start_time = nsn_os_get_time_ns();
-    // nsn_mm_zone_list_t *zones = (nsn_mm_zone_list_t *)(nsn_shm_rawdata(shm) + sizeof(fixed_mem_arena_t)); // TODO: this is a hack, we should have a proper way to get the zones
-    // nsn_mm_zone_t *rx_bufs    = nsn_find_zone_by_name(zones, str_lit("rx_io_buffer_pool"));
-    // if (rx_bufs == NULL) {
-    //     log_error("failed to find the rx_io_buffer_pool zone\n");
-    // } else {
-    //     i64 end_time = nsn_os_get_time_ns();
-    //     log_info("nsn_find_zone_by_name() took %.2f us\n", (end_time - start_time) / 1000.0);
-    //     print_zone(rx_bufs);
-    // } 
-    
-    // nsn_mm_zone_t *tx_bufs = nsn_find_zone_by_name(zones, str_lit("tx_io_buffer_pool"));
-    // if (tx_bufs == NULL) {
-    //     log_error("failed to find the tx_io_buffer_pool zone\n");
-    // } else {
-    //     print_zone(tx_bufs);
+    // // Lookup the free slots ring
+    // char* ring_position = (char*)(shm->data + resp->free_slots_ring_offset);
+    // log_info("Lookup ring\n offset %u\n from shm->data %p\nexpected at %p\n", resp->free_slots_ring_offset, shm->data, ring_position);
+    // free_slots_ring = nsn_ringbuf_lookup(ring_position, str_lit(resp->free_slots_ring));
+    // log_info("Found ring at %p\n", free_slots_ring);
+    // if (free_slots_ring == NULL) {
+    //     fprintf(stderr, "failed to attach to the free slots ring\n");
+    //     goto exit_error_close_shm;
     // }
 
+    // Retrieve the memory manager's created zones: IO-SLOTS and RINGS. 
+    // TODO: this is a hack, we should have a proper way to get the zones, e.g., through a memory manager API.
+    nsn_mm_zone_list_t *zones = (nsn_mm_zone_list_t *)(nsn_shm_rawdata(shm) + sizeof(fixed_mem_arena_t));
+
+    // a) Find the slot zone(s)
+    tx_bufs = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME));
+    if (tx_bufs == NULL) {
+        log_error("failed to find the rx_io_buffer_pool zone\n");
+        goto exit_error;
+    }
+    
+    // rx_bufs = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME));
+    // if (rx_bufs == NULL) {
+    //     log_error("failed to find the tx_io_buffer_pool zone\n");
+    //     goto exit_error;
+    // }
+    
+    // b) Find the ring zone, its offset in the arena, and then the free_slots ring inside it.
+    rings_zone = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_RINGS_ZONE_NAME));
+    if (rings_zone == NULL) {
+        log_error("failed to find the tx_io_buffer_pool zone\n");
+        goto exit_error;
+    }
+    free_slots_ring = nsn_lookup_ringbuf(rings_zone, str_lit(NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME));
+    if(!free_slots_ring) {
+        log_error("failed to find the free slots ring\n");
+        goto exit_error;
+    }    
+
+    // Initialize the local steam state
+    for (uint32_t i = 0; i < array_count(streams); i++) {
+        streams[i].is_active = false;
+        streams[i].stream_id = NSN_INVALID_STREAM_HANDLE;
+        streams[i].tx_cons = NULL;
+        streams[i].tx_prod = NULL;
+        streams[i].rx_cons = NULL;
+        streams[i].rx_prod = NULL;
+    }
+    n_str = 0;
+
+    // Initialize the local source state
+    for (uint32_t i = 0; i < array_count(sources); i++) {
+        sources[i].is_active = false;
+        sources[i].id = NSN_INVALID_SRC;
+        sources[i].stream = NSN_INVALID_STREAM_HANDLE;
+    }
+    n_src = 0;
+
+    // Initialize the local sink state
+    for (uint32_t i = 0; i < array_count(sinks); i++) {
+        sinks[i].is_active = false;
+        sinks[i].id = NSN_INVALID_SNK;
+        sinks[i].stream = NSN_INVALID_STREAM_HANDLE;
+        sinks[i].cb = NULL;
+    }
+    n_snk = 0;
+    
     temp_mem_arena_end(temp);
     return 0;
+
+// exit_error_close_shm:
+    // detach from the shared memory segment shared with the daemon
+    nsn_shm_detach(shm);
 
 exit_error:
     temp_mem_arena_end(temp);
@@ -175,6 +308,20 @@ nsn_create_stream(nsn_options_t *opts)
 {
     nsn_stream_t stream = NSN_INVALID_STREAM_HANDLE;
 
+    uint32_t str_idx = NSN_MAX_STREAMS;
+    if (n_str == NSN_MAX_STREAMS) {
+        log_warn("limit exceeded: too many streams\n");
+        return stream;
+    } else {
+        // Get the first available source descriptor
+        for(uint32_t i = 0; i < array_count(streams); i++) {
+            if (!streams[i].is_active) {
+                str_idx = i;
+                break;
+            }
+        }
+    }
+    
     if (opts == NULL) {
         // TODO(garbu): set default options
     }
@@ -186,27 +333,43 @@ nsn_create_stream(nsn_options_t *opts)
     cmsghdr->type   = NSN_CMSG_TYPE_CREATE_STREAM;
     cmsghdr->app_id = app_id;
 
-    // TODO(garbu): where do we do the mapping between the request QoS and the technique used?
-
+    // TODO: The mapping between the requested QoS and a plugin happens in the daemon. We should send the policies and the daemon should return the corresponding stream index.
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
 
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
         fprintf(stderr, "failed to create stream with error '%s', is it running?\n", strerror(errno));
-    } else {
-        if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
-            int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-            fprintf(stderr, "failed to create stream with error '%d'\n", error); 
-        } else {
-            // // TODO(garbu): get the stream handle from the daemon
-            // stream = *(nsn_stream_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-
-            stream = 1;
-            printf("created stream\n");
-        }
+        goto exit;
+    } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
+        int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+        fprintf(stderr, "failed to create stream with error '%d'\n", error); 
+        goto exit;
     }
 
-    temp_mem_arena_end(temp);
+    // Get the name of the tx_prod ring from the daemon and attach to it
+    nsn_cmsg_create_stream_t* msg = (nsn_cmsg_create_stream_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    stream = msg->stream_idx;
+    streams[str_idx].tx_cons = free_slots_ring;
+    streams[str_idx].tx_prod = nsn_lookup_ringbuf(rings_zone, str_lit(msg->tx_prod));
+    streams[str_idx].rx_cons = nsn_lookup_ringbuf(rings_zone, str_lit(msg->rx_cons));
+    streams[str_idx].rx_prod = free_slots_ring;
 
+    if (streams[str_idx].tx_prod == NULL || streams[str_idx].rx_cons == NULL) {
+        fprintf(stderr, "failed to attach to the rings\n");
+        streams[str_idx].tx_cons = NULL;
+        streams[str_idx].tx_prod = NULL;
+        streams[str_idx].rx_cons = NULL;
+        streams[str_idx].rx_prod = NULL;
+        stream = NSN_INVALID_STREAM_HANDLE;       
+        goto exit;
+    }
+
+    // Success: fill in the remaining fields of the stream descriptor
+    streams[str_idx].stream_id = stream;
+    streams[str_idx].is_active = true;
+    n_str++;
+
+exit:
+    temp_mem_arena_end(temp);
     return stream;
 }
 
@@ -216,6 +379,21 @@ nsn_destroy_stream(nsn_stream_t stream)
 {
     if (stream == NSN_INVALID_STREAM_HANDLE) {
         fprintf(stderr, "invalid stream handle\n");
+        return -1;
+    }
+
+    uint32_t str_idx = NSN_MAX_STREAMS;
+    for(uint32_t i = 0; i < array_count(streams); i++) {
+        if (streams[i].stream_id == (uint32_t)stream) {
+           str_idx = i; 
+        }
+    }
+    if (str_idx == NSN_MAX_STREAMS) {
+        log_error("stream not found\n");
+        return -1;
+    }
+    if (!streams[str_idx].is_active) {
+        log_error("invalid stream (idx %u, is active %d)\n", stream, streams[str_idx].is_active);
         return -1;
     }
 
@@ -235,6 +413,14 @@ nsn_destroy_stream(nsn_stream_t stream)
             int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
             fprintf(stderr, "failed to destroy stream with error '%d'\n", error); 
         } else {
+            // clean up the stream descriptor
+            streams[str_idx].is_active = false;
+            streams[str_idx].stream_id = NSN_INVALID_STREAM_HANDLE;
+            streams[str_idx].tx_cons = NULL;
+            streams[str_idx].tx_prod = NULL;
+            streams[str_idx].rx_cons = NULL;
+            streams[str_idx].rx_prod = NULL;
+            n_str--;
             printf("destroyed stream\n");
         }
     }
@@ -242,4 +428,239 @@ nsn_destroy_stream(nsn_stream_t stream)
     temp_mem_arena_end(temp);
 
     return 0;
+}
+
+// -----------------------------------------------------------------------------
+nsn_source_t 
+nsn_create_source(nsn_stream_t *stream, uint32_t source_id) {
+    if (stream == NULL) {
+        log_warn("invalid argument: stream\n");
+        return NSN_INVALID_SRC;
+    }
+    if (source_id == NSN_INVALID_SRC) {
+        log_warn("invalid argument: source_id %u\n", source_id);
+        return NSN_INVALID_SRC;
+    }
+    uint32_t src_idx = NSN_INVALID_SRC;
+    if (n_src == NSN_MAX_SOURCES) {
+        log_warn("limit exceeded: too many sources\n");
+        return NSN_INVALID_SRC;
+    } else {
+        // Get the first available source descriptor
+        for(uint32_t i = 0; i < array_count(sources); i++) {
+            if (!sources[i].is_active) {
+                src_idx = i;
+                break;
+            }
+        }
+    }
+    
+    temp_mem_arena_t temp = temp_mem_arena_begin(arena);
+    byte *cmsg = mem_arena_push_array(temp.arena, byte, 4096);
+    nsn_cmsg_hdr_t *cmsghdr = (nsn_cmsg_hdr_t *)cmsg;
+    cmsghdr->type   = NSN_CMSG_TYPE_CREATE_SOURCE;
+    cmsghdr->app_id = app_id;
+
+    // Send the request to the daemon, including the stream id of the source
+    nsn_cmsg_create_source_t *msg = (nsn_cmsg_create_source_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->stream_idx = *stream;
+    msg->source_id  = source_id;
+    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_source_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+
+    // If successful, receive two handlers to attach to the TX rings
+    if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
+        fprintf(stderr, "failed to create source with error '%s', is it running?\n", strerror(errno));
+        source_id = NSN_INVALID_SRC;
+        goto exit;
+    } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
+        int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+        fprintf(stderr, "failed to create source with error '%d'\n", error); 
+        source_id = NSN_INVALID_SRC;
+        goto exit;
+    }
+    
+    // finalize the source creation 
+    sources[src_idx].id = source_id;
+    sources[src_idx].is_active = true;
+    sources[src_idx].stream = *stream;
+    n_src++;    
+
+    printf("created source %u in slot %u with is_active=%d\n", source_id, src_idx, sources[src_idx].is_active);
+
+exit:
+    temp_mem_arena_end(temp);
+    return source_id;
+}
+
+// -----------------------------------------------------------------------------
+int 
+nsn_destroy_source(nsn_source_t source) {
+    
+    uint32_t source_idx = NSN_INVALID_SRC;
+    for(uint32_t i = 0; i < array_count(sources); i++) {
+        if (sources[i].id == (uint32_t)source) {
+           source_idx = i; 
+        }
+    }
+    if (source_idx == NSN_INVALID_SRC) {
+        log_error("source not found\n");
+        return -1;
+    }
+    if (!sources[source_idx].is_active) {
+        log_error("invalid source (idx %u, is active %d)\n", source_idx, sources[source_idx].is_active);
+        return -1;
+    }
+
+    // communicate with the daemon to destroy the source, i.e. to
+    // check if some dp threads can be stopped.
+    int ok = 0;
+    temp_mem_arena_t temp = temp_mem_arena_begin(arena);
+    byte *cmsg = mem_arena_push_array(temp.arena, byte, 4096);
+    nsn_cmsg_hdr_t *cmsghdr = (nsn_cmsg_hdr_t *)cmsg;
+    cmsghdr->type   = NSN_CMSG_TYPE_DESTROY_SOURCE;
+    cmsghdr->app_id = app_id;
+
+    nsn_cmsg_create_source_t *msg = (nsn_cmsg_create_source_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->stream_idx = sources[source_idx].stream;
+    msg->source_id  = sources[source_idx].id;
+
+    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_source_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+
+    if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
+        fprintf(stderr, "failed to create source with error '%s', is it running?\n", strerror(errno));
+        ok = -1;
+        goto clean_and_exit;
+    } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
+        int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+        fprintf(stderr, "failed to create source with error '%d'\n", error); 
+        ok = -1;
+        goto clean_and_exit;
+    }
+
+    // If we receive no error, we can proceed to the destruction of the source
+    sources[source_idx].id = NSN_INVALID_SRC;
+    sources[source_idx].is_active = false;
+    n_src--;
+
+clean_and_exit:
+    temp_mem_arena_end(temp);
+    return ok;
+}
+
+// -----------------------------------------------------------------------------
+nsn_sink_t
+nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb) {
+    if (stream == NULL) {
+        log_warn("invalid argument: stream\n");
+        return NSN_INVALID_SNK;
+    }
+    if (sink_id == NSN_INVALID_SNK) {
+        log_warn("invalid argument: sink_id %u\n", sink_id);
+        return NSN_INVALID_SNK;
+    }
+    uint32_t snk_idx = NSN_INVALID_SNK;
+    if (n_snk == NSN_MAX_SINKS) {
+        log_warn("limit exceeded: too many sinks\n");
+        return NSN_INVALID_SNK;
+    } else {
+        // Get the first available sink descriptor
+        for(uint32_t i = 0; i < array_count(sinks); i++) {
+            if (!sinks[i].is_active) {
+                snk_idx = i;
+                break;
+            }
+        }
+    }
+    
+    temp_mem_arena_t temp = temp_mem_arena_begin(arena);
+    byte *cmsg = mem_arena_push_array(temp.arena, byte, 4096);
+    nsn_cmsg_hdr_t *cmsghdr = (nsn_cmsg_hdr_t *)cmsg;
+    cmsghdr->type   = NSN_CMSG_TYPE_CREATE_SINK;
+    cmsghdr->app_id = app_id;
+
+    // Send the request to the daemon, including the stream id of the sink
+    nsn_cmsg_create_sink_t *msg = (nsn_cmsg_create_sink_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->stream_idx = *stream;
+    msg->sink_id  = sink_id;
+    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_sink_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+
+    // If successful, receive two handlers
+    if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
+        fprintf(stderr, "failed to create sink with error '%s', is it running?\n", strerror(errno));
+        sink_id = NSN_INVALID_SNK;
+        goto exit;
+    } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
+        int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+        fprintf(stderr, "failed to create sink with error '%d'\n", error); 
+        sink_id = NSN_INVALID_SNK;
+        goto exit;
+    }
+    
+    // finalize the sink creation 
+    sinks[snk_idx].id = sink_id;
+    sinks[snk_idx].is_active = true;
+    sinks[snk_idx].stream = *stream;
+    sinks[snk_idx].cb = cb;
+    n_snk++;    
+
+    printf("created sink %u in slot %u with is_active=%d\n", sink_id, snk_idx, sinks[snk_idx].is_active);
+
+exit:
+    temp_mem_arena_end(temp);
+    return sink_id;
+}
+
+// -----------------------------------------------------------------------------
+int
+nsn_destroy_sink(nsn_sink_t sink) {
+    uint32_t sink_idx = NSN_INVALID_SNK;
+    for(uint32_t i = 0; i < array_count(sinks); i++) {
+        if (sinks[i].id == (uint32_t)sink) {
+           sink_idx = i; 
+        }
+    }
+    if (sink_idx == NSN_INVALID_SNK) {
+        log_error("sink not found\n");
+        return -1;
+    }
+    if (!sinks[sink_idx].is_active) {
+        log_error("invalid sink (idx %u, is active %d)\n", sink_idx, sinks[sink_idx].is_active);
+        return -1;
+    }
+
+    // communicate with the daemon to destroy the sink, i.e. to
+    // check if some dp threads can be stopped.
+    int ok = 0;
+    temp_mem_arena_t temp = temp_mem_arena_begin(arena);
+    byte *cmsg = mem_arena_push_array(temp.arena, byte, 4096);
+    nsn_cmsg_hdr_t *cmsghdr = (nsn_cmsg_hdr_t *)cmsg;
+    cmsghdr->type   = NSN_CMSG_TYPE_DESTROY_SINK;
+    cmsghdr->app_id = app_id;
+
+    nsn_cmsg_create_sink_t *msg = (nsn_cmsg_create_sink_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->stream_idx = sinks[sink_idx].stream;
+    msg->sink_id  = sinks[sink_idx].id;
+
+    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_sink_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+
+    if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
+        fprintf(stderr, "failed to create sink with error '%s', is it running?\n", strerror(errno));
+        ok = -1;
+        goto clean_and_exit;
+    } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
+        int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+        fprintf(stderr, "failed to create sink with error '%d'\n", error); 
+        ok = -1;
+        goto clean_and_exit;
+    }
+
+    // If we receive no error, we can proceed to the destruction of the sink
+    sinks[sink_idx].id = NSN_INVALID_SNK;
+    sinks[sink_idx].is_active = false;
+    sinks[sink_idx].cb = NULL;
+    n_snk--;
+
+clean_and_exit:
+    temp_mem_arena_end(temp);
+    return ok;
 }
