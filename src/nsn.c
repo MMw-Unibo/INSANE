@@ -60,6 +60,7 @@ nsn_shm_t *shm            = NULL;
 
 // Slots management
 nsn_mm_zone_t *tx_bufs;
+size_t tx_buf_size;
 // nsn_mm_zone_t *rx_bufs;
 nsn_mm_zone_t *rings_zone;
 nsn_ringbuf_t *free_slots_ring;
@@ -71,6 +72,13 @@ nsn_source_inner_t sources[NSN_MAX_SOURCES]; //TODO: is there a better way? A li
 uint32_t n_src = 0;
 nsn_sink_inner_t sinks[NSN_MAX_SINKS];
 uint32_t n_snk = 0;
+
+typedef struct nsn_hdr {
+    nsn_source_t source_id;
+} nsn_hdr_t;
+
+#define SPIN_LOOP_PAUSE() nsn_pause()
+#define INSANE_HEADER_LEN sizeof(nsn_hdr_t)
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -202,12 +210,14 @@ nsn_init()
         log_error("failed to find the rx_io_buffer_pool zone\n");
         goto exit_error;
     }
+    tx_buf_size = resp->io_buf_size;
     
     // rx_bufs = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME));
     // if (rx_bufs == NULL) {
     //     log_error("failed to find the tx_io_buffer_pool zone\n");
     //     goto exit_error;
     // }
+    // rx_buf_size = ?;
     
     // b) Find the ring zone, its offset in the arena, and then the free_slots ring inside it.
     rings_zone = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_RINGS_ZONE_NAME));
@@ -663,4 +673,65 @@ nsn_destroy_sink(nsn_sink_t sink) {
 clean_and_exit:
     temp_mem_arena_end(temp);
     return ok;
+}
+
+// -----------------------------------------------------------------------------
+nsn_buffer_t nsn_get_buffer(size_t size, int flags) {
+
+    nsn_buffer_t buf = {0};
+    if (size > 1500) {
+        log_error("invalid size %lu\n", size);
+        buf.len = 0;
+        return buf;
+    }
+
+    if (flags & NSN_BLOCKING) {
+        while (nsn_ringbuf_dequeue_burst(free_slots_ring, &buf.index, sizeof(buf.index), 1, NULL) == 0) {
+            SPIN_LOOP_PAUSE();
+        }
+    } else {
+        nsn_ringbuf_dequeue_burst(free_slots_ring, &buf.index, sizeof(buf.index), 1, NULL);
+    }
+
+
+    uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
+    printf("Got iobuf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
+    buf.data      = data + INSANE_HEADER_LEN;
+    buf.len = tx_buf_size;
+
+
+    return buf;
+}
+
+// -----------------------------------------------------------------------------
+int nsn_emit_data(nsn_source_t source, nsn_buffer_t buf) {
+
+    if (source == NSN_INVALID_SRC) {
+        log_error("invalid source\n");
+        return -1;
+    }
+
+    if(buf.len <= 0 || (size_t)buf.len > tx_buf_size) {
+        log_error("invalid buffer size %d\n", buf.len);
+        return -2;
+    }
+
+    if(buf.data == NULL) {
+        log_error("invalid buffer data\n");
+        return -3;
+    }
+
+    nsn_source_inner_t *src = &sources[source];
+    nsn_stream_inner_t *str = &streams[src->stream];
+
+    // Set the nsn header
+    nsn_hdr_t *hdr = (nsn_hdr_t *)(buf.data - INSANE_HEADER_LEN);
+    hdr->source_id = src->id;
+
+    while(nsn_ringbuf_enqueue_burst(str->tx_prod, &buf.index, sizeof(buf.index), 1, NULL) == 0) {
+        SPIN_LOOP_PAUSE();
+    }
+    printf("Emitted iobuf #%lu\n", buf.index);
+
+    return buf.index;
 }

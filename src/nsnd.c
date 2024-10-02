@@ -277,7 +277,7 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
 
     // Create the ring that keeps the free slot descriptors.
     // TODO: The free_slots can be split into a tx/rx couple of rings, if we decide to keep both the tx and rx memory areas separated. Now we keep 1 zone for slots (tx_zone) and 1 ring for its indexing (NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME).
-    usize total_free_slots = 2 * cfg->io_buffer_pool_size;
+    usize total_free_slots = /*2 * */cfg->io_buffer_pool_size;
     nsn_ringbuf_t *free_slots_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME), total_free_slots);
     if (!free_slots_ring) {
         log_error("Failed to create the free_slots ring\n");
@@ -287,8 +287,8 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
     log_trace("Successfully created the free_slots ring at %p with name %s\n", free_slots_ring, free_slots_ring->name);
     
     // Fill the ring buffer with the index of the tx slots 
-    for (usize i = 0; i < total_free_slots; i+=cfg->io_buffer_size) {
-        nsn_ringbuf_enqueue_burst(free_slots_ring, &i, sizeof(u64), 1, NULL);
+    for (usize i = 0; i < total_free_slots - 1; ++i) {
+        nsn_ringbuf_enqueue_burst(free_slots_ring, &i, sizeof(i), 1, NULL);
     } 
 
     return mem;
@@ -313,12 +313,12 @@ nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size
     }
 
     // round the size to the next multiple of the page size
-    usize page_size = 4096; // TODO: get the page size from the system
+    usize page_size = sysconf(_SC_PAGE_SIZE);
     usize zone_size = align_to(size + sizeof(nsn_mm_zone_t), page_size);
 
     // create the zone in the shared memory
     usize base_offset   = mem->shm_arena->pos;
-    nsn_mm_zone_t *zone = fixed_mem_arena_push_struct(mem->shm_arena, nsn_mm_zone_t);
+    nsn_mm_zone_t *zone = fixed_mem_arena_push(mem->shm_arena, zone_size);
     if (!zone) {
         return NULL;
     }
@@ -336,14 +336,6 @@ nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size
     nsn_zone_list_add_tail(mem->zones, zone);
 
     return zone;
-}
-
-// Return the offset of a managed element with respect to the memory arena base address.
-usize
-nsn_memory_manager_offset_of(nsn_mem_manager_t *mem, void* element) {
-    log_info("element: %p\n", (char*)element);
-    log_info("shm->data: %p\n", mem->shm->data);
-    return (usize)element - (usize)mem->shm->data;
 }
 
 typedef struct nsn_app nsn_app_t;
@@ -777,6 +769,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 reply->shm_size           = mem_cfg.shm_size;
                 strcpy(reply->free_slots_ring, NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME);
                 snprintf(reply->shm_name, NSN_MAX_PATH_SIZE, "nsnd_datamem_%d", app_id);
+                reply->io_buf_size        = mem_cfg.io_buffer_size;
                 
                 reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_connect_t);
             } else {

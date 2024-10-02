@@ -16,9 +16,9 @@
 // INSANE Buffer
 //--------------------------------------------------------------------------------------------------
 typedef struct nsn_buffer {
-    int      index;
+    usize    index;
     uint8_t *data;
-    int      len;
+    usize    len;
 } nsn_buffer_t;
 
 //--------------------------------------------------------------------------------------------------
@@ -71,6 +71,11 @@ typedef uint32_t nsn_source_t;
 typedef uint32_t nsn_stream_t;
 
 typedef void *handle_data_cb;
+
+//--------------------------------------------------------------------------------------------------
+// Flags for the nsn_emit_data function
+#define NSN_BLOCKING     0x1
+#define NSN_NONBLOCKING  0x2
 
 //--------------------------------------------------------------------------------------------------
 // Definitions
@@ -135,12 +140,11 @@ int nsn_destroy_source(nsn_source_t source);
 
 /**
  * @brief    Get a buffer slot to write an outgoing message
- * @param    source A handle to the source to which the message will be sent
  * @param    size   The required minimum size of the buffer
  * @param    flag   Flags to control the kind of buffer returned
  * @returns  A buffer slot ready to be written by the application
  */
-nsn_buffer_t nsn_get_buffer(nsn_source_t source, size_t size, int flags);
+nsn_buffer_t nsn_get_buffer(size_t size, int flags);
 
 /**
  * @brief    Ask INSANE to send a buffer slot out to the network
@@ -148,7 +152,7 @@ nsn_buffer_t nsn_get_buffer(nsn_source_t source, size_t size, int flags);
  * @param    buf    The buffer slot contaning the message to be sent
  * @returns  A token to asynchronously retrieve the outcome of the operation
  */
-int nsn_emit_data(nsn_source_t source, nsn_buffer_t *buf);
+int nsn_emit_data(nsn_source_t source, nsn_buffer_t buf);
 
 /**
  * @brief    Retrieve the outcome of a write operation

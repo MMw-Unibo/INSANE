@@ -21,12 +21,14 @@ main(void)
 {
     int res = 0;
 
+    // This will become a parameter
+    size_t buf_size = 64;
+
     i64 start = nsn_os_get_time_ns();
     if (nsn_init() < 0) {
         printf("nsn_init() failed\n");
         return -1;
     }
-    
     i64 end = nsn_os_get_time_ns();
     printf("nsn_init() took %.2f us\n", (end - start) / 1000.0);
 
@@ -51,6 +53,24 @@ main(void)
         goto cleanup_w_src;
     }
 
+    // Get buffer and write there
+    nsn_buffer_t out_buf = nsn_get_buffer(buf_size, NSN_BLOCKING);
+    if(!out_buf.len) {
+        printf("nsn_get_buffer() failed\n");
+        res = -1;
+        goto cleanup_w_src;
+    }
+    strcpy((char *)out_buf.data, "Hello, World!");
+
+    // // Emit data
+    int ok_buf = nsn_emit_data(src, out_buf);
+
+    // // Check the outcome
+    // // TODO: unimplemented
+    nsn_unused(ok_buf);
+
+    // Wait for a message on this sink
+    // TODO: unimplemented
     sleep(1);
 
     nsn_destroy_sink(snk);

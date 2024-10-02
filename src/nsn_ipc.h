@@ -69,6 +69,8 @@ struct nsn_cmsg_connect
     usize shm_size;
     // The name of the free_slots ring
     char free_slots_ring[NSN_MAX_RING_NAME_SIZE];
+    // Size of the io buffers
+    size_t io_buf_size;
 };
 
 typedef struct nsn_cmsg_create_stream nsn_cmsg_create_stream_t;
