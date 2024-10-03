@@ -690,7 +690,10 @@ nsn_buffer_t nsn_get_buffer(size_t size, int flags) {
             SPIN_LOOP_PAUSE();
         }
     } else {
-        nsn_ringbuf_dequeue_burst(free_slots_ring, &buf.index, sizeof(buf.index), 1, NULL);
+        if(nsn_ringbuf_dequeue_burst(free_slots_ring, &buf.index, sizeof(buf.index), 1, NULL) < 0) {
+            return buf;
+        }
+        
     }
 
 
@@ -698,7 +701,6 @@ nsn_buffer_t nsn_get_buffer(size_t size, int flags) {
     printf("Got iobuf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
     buf.data      = data + INSANE_HEADER_LEN;
     buf.len = tx_buf_size;
-
 
     return buf;
 }
