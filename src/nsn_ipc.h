@@ -80,8 +80,6 @@ struct nsn_cmsg_create_stream
     uint32_t stream_idx;
     // Name of the tx_prod ring
     char tx_prod[NSN_MAX_RING_NAME_SIZE]; 
-    // Name of the rx_cons ring
-    char rx_cons[NSN_MAX_RING_NAME_SIZE];
 };
 
 typedef struct nsn_cmsg_create_source nsn_cmsg_create_source_t;
@@ -100,6 +98,8 @@ struct nsn_cmsg_create_sink
     nsn_stream_t stream_idx;
     // Id of the sink
     nsn_sink_t sink_id;
+    // Name of the rx_cons ring
+    char rx_cons[NSN_MAX_RING_NAME_SIZE];
 };
 
 #endif // NSN_IPC_H

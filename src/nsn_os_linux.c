@@ -93,6 +93,11 @@ void nsn_os_release_memory(void *address, usize size)
     munmap(address, size);
 }
 
+size_t nsn_os_default_page_size(void)
+{
+    return sysconf(_SC_PAGESIZE);
+}
+
 // --- Process -----------------------------------------------------------------
 
 int 

@@ -142,6 +142,7 @@ int nsn_destroy_source(nsn_source_t source);
  * @brief    Get a buffer slot to write an outgoing message
  * @param    size   The required minimum size of the buffer
  * @param    flag   Flags to control the kind of buffer returned
+ *                  (e.g., NSN_NONBLOCKING, NSN_BLOCKING)
  * @returns  A buffer slot ready to be written by the application
  */
 nsn_buffer_t nsn_get_buffer(size_t size, int flags);
@@ -192,7 +193,7 @@ int nsn_data_available(nsn_sink_t sink, int flags);
  * @brief    Consume a message from a sink
  * @param    sink   The sink from which to get data
  * @param    flags  Flags to control the behavior of this function,
-                    that can be blocking or non blocking
+                    that can be NSN_BLOCKING or NSN_NONBLOCKING
  * @returns  A buffer slot containing the outcome of the operation and, if
              successful, the read data
  */
@@ -200,10 +201,10 @@ nsn_buffer_t nsn_consume_data(nsn_sink_t sink, int flags);
 
 /**
  * @brief    Release a buffer slot to INSANE
- * @param    sink   The sink from which data was reaf
  * @param    buf    The buffer slot to return to the middleware after data was
                     used by the application
+ * @returns  The outcome of the operation (number of buffers released)
  */
-void nsn_release_data(nsn_sink_t sink, nsn_buffer_t *buf);
+int nsn_release_data(nsn_buffer_t buf);
 
 #endif // NSN_H

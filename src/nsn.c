@@ -17,12 +17,6 @@ struct nsn_stream_inner {
     nsn_stream_t stream_id;
     // send tx slot to the daemon
     nsn_ringbuf_t *tx_prod;
-    // receive tx slot from the daemon
-    nsn_ringbuf_t *tx_cons;
-    // send rx slot to the daemon
-    nsn_ringbuf_t *rx_prod;
-    // receive rx slot from the daemon
-    nsn_ringbuf_t *rx_cons;
 };
 
 #define NSN_MAX_SOURCES 8
@@ -36,6 +30,7 @@ struct nsn_source_inner {
     nsn_stream_t stream;
     // User-provided id
     uint32_t id;
+    // Use the tx queue from the stream
 };
 
 typedef struct nsn_sink_inner nsn_sink_inner_t;
@@ -46,6 +41,8 @@ struct nsn_sink_inner {
     nsn_stream_t stream;
     // User-provided id
     uint32_t id;
+    // Rx queue
+    nsn_ringbuf_t *rx_cons;
     // User-provided callbakck
     handle_data_cb cb;
 };
@@ -235,10 +232,7 @@ nsn_init()
     for (uint32_t i = 0; i < array_count(streams); i++) {
         streams[i].is_active = false;
         streams[i].stream_id = NSN_INVALID_STREAM_HANDLE;
-        streams[i].tx_cons = NULL;
         streams[i].tx_prod = NULL;
-        streams[i].rx_cons = NULL;
-        streams[i].rx_prod = NULL;
     }
     n_str = 0;
 
@@ -358,17 +352,11 @@ nsn_create_stream(nsn_options_t *opts)
     // Get the name of the tx_prod ring from the daemon and attach to it
     nsn_cmsg_create_stream_t* msg = (nsn_cmsg_create_stream_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
     stream = msg->stream_idx;
-    streams[str_idx].tx_cons = free_slots_ring;
     streams[str_idx].tx_prod = nsn_lookup_ringbuf(rings_zone, str_lit(msg->tx_prod));
-    streams[str_idx].rx_cons = nsn_lookup_ringbuf(rings_zone, str_lit(msg->rx_cons));
-    streams[str_idx].rx_prod = free_slots_ring;
 
-    if (streams[str_idx].tx_prod == NULL || streams[str_idx].rx_cons == NULL) {
-        fprintf(stderr, "failed to attach to the rings\n");
-        streams[str_idx].tx_cons = NULL;
+    if (streams[str_idx].tx_prod == NULL) {
+        fprintf(stderr, "stream failed to attach to the tx ring\n");
         streams[str_idx].tx_prod = NULL;
-        streams[str_idx].rx_cons = NULL;
-        streams[str_idx].rx_prod = NULL;
         stream = NSN_INVALID_STREAM_HANDLE;       
         goto exit;
     }
@@ -426,10 +414,7 @@ nsn_destroy_stream(nsn_stream_t stream)
             // clean up the stream descriptor
             streams[str_idx].is_active = false;
             streams[str_idx].stream_id = NSN_INVALID_STREAM_HANDLE;
-            streams[str_idx].tx_cons = NULL;
             streams[str_idx].tx_prod = NULL;
-            streams[str_idx].rx_cons = NULL;
-            streams[str_idx].rx_prod = NULL;
             n_str--;
             printf("destroyed stream\n");
         }
@@ -605,7 +590,15 @@ nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb) {
         sink_id = NSN_INVALID_SNK;
         goto exit;
     }
-    
+
+    sinks[snk_idx].rx_cons = nsn_lookup_ringbuf(rings_zone, str_lit(msg->rx_cons));
+    if (sinks[snk_idx].rx_cons == NULL) {
+        fprintf(stderr, "sink failed to attach to the rx ring\n");
+        sinks[snk_idx].rx_cons = NULL;
+        sink_id = NSN_INVALID_SNK;       
+        goto exit;
+    }
+
     // finalize the sink creation 
     sinks[snk_idx].id = sink_id;
     sinks[snk_idx].is_active = true;
@@ -690,12 +683,10 @@ nsn_buffer_t nsn_get_buffer(size_t size, int flags) {
             SPIN_LOOP_PAUSE();
         }
     } else {
-        if(nsn_ringbuf_dequeue_burst(free_slots_ring, &buf.index, sizeof(buf.index), 1, NULL) < 0) {
+        if(nsn_ringbuf_dequeue_burst(free_slots_ring, &buf.index, sizeof(buf.index), 1, NULL) == 0) {
             return buf;
         }
-        
     }
-
 
     uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
     printf("Got iobuf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
@@ -736,4 +727,65 @@ int nsn_emit_data(nsn_source_t source, nsn_buffer_t buf) {
     printf("Emitted iobuf #%lu\n", buf.index);
 
     return buf.index;
+}
+
+// -----------------------------------------------------------------------------
+int nsn_check_emit_outcome(nsn_source_t source, int id) {
+    nsn_unused(source);
+    nsn_unused(id);
+    log_error("check_emit_outcome not implemented\n");
+    return -1;
+}
+
+// -----------------------------------------------------------------------------
+int nsn_data_available(nsn_sink_t sink, int flags) {
+    nsn_unused(flags);
+    nsn_unused(sink);
+    log_error("data_available not implemented\n");
+    return -1;
+}
+
+// -----------------------------------------------------------------------------
+nsn_buffer_t nsn_consume_data(nsn_sink_t sink, int flags) {
+
+    if (sink == NSN_INVALID_SRC) {
+        log_error("invalid source\n");
+        return (nsn_buffer_t){0};
+    }
+
+    nsn_buffer_t buf = {0};
+    nsn_sink_inner_t *_sink = &sinks[sink];
+
+    if (flags & NSN_BLOCKING) {
+        while (nsn_ringbuf_dequeue_burst(_sink->rx_cons, &buf.index, sizeof(buf.index), 1, NULL) == 0) {
+            SPIN_LOOP_PAUSE();
+        }
+    } else {
+        if (nsn_ringbuf_dequeue_burst(_sink->rx_cons, &buf.index, sizeof(buf.index), 1, NULL) == 0) {
+            buf.len = 0;
+            return buf;
+        }
+    }
+
+    uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
+    printf("Received on buf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
+    buf.data      = data + INSANE_HEADER_LEN;
+
+    // TODO: This should be the actual size of the data, not the max size of the buffer
+    buf.len = tx_buf_size;
+
+    return buf;
+}
+
+// -----------------------------------------------------------------------------
+int nsn_release_data(nsn_buffer_t buf) {
+    if (buf.len == 0) {
+        log_error("release of invalid buffer\n");
+        return 0;
+    }
+    int ret = nsn_ringbuf_enqueue_burst(free_slots_ring, &buf.index, sizeof(buf.index), 1, NULL);
+    if(ret != 1) {
+        log_error("failed to release buffer\n");
+    } 
+    return ret;
 }

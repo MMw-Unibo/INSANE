@@ -313,7 +313,7 @@ nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size
     }
 
     // round the size to the next multiple of the page size
-    usize page_size = sysconf(_SC_PAGE_SIZE);
+    usize page_size = nsn_os_default_page_size();
     usize zone_size = align_to(size + sizeof(nsn_mm_zone_t), page_size);
 
     // create the zone in the shared memory
@@ -640,6 +640,8 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr)
     }
 
     // Check that the stream index is valid
+    // TODO: This "create source" struct is the same as the "create sink" struct, for the first part.
+    // If the common struct part changes, we need to change this code as well.
     nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
     uint32_t stream_idx = (uint32_t)reply->stream_idx;
     if (stream_idx >= plugin_set.count) {
@@ -809,27 +811,15 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             nsn_cmsg_create_stream_t *reply = (nsn_cmsg_create_stream_t*)(cmsghdr + 1);
             reply->stream_idx = stream_idx;
 
-            // Create the ring buffers, where the consumer and producer definitions are relative to the application.
+            // Create the tx ring buffer. The "consumer" and "producer" definitions are relative to the application.
             // The tx_cons and the rx_prod are the same ring, the free_slots ring, which is already available to the app.
-            // The tx_prod is created here for this plugin, allowing the app to send data to the plugin.
-            snprintf(reply->tx_prod, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%u", stream_idx);
-            // The rx_cons is created here for this plugin, allowing the app to receive data from the plugin.
-            snprintf(reply->rx_cons, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "rx_cons_%u", stream_idx);
-            
+            // The rx_cons is created at sink creation, allowing each sink to receive incoming data from the plugin.
+            // The tx_prod is created here for this plugin, allowing all the sources to send data to the plugin.
+            snprintf(reply->tx_prod, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%u", stream_idx);            
             nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
             nsn_ringbuf_t *tx_prod_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(reply->tx_prod), NSN_CFG_DEFAULT_TX_RING_SIZE);
             if (!tx_prod_ring) {
                 log_error("Failed to create the tx_prod ring\n", tx_prod_ring);
-                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
-                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 3;
-                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
-                break;
-            }
-
-            nsn_ringbuf_t *rx_cons_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(reply->rx_cons), NSN_CFG_DEFAULT_RX_RING_SIZE);
-            if (!rx_cons_ring) {
-                log_error("Failed to create the rx_cons ring\n", rx_cons_ring);
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
                 *error_code     = 3;
@@ -903,19 +893,6 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 break;
             }
 
-            // 5) destroy the rx_cons ring
-            char rx_cons_ring_name[NSN_CFG_RINGBUF_MAX_NAME_SIZE];
-            snprintf(rx_cons_ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "rx_cons_%u", stream_idx);
-            err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(rx_cons_ring_name));
-            if (err < 0) {
-                log_error("Failed to destroy the rx_cons ring\n");
-                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
-                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 4;
-                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
-                break;
-            }
-
             // Return success
             cmsghdr->type = NSN_CMSG_TYPE_DESTROYED_STREAM;
             reply_len = sizeof(nsn_cmsg_hdr_t);
@@ -958,6 +935,32 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         {
             log_debug("received new sink message from app %d\n", app_id);
 
+            nsn_cmsg_create_sink_t *reply = (nsn_cmsg_create_sink_t *)(cmsghdr + 1);
+            uint32_t app_idx = UINT32_MAX;
+            for (usize i = 0; i < app_pool.count; i++) {
+                if (app_pool.apps[i].app_id == app_id) {
+                    app_idx = (uint32_t)i;
+                    break;
+                }
+            }
+            if(app_idx > app_pool.count) {
+                log_error("app %d not found in the pool\n", app_id);
+                return -1;
+            }
+
+            // Create ringbuf from the plugin to the sink (rx_cons)
+            snprintf(reply->rx_cons, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "rx_cons_%u_%u", (u32)reply->stream_idx, (u32)reply->sink_id);
+            nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
+            nsn_ringbuf_t *rx_cons_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(reply->rx_cons), NSN_CFG_DEFAULT_RX_RING_SIZE);
+            if (!rx_cons_ring) {
+                log_error("Failed to create the rx_cons ring\n", rx_cons_ring);
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 3;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
             int err = 0;
             if ((err = ipc_create_channel(app_id, cmsghdr)) != 0) {
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
@@ -975,12 +978,41 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         case NSN_CMSG_TYPE_DESTROY_SINK:
         {
             log_debug("received destroy sink message from app %d\n", app_id);
+            
+            // Check that the app_id exists
+            nsn_cmsg_create_sink_t *reply = (nsn_cmsg_create_sink_t *)(cmsghdr + 1);
+            uint32_t app_idx = UINT32_MAX;
+            for (usize i = 0; i < app_pool.count; i++) {
+                if (app_pool.apps[i].app_id == app_id) {
+                    app_idx = (uint32_t)i;
+                    break;
+                }
+            }
+            if(app_idx > app_pool.count) {
+                log_error("app %d not found in the pool\n", app_id);
+                return -1;
+            }
 
+            // destroy the channel and its side effects
             int err = 0;
             if ((err = ipc_destroy_channel(app_id, cmsghdr)) != 0) {
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
                 *error_code     = -err;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // destroy the rx_cons ring
+            char rx_cons_ring_name[NSN_CFG_RINGBUF_MAX_NAME_SIZE];
+            snprintf(rx_cons_ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "rx_cons_%u_%u", (u32)reply->stream_idx, (u32)reply->sink_id);
+            nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
+            err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(rx_cons_ring_name));
+            if (err < 0) {
+                log_error("Failed to destroy the rx_cons ring\n");
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 4;
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
                 break;
             }

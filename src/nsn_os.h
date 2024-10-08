@@ -50,6 +50,8 @@ void  nsn_os_commit_memory(void *address, usize size);
 void  nsn_os_decommit_memory(void *address, usize size);
 void  nsn_os_release_memory(void *address, usize size);
 
+size_t nsn_os_default_page_size(void);
+
 // --- Process -----------------------------------------------------------------
 
 int nsn_os_get_process_id(void);
