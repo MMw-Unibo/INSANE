@@ -13,6 +13,8 @@ typedef struct nsn_stream_inner nsn_stream_inner_t;
 struct nsn_stream_inner {
     // The stream is valid
     bool is_active;
+    // Plugin id
+    uint32_t plugin_id;
     // Stream id 
     nsn_stream_t stream_id;
     // send tx slot to the daemon
@@ -362,6 +364,7 @@ nsn_create_stream(nsn_options_t *opts)
     }
 
     // Success: fill in the remaining fields of the stream descriptor
+    streams[str_idx].plugin_id = msg->plugin_idx;
     streams[str_idx].stream_id = stream;
     streams[str_idx].is_active = true;
     n_str++;
@@ -402,7 +405,11 @@ nsn_destroy_stream(nsn_stream_t stream)
     cmsghdr->type   = NSN_CMSG_TYPE_DESTROY_STREAM;
     cmsghdr->app_id = app_id;
 
-    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+    nsn_cmsg_create_stream_t* msg = (nsn_cmsg_create_stream_t *)(cmsghdr + 1);
+    msg->plugin_idx = streams[str_idx].plugin_id;
+    msg->stream_idx = stream;
+
+    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_stream_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
 
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
         fprintf(stderr, "failed to destroy stream with error '%s', is it running?\n", strerror(errno));
@@ -458,6 +465,7 @@ nsn_create_source(nsn_stream_t *stream, uint32_t source_id) {
 
     // Send the request to the daemon, including the stream id of the source
     nsn_cmsg_create_source_t *msg = (nsn_cmsg_create_source_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->plugin_idx = streams[*stream].plugin_id;
     msg->stream_idx = *stream;
     msg->source_id  = source_id;
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_source_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
@@ -575,6 +583,7 @@ nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb) {
 
     // Send the request to the daemon, including the stream id of the sink
     nsn_cmsg_create_sink_t *msg = (nsn_cmsg_create_sink_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->plugin_idx = streams[*stream].plugin_id;
     msg->stream_idx = *stream;
     msg->sink_id  = sink_id;
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_sink_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));

@@ -76,6 +76,8 @@ struct nsn_cmsg_connect
 typedef struct nsn_cmsg_create_stream nsn_cmsg_create_stream_t;
 struct nsn_cmsg_create_stream
 {
+    // Index of the plugin this stream belongs to
+    uint32_t plugin_idx;
     // Index of the stream in the stream table
     uint32_t stream_idx;
     // Name of the tx_prod ring
@@ -85,6 +87,8 @@ struct nsn_cmsg_create_stream
 typedef struct nsn_cmsg_create_source nsn_cmsg_create_source_t;
 struct nsn_cmsg_create_source
 {
+    // Index of the plugin the stream belongs to
+    uint32_t plugin_idx;
     // Index of the associated stream
     nsn_stream_t stream_idx;
     // Id of the source
@@ -94,6 +98,8 @@ struct nsn_cmsg_create_source
 typedef struct nsn_cmsg_create_sink nsn_cmsg_create_sink_t;
 struct nsn_cmsg_create_sink
 {
+    // Index of the plugin the stream belongs to
+    uint32_t plugin_idx;
     // Index of the associated stream
     nsn_stream_t stream_idx;
     // Id of the sink
