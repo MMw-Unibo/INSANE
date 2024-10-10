@@ -428,9 +428,9 @@ struct _nsn_inner_stream
     u32                 plugin_idx;
 
     // tx ring from srcs to the plugin
-    // TODO: This should be protected from critical races
-    nsn_ringbuf_t*      tx_prod;   
+    nsn_ringbuf_t*      tx_prod; // TODO: This should be protected from critical races
     atu32               n_srcs;
+    nsn_mm_zone_t*      tx_zone;
 
     // rx rings from the plugin to the sinks
     //TODO: parametrize this and dynamicaly allocate with mem_arena_push_array
@@ -528,6 +528,7 @@ wait:
 
     // Load the datapath plugin
     string_t datapath_name = args->datapath_name;
+    nsn_plugin_t *plugin = args->plugin_data;
     log_debug("[thread %d] dataplane thread started for datapath: " str_fmt "\n", self, str_varg(datapath_name));                 
     char datapath_lib[256];
     snprintf(datapath_lib, sizeof(datapath_lib), "./datapaths/lib%s.so", to_cstr(datapath_name));
@@ -572,14 +573,38 @@ wait:
         // TODO: get an array of pointers to the io buffers that can be used to store the received packets
         // ops.rx(&ctx);
 
-        nsn_buf_t io_buffs[] = {
-            { .data = "hello\n", .size = 6 },
-            { .data = "world\n", .size = 6 },
-        };
-        int tx_count = ops.tx(io_buffs, array_count(io_buffs));
-        if (tx_count < 0) {
-            log_error("[thread %d] Failed to transmit\n", self);
-        } 
+#define MAX_TX_BURST 32
+
+        for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
+            if (plugin->streams[i].plugin_idx == UINT32_MAX) {
+                continue;
+            }
+
+            nsn_buf_t io_buffs[MAX_TX_BURST];
+            usize io_indexes[MAX_TX_BURST];
+            uint32_t nbufs = 0;
+
+            // 1. Dequeue the io_bufs indexes from the tx_ring
+            // FIXME: This does not work; it only works if I put 1 as the number of elements to dequeue
+            nbufs = nsn_ringbuf_dequeue_burst(plugin->streams[i].tx_prod,
+                                &io_indexes, sizeof(io_indexes[0]),
+                                MAX_TX_BURST, NULL);
+
+            // 2. Fill in the descriptors with the right pointer and size
+            nsn_mm_zone_t *tx_zone = plugin->streams[i].tx_zone;
+            for (uint32_t j = 0; j < nbufs; j++) {
+                io_buffs[j].data =  (uint8_t*)(tx_zone + 1) + (io_indexes[j] * 2048); // TODO: 2048 is a cfg param... must be passed here
+                io_buffs[j].size = 1400; // TODO: the actual size should be retrieved from the ring buffer or from a meta shared memory area
+            }
+
+            // 3. Call the tx function of the datapath
+            if(nbufs > 0) {
+                int tx_count = ops.tx(io_buffs, nbufs);
+                if (tx_count < 0) {
+                    log_error("[thread %d] Failed to transmit\n", self);
+                } 
+            }
+        }
 
         // check if there are local sinks that need to be notified
         //  - the local sinks are the applications that are connected to the daemon
@@ -807,7 +832,7 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
         atu32 active_src = stream->n_srcs;
         at_store(&stream->n_srcs, active_src - 1, mo_rlx);
     }
-    
+
     return 0;
 }
 
@@ -946,6 +971,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
 
             // Associate the tx ring with the plugin
             plugin->streams[stream_idx].tx_prod = tx_prod_ring;
+            plugin->streams[stream_idx].tx_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME));
            
             // Successful operation: return success
             cmsghdr->type = NAN_CSMG_TYPE_CREATED_STREAM;
@@ -1015,7 +1041,8 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             
             // Finalize the destruction of the stream
             stream->tx_prod = NULL;
-            stream->plugin_idx = UINT32_MAX;
+            stream->tx_zone = NULL;
+            stream->plugin_idx = UINT32_MAX; // TODO: This should be protected from critical races
 
             // Return success
             cmsghdr->type = NSN_CMSG_TYPE_DESTROYED_STREAM;

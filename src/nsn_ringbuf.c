@@ -198,7 +198,7 @@ __nsn_ringbuf_move_cons_head(nsn_ringbuf_t *rb, u32 n, atu32 *old_head, atu32 *n
 
         *entries = (rb->prod.tail - *old_head);
 
-        if (nsn_unlikely(n > *entries))     n = 0;
+        if (nsn_unlikely(n > *entries))     n = *entries;
         if (nsn_unlikely(n == 0))           return 0;
 
         *new_head = *old_head + n;
