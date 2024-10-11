@@ -83,6 +83,7 @@ typedef void *handle_data_cb;
 // Consider passing these names from the daemon to the app via IPC instead,
 // and/or defining the structs in a common file
 #define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME         "tx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_TX_META_NAME            "tx_io_meta_pool"
 #define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
 #define NSN_CFG_DEFAULT_RINGS_ZONE_NAME         "rings_zone"
 #define NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME    "free_slots"
@@ -97,6 +98,12 @@ struct nsn_ringbuf_pool
     usize          ecount;              // the number of elements in the ring buffer    
     usize          free_slots_count;
 } nsn_cache_aligned;
+
+typedef struct nsn_meta nsn_meta_t;
+struct nsn_meta
+{
+    usize len;
+};
 
 //--------------------------------------------------------------------------------------------------
 // INSANE API

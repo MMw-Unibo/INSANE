@@ -270,6 +270,18 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
         return NULL;
     }
     // nsn_mm_zone_t *rx_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+    // if (!rx_zone) {
+    //     log_error("failed to create the rx_zone\n");
+    //     return NULL;
+    // }
+
+    // The metadata associated with the actual data slots (e.g., pkt len) is kept in a separate zone
+    total_zone_size = cfg->io_buffer_pool_size * sizeof(nsn_meta_t);
+    nsn_mm_zone_t *tx_meta_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_META_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+    if (!tx_meta_zone) {
+        log_error("failed to create the tx_meta_zone\n");
+        return NULL;
+    }
 
     // Create a pool of ring buffers inside the ring zone
     usize max_rings = 16;
@@ -431,6 +443,7 @@ struct _nsn_inner_stream
     nsn_ringbuf_t*      tx_prod; // TODO: This should be protected from critical races
     atu32               n_srcs;
     nsn_mm_zone_t*      tx_zone;
+    nsn_mm_zone_t*      tx_meta_zone;
 
     // rx rings from the plugin to the sinks
     //TODO: parametrize this and dynamicaly allocate with mem_arena_push_array
@@ -560,6 +573,13 @@ wait:
     nsn_config_get_int(config, str_lit("global"), str_lit("socket_port"), &socket_port);
     snprintf(ctx.configs, sizeof(ctx.configs) - 1, "%.*s:%d", (int)socket_ip.len, to_cstr(socket_ip), socket_port);
 
+    int io_bufs_size;
+    int max_tx_burst;
+    int max_rx_burst;
+    nsn_config_get_int(config, str_lit("global"), str_lit("io_bufs_size"), &io_bufs_size);
+    nsn_config_get_int(config, str_lit("global"), str_lit("max_tx_burst"), &max_tx_burst);
+    nsn_config_get_int(config, str_lit("global"), str_lit("max_rx_burst"), &max_rx_burst);
+
     ops.init(&ctx);
 
     while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_RUNNING) {
@@ -570,31 +590,30 @@ wait:
         //  - in order to be freed, an io buffer must not be referenced by any ring buffer
         //  - how do we know if an io buffer is referenced by a ring buffer?
 
-        // TODO: get an array of pointers to the io buffers that can be used to store the received packets
-        // ops.rx(&ctx);
-
-#define MAX_TX_BURST 32
-
+        // TX routine
+        // TODO: Now, this is not very efficient as we send the packets as soon as we dequeue them.
+        // Perhaps we should collect them all first and then send them in a burst? 
         for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
-            if (plugin->streams[i].plugin_idx == UINT32_MAX) {
+            if (plugin->streams[i].plugin_idx == UINT32_MAX ||
+                at_load(&plugin->streams[i].n_srcs, mo_rlx) == 0) {
                 continue;
             }
 
-            nsn_buf_t io_buffs[MAX_TX_BURST];
-            usize io_indexes[MAX_TX_BURST];
+            nsn_buf_t io_buffs[max_tx_burst];
+            usize io_indexes[max_tx_burst];
             uint32_t nbufs = 0;
 
             // 1. Dequeue the io_bufs indexes from the tx_ring
-            // FIXME: This does not work; it only works if I put 1 as the number of elements to dequeue
             nbufs = nsn_ringbuf_dequeue_burst(plugin->streams[i].tx_prod,
                                 &io_indexes, sizeof(io_indexes[0]),
-                                MAX_TX_BURST, NULL);
+                                max_tx_burst, NULL);
 
             // 2. Fill in the descriptors with the right pointer and size
             nsn_mm_zone_t *tx_zone = plugin->streams[i].tx_zone;
+            nsn_mm_zone_t *tx_meta_zone = plugin->streams[i].tx_meta_zone;
             for (uint32_t j = 0; j < nbufs; j++) {
-                io_buffs[j].data =  (uint8_t*)(tx_zone + 1) + (io_indexes[j] * 2048); // TODO: 2048 is a cfg param... must be passed here
-                io_buffs[j].size = 1400; // TODO: the actual size should be retrieved from the ring buffer or from a meta shared memory area
+                io_buffs[j].data =  (uint8_t*)(tx_zone + 1) + (io_indexes[j] * io_bufs_size);
+                io_buffs[j].size =  ((nsn_meta_t*)(tx_meta_zone + 1) + io_indexes[j])->len;
             }
 
             // 3. Call the tx function of the datapath
@@ -972,6 +991,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // Associate the tx ring with the plugin
             plugin->streams[stream_idx].tx_prod = tx_prod_ring;
             plugin->streams[stream_idx].tx_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME));
+            plugin->streams[stream_idx].tx_meta_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_META_NAME));
            
             // Successful operation: return success
             cmsghdr->type = NAN_CSMG_TYPE_CREATED_STREAM;

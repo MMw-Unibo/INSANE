@@ -60,6 +60,7 @@ nsn_shm_t *shm            = NULL;
 // Slots management
 nsn_mm_zone_t *tx_bufs;
 size_t tx_buf_size;
+nsn_mm_zone_t *tx_buf_meta;
 // nsn_mm_zone_t *rx_bufs;
 nsn_mm_zone_t *rings_zone;
 nsn_ringbuf_t *free_slots_ring;
@@ -210,6 +211,12 @@ nsn_init()
         goto exit_error;
     }
     tx_buf_size = resp->io_buf_size;
+
+    tx_buf_meta = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_TX_META_NAME));
+    if (tx_buf_meta == NULL) {
+        log_error("failed to find the tx_io_meta_pool zone\n");
+        goto exit_error;
+    }
     
     // rx_bufs = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME));
     // if (rx_bufs == NULL) {
@@ -726,9 +733,10 @@ int nsn_emit_data(nsn_source_t source, nsn_buffer_t buf) {
     nsn_source_inner_t *src = &sources[source];
     nsn_stream_inner_t *str = &streams[src->stream];
 
-    // Set the nsn header
+    // Set the nsn header and metadata
     nsn_hdr_t *hdr = (nsn_hdr_t *)(buf.data - INSANE_HEADER_LEN);
     hdr->source_id = src->id;
+    ((nsn_meta_t*)(tx_buf_meta + 1))[buf.index].len = buf.len;
 
     while(nsn_ringbuf_enqueue_burst(str->tx_prod, &buf.index, sizeof(buf.index), 1, NULL) == 0) {
         SPIN_LOOP_PAUSE();
@@ -779,9 +787,7 @@ nsn_buffer_t nsn_consume_data(nsn_sink_t sink, int flags) {
     uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
     printf("Received on buf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
     buf.data      = data + INSANE_HEADER_LEN;
-
-    // TODO: This should be the actual size of the data, not the max size of the buffer
-    buf.len = tx_buf_size;
+    buf.len = ((nsn_meta_t*)(tx_buf_meta + 1) + buf.index)->len; 
 
     return buf;
 }

@@ -61,6 +61,7 @@ main(void)
         goto cleanup_w_src;
     }
     strcpy((char *)out_buf.data, "Hello, World!");
+    out_buf.len = strlen("Hello, World!");
 
     // // Emit data
     int ok_buf = nsn_emit_data(src, out_buf);
