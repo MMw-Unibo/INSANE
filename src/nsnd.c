@@ -423,8 +423,9 @@ app_pool_try_alloc_and_init_slot(nsn_app_pool_t *pool, int app_id, nsn_mem_manag
     return app_pool_init_slot(pool, slot, &mem_cfg);
 }
 
-// --- Plugin, Streams, Sinks -------------------------------------------------
+// --- Plugin, Streams, Endpoints, Sinks -------------------------------------------------
 
+// Sink: needed to dispatch data to the right sink
 typedef struct _nsn_inner_sink _nsn_inner_sink_t;
 struct _nsn_inner_sink
 {
@@ -432,6 +433,7 @@ struct _nsn_inner_sink
     u32           sink_id;
 };
 
+// Stream: state for a specific plugin for a specific app_id
 typedef struct _nsn_inner_stream _nsn_inner_stream_t;
 struct _nsn_inner_stream
 {
@@ -442,13 +444,14 @@ struct _nsn_inner_stream
     // tx ring from srcs to the plugin
     nsn_ringbuf_t*      tx_prod; // TODO: This should be protected from critical races
     atu32               n_srcs;
-    nsn_mm_zone_t*      tx_zone;
-    nsn_mm_zone_t*      tx_meta_zone;
 
     // rx rings from the plugin to the sinks
     //TODO: parametrize this and dynamicaly allocate with mem_arena_push_array
     _nsn_inner_sink_t   sinks[8]; 
     atu32               n_sinks;
+
+    // Endpoint info (for the plugin)
+    nsn_endpoint_t          ep;
 };
 
 typedef struct nsn_plugin nsn_plugin_t;
@@ -460,6 +463,7 @@ struct nsn_plugin
 
     atu32 active_channels;  // No. of total src+snk
     //TODO: parametrize this and dynamicaly allocate with mem_arena_push_array
+    // Could this become a LIST? It would be better for the datapath.
     _nsn_inner_stream_t streams[8]; //Streams that use this plugin
 };
 
@@ -580,7 +584,18 @@ wait:
     nsn_config_get_int(config, str_lit("global"), str_lit("max_tx_burst"), &max_tx_burst);
     nsn_config_get_int(config, str_lit("global"), str_lit("max_rx_burst"), &max_rx_burst);
 
-    ops.init(&ctx);
+    // Now, prepare the enpoints to initialize (for currently active plugins)
+    nsn_endpoint_t *ep[array_count(plugin->streams)];
+    for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
+        if (plugin->streams[i].plugin_idx != UINT32_MAX) {
+            ep[i] = &plugin->streams[i].ep;
+        } else {
+            ep[i] = NULL;
+        }
+    }
+
+    // Initialize the plugin
+    ops.init(&ctx, ep, array_count(plugin->streams));
 
     while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_RUNNING) {
         // TODO: dpdk example, in the final code the string "dpdk" should be replaced by the name of the datapath
@@ -591,61 +606,60 @@ wait:
         //  - how do we know if an io buffer is referenced by a ring buffer?
 
         // TX routine
-        // TODO: Now, this is not very efficient as we send the packets as soon as we dequeue them.
-        // Perhaps we should collect them all first and then send them in a burst? 
         for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
-            if (plugin->streams[i].plugin_idx == UINT32_MAX ||
-                at_load(&plugin->streams[i].n_srcs, mo_rlx) == 0) {
+            _nsn_inner_stream_t *stream = &plugin->streams[i];
+            if (stream->plugin_idx == UINT32_MAX ||
+                at_load(&stream->n_srcs, mo_rlx) == 0) {
                 continue;
             }
 
-            nsn_buf_t io_buffs[max_tx_burst];
-            usize io_indexes[max_tx_burst];
+            nsn_buf_t io_indexes[max_tx_burst];
             uint32_t nbufs = 0;
 
             // 1. Dequeue the io_bufs indexes from the tx_ring
-            nbufs = nsn_ringbuf_dequeue_burst(plugin->streams[i].tx_prod,
+            nbufs = nsn_ringbuf_dequeue_burst(stream->tx_prod,
                                 &io_indexes, sizeof(io_indexes[0]),
                                 max_tx_burst, NULL);
 
-            // 2. Fill in the descriptors with the right pointer and size
-            nsn_mm_zone_t *tx_zone = plugin->streams[i].tx_zone;
-            nsn_mm_zone_t *tx_meta_zone = plugin->streams[i].tx_meta_zone;
-            for (uint32_t j = 0; j < nbufs; j++) {
-                io_buffs[j].data =  (uint8_t*)(tx_zone + 1) + (io_indexes[j] * io_bufs_size);
-                io_buffs[j].size =  ((nsn_meta_t*)(tx_meta_zone + 1) + io_indexes[j])->len;
-            }
 
-            // 3. Call the tx function of the datapath
+            // 2. Call the tx function of the datapath
             if(nbufs > 0) {
-                int tx_count = ops.tx(io_buffs, nbufs);
+                int tx_count = ops.tx(io_indexes, nbufs, &stream->ep);
                 if (tx_count < 0) {
                     log_error("[thread %d] Failed to transmit\n", self);
                 } 
             }
         }
 
-        // check if there are local sinks that need to be notified
-        //  - the local sinks are the applications that are connected to the daemon
+        // RX routine
+        for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
+            _nsn_inner_stream_t *stream = &plugin->streams[i];
+            if (stream->plugin_idx == UINT32_MAX ||
+                at_load(&stream->n_srcs, mo_rlx) == 0) {
+                continue;
+            }
 
-        // for_each_io_buffer(io_buff) {
-        //     bool is_free = true;
-        //     for_each_local_sink(sink) {
-        //         if (io_buff.source_id == sink->source_id) {
-        //             nsn_ringbuf_enqueue_burst(sink->rx_ring, io_buff);
-        //             is_free = false;
-        //         }
-        //     }
-        
-
-        //     if (is_free) {
-        //         io_buff_free(io_buff);
-        //     }
-        // }
+            // 1. Rx from the plugin
+            nsn_buf_t io_buffs[max_rx_burst];
+            usize io_max = max_rx_burst;        
+            usize np_rx = ops.rx(io_buffs, &io_max, &stream->ep);
+            
+            // 2. Dispatch the packets to the sinks
+            for(uint32_t j = 0; j < np_rx; j++) {
+                uint8_t* data = (uint8_t*)(stream->ep.tx_zone + 1) + (io_buffs[j].index * stream->ep.io_bufs_size);
+                nsn_hdr_t *hdr = (nsn_hdr_t *)data;
+                // TODO: Check if the sink exists!
+                log_debug("pkt received on channel %d\n", self, hdr->channel_id);
+                nsn_ringbuf_t *rx_cons = stream->sinks[hdr->channel_id].rx_cons;
+                if (nsn_ringbuf_enqueue_burst(rx_cons, &io_buffs[j].index, sizeof(io_buffs[j].index), 1, NULL) == 0) {
+                    log_error("[thread %d] Failed to enqueue pkt to sink\n", self);
+                }
+            }
+        }
     }
 
     log_debug("[thread %d] deinit\n", self);
-    if (ops.deinit(NULL)) {
+    if (ops.deinit(NULL, ep, array_count(plugin->streams))) {
         log_error("[thread %d] Failed to deinit\n", self);
     }
 
@@ -665,35 +679,6 @@ quit:
     log_info("[thread %d] done\n", self);
     return NULL;
 }
-
-// // --- Test Application Thread --------------------------------------------------
-
-// typedef struct test_app_thread_args test_app_thread_args_t;
-// struct test_app_thread_args
-// {
-//     nsn_mem_manager_t *mm;
-// };
-
-// void *
-// test_app_thread_proc(void *arg)
-// {
-//     test_app_thread_args_t *args = (test_app_thread_args_t *)arg;
-//     nsn_mem_manager_t *mem = args->mm;
-//     nsn_unused(mem);
-
-//     log_info("thread [test app] started\n");
-
-//     i64 cycles_start = nsn_os_get_cycles();
-//     // for (usize i = 0; i < 100; i++) {
-//     //     u64 table[16];
-//     //     nsn_ringbuf_dequeue_burst(mem->tx_ring, table, sizeof(u64), 1, NULL);
-//     // }
-//     i64 cycles_end = nsn_os_get_cycles();
-//     f64 elapsed_ns = (cycles_end - cycles_start) / (f64)(cpu_hz / 1000000000.0);
-//     log_info("nsn_ringbuf_dequeue_burst() took %f ns (%ld cycles)\n", elapsed_ns / 100, cycles_end - cycles_start);
-
-//     return NULL;
-// }
 
 // --- Helper Functions ---------------------------------------------------------
 // Helps creating a source/sink. If necessary, it starts a new thread for the dataplane.
@@ -969,6 +954,8 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             reply->plugin_idx = plugin_idx;
             reply->stream_idx = stream_idx;
 
+            _nsn_inner_stream_t *stream = &plugin->streams[stream_idx];
+
             // Create the tx ring buffer. The "consumer" and "producer" definitions are relative to the application.
             // The tx_cons and the rx_prod are the same ring, the free_slots ring, which is already available to the app.
             // The rx_cons is created at sink creation, allowing each sink to receive incoming data from the plugin.
@@ -979,7 +966,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             if (!tx_prod_ring) {
                 log_error("Failed to create the tx_prod ring\n", tx_prod_ring);
                 // clean the stream
-                plugin->streams[stream_idx].plugin_idx = UINT32_MAX;
+                stream->plugin_idx = UINT32_MAX;
                 // return error message
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
@@ -989,9 +976,14 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             }
 
             // Associate the tx ring with the plugin
-            plugin->streams[stream_idx].tx_prod = tx_prod_ring;
-            plugin->streams[stream_idx].tx_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME));
-            plugin->streams[stream_idx].tx_meta_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_META_NAME));
+            stream->tx_prod = tx_prod_ring;
+
+            // Prepare the endpoint
+            stream->ep.app_id = app_id;
+            stream->ep.free_slots = nsn_memory_manager_lookup_ringbuf(app_pool.apps[app_idx].mem, str_lit(NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME));
+            stream->ep.tx_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME));
+            stream->ep.tx_meta_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_META_NAME));
+            stream->ep.io_bufs_size = mem_cfg.io_buffer_size;            
            
             // Successful operation: return success
             cmsghdr->type = NAN_CSMG_TYPE_CREATED_STREAM;
@@ -1033,7 +1025,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             }
 
             // check that no channel is active for this stream
-            nsn_plugin_t *plugin = &plugin_set.plugins[stream_idx];
+            nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
             _nsn_inner_stream_t *stream = &plugin->streams[stream_idx];
             if (stream->n_sinks > 0 || stream->n_srcs > 0) {
                 log_error("stream %d has active channels (src/snk)\n", stream_idx);
@@ -1061,8 +1053,12 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             
             // Finalize the destruction of the stream
             stream->tx_prod = NULL;
-            stream->tx_zone = NULL;
             stream->plugin_idx = UINT32_MAX; // TODO: This should be protected from critical races
+            stream->ep.app_id = UINT32_MAX;
+            stream->ep.free_slots = NULL;
+            stream->ep.tx_zone = NULL;
+            stream->ep.tx_meta_zone = NULL;
+            stream->ep.io_bufs_size = 0;
 
             // Return success
             cmsghdr->type = NSN_CMSG_TYPE_DESTROYED_STREAM;

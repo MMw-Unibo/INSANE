@@ -46,13 +46,6 @@ main(void)
         goto cleanup_w_stream;
     }
 
-    nsn_source_t snk = nsn_create_sink(&stream, 0, NULL);
-    if (src == NSN_INVALID_SNK) {
-        printf("nsn_create_sink() failed\n");
-        res = -1;
-        goto cleanup_w_src;
-    }
-
     // Get buffer and write there
     nsn_buffer_t out_buf = nsn_get_buffer(buf_size, NSN_BLOCKING);
     if(!out_buf.len) {
@@ -63,18 +56,15 @@ main(void)
     strcpy((char *)out_buf.data, "Hello, World!");
     out_buf.len = strlen("Hello, World!");
 
-    // // Emit data
+    // Emit data
     int ok_buf = nsn_emit_data(src, out_buf);
 
-    // // Check the outcome
-    // // TODO: unimplemented
+    // Check the outcome
+    // TODO: unimplemented
     nsn_unused(ok_buf);
 
-    // Wait for a message on this sink
-    // TODO: unimplemented
     sleep(1);
 
-    nsn_destroy_sink(snk);
 cleanup_w_src:
     nsn_destroy_source(src);
 cleanup_w_stream:

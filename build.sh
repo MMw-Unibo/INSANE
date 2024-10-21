@@ -27,5 +27,6 @@ fi
 
 cd build
 $CC $CFLAGS $LDFLAGS ../src/nsnd.c $DEFINES -o nsnd 
-$CC $CFLAGS $LDFLAGS ../src/nsn_app.c $DEFINES -o nsn-app
+$CC $CFLAGS $LDFLAGS ../src/nsn_app_tx.c $DEFINES -o nsn-app-tx
+$CC $CFLAGS $LDFLAGS ../src/nsn_app_rx.c $DEFINES -o nsn-app-rx
 cd ..

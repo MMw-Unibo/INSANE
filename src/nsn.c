@@ -7,6 +7,8 @@
 #include "nsn_shm.h"
 #include "nsn_zone.h"
 
+#include "nsn_config.c"
+
 // internals
 #define NSN_MAX_STREAMS 8
 typedef struct nsn_stream_inner nsn_stream_inner_t;
@@ -73,12 +75,7 @@ uint32_t n_src = 0;
 nsn_sink_inner_t sinks[NSN_MAX_SINKS];
 uint32_t n_snk = 0;
 
-typedef struct nsn_hdr {
-    nsn_source_t source_id;
-} nsn_hdr_t;
-
 #define SPIN_LOOP_PAUSE() nsn_pause()
-#define INSANE_HEADER_LEN sizeof(nsn_hdr_t)
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -132,6 +129,14 @@ nsn_init()
 {
     arena = mem_arena_alloc_default();
 
+    // load the app configuration file
+    nsn_thread_ctx_t main_thread = nsn_thread_ctx_alloc();
+    main_thread.is_main_thread   = true;
+    nsn_thread_set_ctx(&main_thread);
+    
+    nsn_cfg_t *config = nsn_load_config(arena, str_lit(NSN_APP_DEFAULT_CONFIG_FILE));
+    nsn_config_get_int(config, str_lit("app"), str_lit("l4_port"), &app_id);
+
     temp_mem_arena_t temp = temp_mem_arena_begin(arena);
 
     // open a connection with the insance of the nsn daemon
@@ -142,7 +147,6 @@ nsn_init()
 
     nsn_app_addr.sun_family = AF_UNIX;
     
-    app_id = nsn_os_get_process_id();
 
     char name[IPC_MAX_PATH_SIZE];
     snprintf(name, IPC_MAX_PATH_SIZE, "%s%d", NSND_TO_NSNAPP_IPC, app_id);
@@ -735,7 +739,7 @@ int nsn_emit_data(nsn_source_t source, nsn_buffer_t buf) {
 
     // Set the nsn header and metadata
     nsn_hdr_t *hdr = (nsn_hdr_t *)(buf.data - INSANE_HEADER_LEN);
-    hdr->source_id = src->id;
+    hdr->channel_id = src->id;
     ((nsn_meta_t*)(tx_buf_meta + 1))[buf.index].len = buf.len;
 
     while(nsn_ringbuf_enqueue_burst(str->tx_prod, &buf.index, sizeof(buf.index), 1, NULL) == 0) {

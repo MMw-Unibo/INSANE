@@ -7,6 +7,15 @@
 #include <limits.h>
 #include "nsn_ringbuf.h"
 #include "nsn_zone.h"
+#include "nsn_config.h"
+#include "nsn_thread_ctx.h"
+
+typedef struct nsn_hdr {
+    u32 channel_id;
+} nsn_hdr_t;
+#define INSANE_HEADER_LEN sizeof(nsn_hdr_t)
+
+#define NSN_APP_DEFAULT_CONFIG_FILE     "nsnd-app.cfg"
 
 // --- Error Codes ----------------------------------------------------------------
 #define NSN_ERROR_ALREADY_INITIALIZED   1
