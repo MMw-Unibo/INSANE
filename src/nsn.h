@@ -15,7 +15,7 @@ typedef struct nsn_hdr {
 } nsn_hdr_t;
 #define INSANE_HEADER_LEN sizeof(nsn_hdr_t)
 
-#define NSN_APP_DEFAULT_CONFIG_FILE     "nsnd-app.cfg"
+#define NSN_APP_DEFAULT_CONFIG_FILE     "nsn-app.cfg"
 
 // --- Error Codes ----------------------------------------------------------------
 #define NSN_ERROR_ALREADY_INITIALIZED   1
