@@ -159,7 +159,7 @@ nsn_init()
     // set a timeout for the socket
     struct timeval tv;
     tv.tv_sec  = 0;
-    tv.tv_usec = 5000;
+    tv.tv_usec = 25000; //TODO: Why on some machines it takes forever? 5ms should be far enough!
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
     // send a message to the daemon to create a new instance

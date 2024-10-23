@@ -601,9 +601,10 @@ wait:
         // TODO: dpdk example, in the final code the string "dpdk" should be replaced by the name of the datapath
         // and has to be done in a parameterized way. 
 
-        // TODO: check if there are io buffers that can be freed
-        //  - in order to be freed, an io buffer must not be referenced by any ring buffer
-        //  - how do we know if an io buffer is referenced by a ring buffer?
+        // IOBUFS are freed: (a) by the plugin after TX; (b) by the app after RX. No free is needed by the daemon.
+
+        // TODO: Using arrays here is highly inefficient. Can we use lists? 
+        // Then we should protect them with locks? or similar? 
 
         // TX routine
         for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
@@ -635,7 +636,7 @@ wait:
         for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
             _nsn_inner_stream_t *stream = &plugin->streams[i];
             if (stream->plugin_idx == UINT32_MAX ||
-                at_load(&stream->n_srcs, mo_rlx) == 0) {
+                at_load(&stream->n_sinks, mo_rlx) == 0) {
                 continue;
             }
 
@@ -648,7 +649,8 @@ wait:
             for(uint32_t j = 0; j < np_rx; j++) {
                 uint8_t* data = (uint8_t*)(stream->ep.tx_zone + 1) + (io_buffs[j].index * stream->ep.io_bufs_size);
                 nsn_hdr_t *hdr = (nsn_hdr_t *)data;
-                // TODO: Check if the sink exists!
+                // TODO: Check if the sink exists! 
+                // TODO: We also need to find an efficient way to get the sink INDEX (not id) from the channel id.
                 log_debug("pkt received on channel %d\n", self, hdr->channel_id);
                 nsn_ringbuf_t *rx_cons = stream->sinks[hdr->channel_id].rx_cons;
                 if (nsn_ringbuf_enqueue_burst(rx_cons, &io_buffs[j].index, sizeof(io_buffs[j].index), 1, NULL) == 0) {
@@ -1175,8 +1177,10 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         } break;
     }
 
-    if (send_reply)
-        sendto(sockfd, cmsghdr, reply_len, 0, (struct sockaddr *)&temp_addr, temp_len);        
+    if (send_reply) {  
+        if (sendto(sockfd, cmsghdr, reply_len, 0, (struct sockaddr *)&temp_addr, temp_len) < 0)
+            log_error("error sending reply to app %d (%s): %s\n", app_id, temp_addr.sun_path, strerror(errno));
+    }   
 
 clean_and_next: 
     nsn_thread_scratch_end(temp_arena);

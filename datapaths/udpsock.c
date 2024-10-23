@@ -27,6 +27,7 @@ NSN_DATAPATH_INIT(udpsock)
     char *config   = ctx->configs;
     char *port_str = NULL;
     int fd = 0, flags = 0, reuseaddr = 0;
+    u16 config_port = 0;
 
     // TODO: Should we fail entirely if a peer cannot be reached?
     // For the moment, yes.
@@ -53,15 +54,18 @@ NSN_DATAPATH_INIT(udpsock)
             free(endpoints[i]->data);
             return -1;
         }
+        config_port = atoi(port_str + 1);
+        nsn_unused(config_port);
 
-        *port_str = '\0';
-        ep->s_port = atoi(port_str + 1);
+        // Get the APP port
+        ep->s_port = endpoints[i]->app_id;
         if (ep->s_port == 0) {
             free(endpoints[i]->data);
             return -1;
         }
 
-        strncpy(ep->s_addr, config, UDP_SOCKET_ADDR_MAX);
+        // Copy only the address string (no port)
+        strncpy(ep->s_addr, config, strlen(config) - strlen(port_str));
 
         fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd == -1) {
@@ -96,8 +100,8 @@ NSN_DATAPATH_INIT(udpsock)
 
         memory_zero_struct(&ep->sock_addr);
         ep->sock_addr.sin_family      = AF_INET;
-        ep->sock_addr.sin_port        = htons(endpoints[i]->app_id);
-        ep->sock_addr.sin_addr.s_addr = inet_addr(ep->s_addr); //TODO: we need this to be passed as a parameter in the endpoint struct
+        ep->sock_addr.sin_port        = htons(ep->s_port);
+        ep->sock_addr.sin_addr.s_addr = inet_addr(ep->s_addr);
         if (bind(fd, (struct sockaddr *)&ep->sock_addr, sizeof(ep->sock_addr)) == -1) {
             close(fd);
             free(endpoints[i]->data);
@@ -106,7 +110,6 @@ NSN_DATAPATH_INIT(udpsock)
         }
 
         ep->s_sockfd = fd;
-        ep->s_port   = endpoints[i]->app_id;
     }
 
     return 0;
@@ -155,41 +158,33 @@ NSN_DATAPATH_RX(udpsock)
 
     isize ret = 0;
     usize i   = 0;
-    while (*buf_count--) {
 
-        // TODO: This design is dubious. To receive data from the socket, we need to give a buffer to the recvfrom() function.
-        // To get a buffer, we need to dequeue a descriptor from the free_slots ring and then get the buffer from the tx_zone.
-        // However, because the socket is non-blocking, if we don't have data to receive, we just pass on, "wasting" the descriptor.
-        // Currently, I'm re-enqueuing it back to the free_slots ring, but this is not the best solution. Maybe we could have some
-        // state where we save one free buffer and use it until we get data from the socket?
-
-        // get a descriptor
-        u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &bufs[i], sizeof(bufs[i]), 1, NULL);
-        if (np == 0) {
-            printf("[udpsock] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
-            break;
-        }
-
-        // set the receive buffer
-        char *data =  (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size);    
-        usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
-
-        ret = recvfrom(ep_sk->s_sockfd, data, endpoint->io_bufs_size, 0, NULL, NULL);
-        // if ok increment i, otherwise retry
-        if (ret == -1) {
-            // We didn't get any data, so we re-enqueue the descriptor
-            nsn_ringbuf_enqueue_burst(endpoint->free_slots, &bufs[i], sizeof(bufs[i]), 1, NULL);
-            // Check the reason of the -1
-            if (errno != EAGAIN || errno != EWOULDBLOCK) {
-                printf("recvfrom() failed: %s\n", strerror(errno));
-            }
-            break;
-        } else {
-            // Set the size as packet metadata
-            *size = ret;
-            i++;
-        }
+    // get a descriptor
+    u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &bufs[i], sizeof(bufs[i]), 1, NULL);
+    if (np == 0) {
+        printf("[udpsock] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+        return 0;
     }
+
+    // set the receive buffer
+    char *data =  (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size);    
+    usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
+
+    // In UDP, we only receive 1 pkt per time - no burst receive
+    while((ret = recvfrom(ep_sk->s_sockfd, data, endpoint->io_bufs_size, 0, NULL, NULL)) < 0) {
+        //Check the reason of the -1: if not expected, return the descriptor and exit
+        if (errno != EAGAIN || errno != EWOULDBLOCK) {
+            nsn_ringbuf_enqueue_burst(endpoint->free_slots, &bufs[i], sizeof(bufs[i]), 1, NULL);
+            printf("recvfrom() failed: %s\n", strerror(errno));        
+            return 0;
+        }
+    } 
+
+    // Set the size as packet metadata
+    *size = ret;
+    i++;
+    *buf_count = *buf_count - 1;
+    printf("[udpsock] Received %ld bytes\n", ret);
 
     return i;
 }
