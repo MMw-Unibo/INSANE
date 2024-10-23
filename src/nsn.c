@@ -740,7 +740,7 @@ int nsn_emit_data(nsn_source_t source, nsn_buffer_t buf) {
     // Set the nsn header and metadata
     nsn_hdr_t *hdr = (nsn_hdr_t *)(buf.data - INSANE_HEADER_LEN);
     hdr->channel_id = src->id;
-    ((nsn_meta_t*)(tx_buf_meta + 1))[buf.index].len = buf.len;
+    ((nsn_meta_t*)(tx_buf_meta + 1))[buf.index].len = buf.len + INSANE_HEADER_LEN;
 
     while(nsn_ringbuf_enqueue_burst(str->tx_prod, &buf.index, sizeof(buf.index), 1, NULL) == 0) {
         SPIN_LOOP_PAUSE();
@@ -791,7 +791,7 @@ nsn_buffer_t nsn_consume_data(nsn_sink_t sink, int flags) {
     uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
     printf("Received on buf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
     buf.data      = data + INSANE_HEADER_LEN;
-    buf.len = ((nsn_meta_t*)(tx_buf_meta + 1) + buf.index)->len; 
+    buf.len = ((nsn_meta_t*)(tx_buf_meta + 1) + buf.index)->len - INSANE_HEADER_LEN; 
 
     return buf;
 }

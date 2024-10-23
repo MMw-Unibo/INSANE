@@ -651,7 +651,7 @@ wait:
                 nsn_hdr_t *hdr = (nsn_hdr_t *)data;
                 // TODO: Check if the sink exists! 
                 // TODO: We also need to find an efficient way to get the sink INDEX (not id) from the channel id.
-                log_debug("pkt received on channel %d\n", self, hdr->channel_id);
+                log_debug("pkt received on channel %u\n", self, hdr->channel_id);
                 nsn_ringbuf_t *rx_cons = stream->sinks[hdr->channel_id].rx_cons;
                 if (nsn_ringbuf_enqueue_burst(rx_cons, &io_buffs[j].index, sizeof(io_buffs[j].index), 1, NULL) == 0) {
                     log_error("[thread %d] Failed to enqueue pkt to sink\n", self);
