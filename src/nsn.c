@@ -78,6 +78,47 @@ uint32_t n_snk = 0;
 #define SPIN_LOOP_PAUSE() nsn_pause()
 
 // -----------------------------------------------------------------------------
+// Termination handler
+void 
+signal_handler(int signum)
+{
+    if (signum == SIGINT || signum == SIGTERM) {
+        // close all the sinks, sources
+        if (n_src > 0) {
+            for (uint32_t i = 0; i < array_count(sources); ++i) {
+                if (sources[i].is_active) {
+                    printf("Destroying source %d\n", sources[i].id);
+                    nsn_destroy_source(sources[i].id);
+                }
+            }
+        }
+        if (n_snk > 0) {
+            for (uint32_t i = 0; i < array_count(sinks); ++i) {
+                if (sinks[i].is_active) {
+                    printf("Destroying sink %d\n", sinks[i].id);
+                    nsn_destroy_sink(sinks[i].id);
+                }
+            }
+        }
+        // close all the streams
+        if (n_str > 0) {
+            for (uint32_t i = 0; i < array_count(streams); ++i) {
+                if (streams[i].is_active) {
+                    printf("Destroying stream %d\n", streams[i].stream_id);
+                    nsn_destroy_stream(streams[i].stream_id);
+                }
+            }
+        }
+
+        // uninitialize the daemon
+        nsn_close();
+
+    }
+    
+    exit(0);
+}
+
+// -----------------------------------------------------------------------------
 // Helpers
 // @param zone: the zone to search in
 // @param ring_name: the name of the ring buffer to retrieve from the zone
@@ -184,6 +225,13 @@ nsn_init()
         fprintf(stderr, "failed to connect to nsnd with error '%d'\n", error); 
         goto exit_error;
     }
+
+    struct sigaction sa;
+    memory_zero_struct(&sa);
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     nsn_cmsg_connect_t *resp = (nsn_cmsg_connect_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
 
