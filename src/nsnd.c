@@ -30,6 +30,8 @@
 #define NSN_CFG_DEFAULT_IO_BUFS_NUM             1024
 #define NSN_CFG_DEFAULT_IO_BUFS_SIZE            2048
 #define NSN_CFG_DEFAULT_SHM_SIZE                64      // in MB
+#define NSN_CFG_DEFAULT_MAX_TX_BURST            32
+#define NSN_CFG_DEFAULT_MAX_RX_BURST            32
 #define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME         "tx_io_buffer_pool"
 #define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
 #define NSN_CFG_DEFAULT_RINGS_ZONE_NAME         "rings_zone"
@@ -489,12 +491,14 @@ const char *nsn_dataplane_thread_state_str[] = {
     "STOP",
 };
 
+// Argument for the dataplane thread (plugin-independent)
 struct nsn_dataplane_thread_args
 {
-    // nsn_mem_manager_t *mm;
     atu32              state;
     string_t           datapath_name;
     nsn_plugin_t      *plugin_data;
+    int                max_tx_burst;
+    int                max_rx_burst;
 };
 
 typedef struct nsn_thread_pool nsn_thread_pool_t;
@@ -522,8 +526,6 @@ void *
 dataplane_thread_proc(void *arg)
 {
     struct nsn_dataplane_thread_args *args = (struct nsn_dataplane_thread_args *)arg;
-    // nsn_mem_manager_t *mem = args->mm;
-    // nsn_unused(mem);
 
     nsn_thread_ctx_t this_thread = nsn_thread_ctx_alloc();
     this_thread.is_main_thread   = false;
@@ -531,6 +533,8 @@ dataplane_thread_proc(void *arg)
 
     int self = nsn_os_current_thread_id();
     u32 state;
+
+    temp_mem_arena_t data_arena = nsn_thread_scratch_begin(NULL, 0);
 
 wait: 
     log_debug("[thread %d] waiting for a message\n", self);
@@ -568,23 +572,38 @@ wait:
     snprintf(fn_name, sizeof(fn_name), "%s_datapath_deinit", to_cstr(datapath_name));
     ops.deinit = (nsn_datapath_deinit*)nsn_os_get_proc_address(module, fn_name);
 
+    // Prepare the arguments to initialize the plugin
+    // 1a) Plugin context
     nsn_datapath_ctx_t ctx;
     memory_zero_struct(&ctx);
- 
-    string_t socket_ip;
-    int socket_port;
-    nsn_config_get_string(config, str_lit("global"), str_lit("socket_ip"), &socket_ip);
-    nsn_config_get_int(config, str_lit("global"), str_lit("socket_port"), &socket_port);
-    snprintf(ctx.configs, sizeof(ctx.configs) - 1, "%.*s:%d", (int)socket_ip.len, to_cstr(socket_ip), socket_port);
+    size_t ip_str_size = 16;
 
-    int io_bufs_size;
-    int max_tx_burst;
-    int max_rx_burst;
-    nsn_config_get_int(config, str_lit("global"), str_lit("io_bufs_size"), &io_bufs_size);
-    nsn_config_get_int(config, str_lit("global"), str_lit("max_tx_burst"), &max_tx_burst);
-    nsn_config_get_int(config, str_lit("global"), str_lit("max_rx_burst"), &max_rx_burst);
+    ctx.local_ip = mem_arena_push_array(data_arena.arena, char, ip_str_size);
+    bzero(ctx.local_ip, ip_str_size);
+    char* string_buf = mem_arena_push_array(data_arena.arena, char, ip_str_size*4);
+    bzero(string_buf, ip_str_size*4);
+    sprintf(string_buf, "plugins.%s", to_cstr(datapath_name));
+    string_t local_ip_str = str_lit(string_buf);
+    nsn_config_get_string(config, str_lit(string_buf), str_lit("ip"), &local_ip_str);
+    mem_arena_pop(data_arena.arena, 64);
 
-    // Now, prepare the enpoints to initialize (for currently active plugins)
+    ctx.max_tx_burst = args->max_tx_burst;
+    ctx.max_rx_burst = args->max_rx_burst;
+
+    // 1b) List of peer's IP
+    // TODO: Read these two lines from the config file
+    ctx.n_peers = 2;
+    char* config_file[] = {"10.0.0.212", "10.0.0.213"};
+
+    ctx.peers = mem_arena_push(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers);
+    bzero(ctx.peers, sizeof(ctx.peers) * ctx.n_peers);
+    for (u32 i = 0; i < ctx.n_peers; i++) {
+        ctx.peers[i] = mem_arena_push_array(data_arena.arena, char, ip_str_size);
+        bzero(ctx.peers[i], ip_str_size);
+        strcpy(ctx.peers[i], config_file[i]);
+    }
+
+    // 2) Endpoints for each stream: plugin-specific data to init&keep connections.
     nsn_endpoint_t *ep[array_count(plugin->streams)];
     for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
         if (plugin->streams[i].plugin_idx != UINT32_MAX) {
@@ -614,13 +633,13 @@ wait:
                 continue;
             }
 
-            nsn_buf_t io_indexes[max_tx_burst];
+            nsn_buf_t io_indexes[ctx.max_tx_burst];
             uint32_t nbufs = 0;
 
             // 1. Dequeue the io_bufs indexes from the tx_ring
             nbufs = nsn_ringbuf_dequeue_burst(stream->tx_prod,
                                 &io_indexes, sizeof(io_indexes[0]),
-                                max_tx_burst, NULL);
+                                ctx.max_tx_burst, NULL);
 
 
             // 2. Call the tx function of the datapath
@@ -641,8 +660,8 @@ wait:
             }
 
             // 1. Rx from the plugin
-            nsn_buf_t io_buffs[max_rx_burst];
-            usize io_max = max_rx_burst;        
+            nsn_buf_t io_buffs[ctx.max_rx_burst];
+            usize io_max = ctx.max_rx_burst;        
             usize np_rx = ops.rx(io_buffs, &io_max, &stream->ep);
             
             // 2. Dispatch the packets to the sinks
@@ -667,6 +686,10 @@ wait:
 
     log_debug("[thread %d] unloading library\n", self);
     nsn_os_unload_library(module);
+    
+    mem_arena_pop(data_arena.arena, sizeof(char)*ip_str_size*ctx.n_peers); // peers' IPs
+    mem_arena_pop(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers); // ctx.peers
+    mem_arena_pop(data_arena.arena, 16); // ctx.local_ip
 
     state = at_load(&args->state, mo_rlx);
     log_debug("[thread %d] state: %s (%d)\n", self, nsn_dataplane_thread_state_str[state], state);
@@ -678,6 +701,7 @@ wait:
     }
 
 quit:
+    nsn_thread_scratch_end(data_arena);
     log_info("[thread %d] done\n", self);
     return NULL;
 }
@@ -1277,11 +1301,17 @@ main(int argc, char *argv[])
     int io_bufs_num  = NSN_CFG_DEFAULT_IO_BUFS_NUM;
     int io_bufs_size = NSN_CFG_DEFAULT_IO_BUFS_SIZE;   
     int shm_size     = NSN_CFG_DEFAULT_SHM_SIZE;
+    int max_tx_burst = NSN_CFG_DEFAULT_MAX_TX_BURST;
+    int max_rx_burst = NSN_CFG_DEFAULT_MAX_RX_BURST;
     
     nsn_config_get_int(config, str_lit("global"), str_lit("app_num"), &app_num);      
     nsn_config_get_int(config, str_lit("global"), str_lit("io_bufs_num"), &io_bufs_num);
     nsn_config_get_int(config, str_lit("global"), str_lit("io_bufs_size"), &io_bufs_size);
     nsn_config_get_int(config, str_lit("global"), str_lit("shm_size"), &shm_size);
+    nsn_config_get_int(config, str_lit("global"), str_lit("max_tx_burst"), &max_tx_burst);
+    nsn_config_get_int(config, str_lit("global"), str_lit("max_rx_burst"), &max_rx_burst);
+
+    // TODO: Sanity check the configuration values!
 
     // init the memory arena
     mem_arena_t *arena = mem_arena_alloc(megabytes(1));
@@ -1347,7 +1377,7 @@ main(int argc, char *argv[])
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
-    // --- Init the thread pool. Currently, one thread only. We do not set here the dp_args.name, 
+    // --- Init the thread pool. Currently, one thread only. We DO NOT set here the dp_args.name, 
     // as the thread pool exists independently of the associated plugin. However, it is important that
     // the name is set when the thread moves to the RUNNING state, as it will try to load the dll.
     // The association is done when a new stream for a new plugin is set, and currently is permanent.
@@ -1359,7 +1389,9 @@ main(int argc, char *argv[])
     for (usize i = 0; i < thread_pool.count; i++) {
         log_trace("creating thread %d\n", i);
         thread_pool.thread_args[i] = 
-            (struct nsn_dataplane_thread_args){ .state = NSN_DATAPLANE_THREAD_STATE_WAIT};
+            (struct nsn_dataplane_thread_args){ .state = NSN_DATAPLANE_THREAD_STATE_WAIT,
+                                                .max_tx_burst = max_tx_burst,
+                                                .max_rx_burst = max_rx_burst };
         thread_pool.threads[i] = nsn_os_thread_create(dataplane_thread_proc, &thread_pool.thread_args[i]);
         if (thread_pool.threads[i].handle == 0) {
             log_error("Failed to create thread %d\n", i);

@@ -9,13 +9,20 @@
 #include "nsn_string.h"
 #include "nsn_ringbuf.h"
 
+// Argument for the plugin
 typedef struct nsn_datapath_ctx nsn_datapath_ctx_t;
 struct nsn_datapath_ctx
 {
-    void  *data_memory;
-    usize  data_memory_size;
-
-    char configs[256];
+    // Local IP for this plugin
+    char* local_ip;
+    // Array of peers' IPs
+    char** peers;
+    u16   n_peers;
+    // Daemon-wise config values
+    int max_tx_burst;
+    int max_rx_burst;
+    // Additional config if necessary
+    char  config[0];
 };
 
 typedef struct nsn_buf nsn_buf_t;

@@ -22,21 +22,27 @@ struct udpsock_ep {
     struct sockaddr_in sock_addr;
 };
 
+static char*  local_ip;
+static char** peers;
+static u16    n_peers;
+
 NSN_DATAPATH_INIT(udpsock)
 {
-    char *config   = ctx->configs;
     char *port_str = NULL;
     int fd = 0, flags = 0, reuseaddr = 0;
-    u16 config_port = 0;
 
-    // TODO: Should we fail entirely if a peer cannot be reached?
-    // For the moment, yes.
+    // Initialize local state 
+    n_peers = ctx->n_peers;
+    peers = ctx->peers;
+    local_ip = ctx->local_ip;
+
+    // TODO: Should we fail entirely if a peer cannot be reached? For the moment, yes.
     for(usize i = 0; i < endpoint_count; i++) {
         if (endpoints[i] == NULL) {
             continue;
         }
 
-        // allocate memory for the endpoint state
+        // create the state of the endpoint, which will hold connection data
         endpoints[i]->data = malloc(sizeof(struct udpsock_ep));
         if (endpoints[i]->data == NULL) {
             fprintf(stderr, "malloc() failed\n");
@@ -44,33 +50,22 @@ NSN_DATAPATH_INIT(udpsock)
         }
         endpoints[i]->data_size = sizeof(struct udpsock_ep);
 
-        struct udpsock_ep *ep = (struct udpsock_ep *)endpoints[i]->data;
-
-        // TODO: create the config file/section with the static daemon list    
-        // Here, assume there's only one peer.
-        // parse config, : separated, e.g. "<addr>:<port>"
-        port_str = strchr(config, ':');
-        if (port_str == NULL) {
+        // initialize the state of the endpoint 
+        struct udpsock_ep *conn = (struct udpsock_ep *)endpoints[i]->data;
+        // Source address is the local_ip (config file)
+        strncpy(conn->s_addr, local_ip, strlen(local_ip));
+        // Source port is the app_id
+        conn->s_port = endpoints[i]->app_id;
+        if (conn->s_port == 0) {
             free(endpoints[i]->data);
+            fprintf(stderr, "[udpsock] invalid app_id %u\n", conn->s_port);
             return -1;
         }
-        config_port = atoi(port_str + 1);
-        nsn_unused(config_port);
-
-        // Get the APP port
-        ep->s_port = endpoints[i]->app_id;
-        if (ep->s_port == 0) {
-            free(endpoints[i]->data);
-            return -1;
-        }
-
-        // Copy only the address string (no port)
-        strncpy(ep->s_addr, config, strlen(config) - strlen(port_str));
 
         fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd == -1) {
             free(endpoints[i]->data);
-            fprintf(stderr, "socket() failed\n");
+            fprintf(stderr, "[udpsock] socket() failed\n");
             return -1;
         }
 
@@ -78,7 +73,7 @@ NSN_DATAPATH_INIT(udpsock)
         if (flags == -1) {
             close(fd);
             free(endpoints[i]->data);
-            fprintf(stderr, "fcntl() failed\n");
+            fprintf(stderr, "[udpsock] fcntl() failed\n");
             return -1;
         }
 
@@ -86,7 +81,7 @@ NSN_DATAPATH_INIT(udpsock)
         if (fcntl(fd, F_SETFL, flags) == -1) {
             close(fd);
             free(endpoints[i]->data);
-            fprintf(stderr, "fcntl() failed\n");
+            fprintf(stderr, "[udpsock] fcntl() failed\n");
             return -1;
         }
 
@@ -94,29 +89,28 @@ NSN_DATAPATH_INIT(udpsock)
         if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr, sizeof(reuseaddr)) == -1) {
             close(fd);
             free(endpoints[i]->data);
-            fprintf(stderr, "setsockopt() failed\n");
+            fprintf(stderr, "[udpsock] setsockopt() failed\n");
             return -1;
         }
 
-        memory_zero_struct(&ep->sock_addr);
-        ep->sock_addr.sin_family      = AF_INET;
-        ep->sock_addr.sin_port        = htons(ep->s_port);
-        ep->sock_addr.sin_addr.s_addr = inet_addr(ep->s_addr);
-        if (bind(fd, (struct sockaddr *)&ep->sock_addr, sizeof(ep->sock_addr)) == -1) {
+        memory_zero_struct(&conn->sock_addr);
+        conn->sock_addr.sin_family      = AF_INET;
+        conn->sock_addr.sin_port        = htons(conn->s_port);
+        conn->sock_addr.sin_addr.s_addr = inet_addr(conn->s_addr);
+        if (bind(fd, (struct sockaddr *)&conn->sock_addr, sizeof(conn->sock_addr)) == -1) {
             close(fd);
             free(endpoints[i]->data);
-            fprintf(stderr, "bind() failed\n");
+            fprintf(stderr, "[udpsock] bind() failed\n");
             return -1;
         }
 
-        ep->s_sockfd = fd;
+        // finalize the initialization
+        conn->s_sockfd = fd;
     }
 
     return 0;
 
 }
-
-struct sockaddr_in send_addr;
 
 NSN_DATAPATH_TX(udpsock)
 {
@@ -124,26 +118,31 @@ NSN_DATAPATH_TX(udpsock)
     usize i;
     int tx_count = 0;
 
-    struct udpsock_ep *ep = (struct udpsock_ep *)endpoint->data;
+    struct udpsock_ep *conn = (struct udpsock_ep *)endpoint->data;
 
-    memory_zero_struct(&send_addr);
+    struct sockaddr_in send_addr;
     send_addr.sin_family = AF_INET;
     send_addr.sin_port = htons(endpoint->app_id);
-    inet_pton(AF_INET, "10.0.0.212", &send_addr.sin_addr);
 
     for (i = 0; i < buf_count; i++) {
+        // Get the data and size from the index
         char* data = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size); 
         usize size = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;        
 
-        ret = sendto(ep->s_sockfd, data, size, 0, (struct sockaddr *)&send_addr, sizeof(send_addr));
-        if (ret == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                printf("EAGAIN or EWOULDBLOCK\n");
-            else 
-                printf("sendto() failed: %s\n", strerror(errno));
-        } else {
-            tx_count++;
+        // Send the buf to all the peers
+        for(int p = 0; p < n_peers; p++) {
+            printf("[udpsock] Sending to %s\n", peers[p]);
+            inet_pton(AF_INET, peers[p], &send_addr.sin_addr);
+            while((ret = sendto(conn->s_sockfd, data, size, 0, (struct sockaddr *)&send_addr, sizeof(send_addr))) < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    printf("[udpsock] sendto() failed: %s\n", strerror(errno));
+                    return tx_count;
+                }
+            }
+            printf("[udpsock] Sent %ld bytes\n", ret); 
+            memory_zero_struct(&send_addr.sin_addr);            
         }
+        tx_count++;
     }
 
     // Free the descriptors after using them
@@ -173,7 +172,7 @@ NSN_DATAPATH_RX(udpsock)
     // In UDP, we only receive 1 pkt per time - no burst receive
     while((ret = recvfrom(ep_sk->s_sockfd, data, endpoint->io_bufs_size, 0, NULL, NULL)) < 0) {
         //Check the reason of the -1: if not expected, return the descriptor and exit
-        if (errno != EAGAIN || errno != EWOULDBLOCK) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
             nsn_ringbuf_enqueue_burst(endpoint->free_slots, &bufs[i], sizeof(bufs[i]), 1, NULL);
             printf("recvfrom() failed: %s\n", strerror(errno));        
             return 0;
@@ -199,9 +198,9 @@ NSN_DATAPATH_DEINIT(udpsock)
             continue;
         }
 
-        struct udpsock_ep *ep = (struct udpsock_ep *)endpoints[i]->data;
-        if (ep->s_sockfd != -1) {
-            close(ep->s_sockfd);
+        struct udpsock_ep *conn = (struct udpsock_ep *)endpoints[i]->data;
+        if (conn->s_sockfd != -1) {
+            close(conn->s_sockfd);
         }
 
         free(endpoints[i]->data);
