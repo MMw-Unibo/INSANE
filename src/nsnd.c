@@ -750,7 +750,7 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         log_error("stream index %d is out of bounds\n", stream_idx);
         return -2;
     }
-    nsn_plugin_t *plugin = &plugin_set.plugins[stream_idx];
+    nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
     _nsn_inner_stream_t *stream = &plugin->streams[stream_idx];
 
     // If sink, create the ring. Here, because if it fails, it has no other side effect.
@@ -798,9 +798,9 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
     else if (!stream->ep.data) {
         // This creates a connection/initializes network state!
         // IT MUST BE DONE *BEFORE* UPDATING N_SRC/N_SINKS and N_ACTIVE_CHANNELS
-        assert(!plugin->update);
-        log_debug("creating stream EP data: new active channel\n");
+        assert(plugin->update && !stream->ep.data);
         plugin->update(stream->ep.data);
+        log_debug("Updated DP: new active channel!\n");
     }
 
     // Update the number of srcs/sinks in the plugin
@@ -1022,7 +1022,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // The tx_cons and the rx_prod are the same ring, the free_slots ring, which is already available to the app.
             // The rx_cons is created at sink creation, allowing each sink to receive incoming data from the plugin.
             // The tx_prod is created here for this plugin, allowing all the sources to send data to the plugin.
-            snprintf(reply->tx_prod, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%u", stream_idx);            
+            snprintf(reply->tx_prod, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%d", app_id);            
             nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
             nsn_ringbuf_t *tx_prod_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(reply->tx_prod), NSN_CFG_DEFAULT_TX_RING_SIZE);
             if (!tx_prod_ring) {
@@ -1102,7 +1102,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // 4) destroy the tx_prod ring
             nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
             char tx_prod_ring_name[NSN_CFG_RINGBUF_MAX_NAME_SIZE];
-            snprintf(tx_prod_ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%u", stream_idx);
+            snprintf(tx_prod_ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%d", app_id);
             int err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(tx_prod_ring_name));
             if (err < 0) {
                 log_error("Failed to destroy the tx_prod ring\n");
