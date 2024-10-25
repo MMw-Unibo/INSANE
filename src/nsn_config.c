@@ -168,16 +168,20 @@ nsn_config_get_string(nsn_cfg_t *cfg, string_t sec, string_t key, string_t* out_
 
     nsn_cfg_opt_t *opt = nsn_config_get_opt(scratch.arena, cfg, sec, key);
     if (!opt) {
+        log_warn("invalid option: %s\n", to_cstr(key));
         return -1;
     }
 
     if (opt->type != NsnConfigOptType_String) {
+        log_warn("invalid option type\n");
         return -1;
     }
 
     log_debug("found option %.*s.%.*s = %.*s\n", (int)sec.len, sec.data, (int)key.len, key.data, (int)opt->string.len, opt->string.data);
 
-    *out_value = opt->string;
+    memcpy(out_value->data, opt->string.data, opt->string.len);
+    out_value->len = opt->string.len;
+
     nsn_thread_scratch_end(scratch);
     return 0;
 }

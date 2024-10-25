@@ -55,6 +55,7 @@ signal_handler(int signum)
 struct datapath_ops
 {
     nsn_datapath_init       *init;
+    nsn_datapath_update     *update;
     nsn_datapath_tx         *tx;
     nsn_datapath_rx         *rx;
     nsn_datapath_deinit     *deinit;
@@ -467,6 +468,9 @@ struct nsn_plugin
     //TODO: parametrize this and dynamicaly allocate with mem_arena_push_array
     // Could this become a LIST? It would be better for the datapath.
     _nsn_inner_stream_t streams[8]; //Streams that use this plugin
+
+    // Pointer to the plugin's UPDATE function
+    nsn_datapath_update* update;
 };
 
 typedef struct nsn_plugin_set nsn_plugin_set_t;
@@ -565,6 +569,8 @@ wait:
     memory_zero_struct(&ops);
     snprintf(fn_name, sizeof(fn_name), "%s_datapath_init", to_cstr(datapath_name));
     ops.init   = (nsn_datapath_init*)nsn_os_get_proc_address(module, fn_name);
+    snprintf(fn_name, sizeof(fn_name), "%s_datapath_update", to_cstr(datapath_name));
+    ops.update = (nsn_datapath_update*)nsn_os_get_proc_address(module, fn_name);
     snprintf(fn_name, sizeof(fn_name), "%s_datapath_tx", to_cstr(datapath_name));
     ops.tx     = (nsn_datapath_tx*)nsn_os_get_proc_address(module, fn_name);
     snprintf(fn_name, sizeof(fn_name), "%s_datapath_rx", to_cstr(datapath_name));
@@ -573,25 +579,26 @@ wait:
     ops.deinit = (nsn_datapath_deinit*)nsn_os_get_proc_address(module, fn_name);
 
     // Prepare the arguments to initialize the plugin
-    // 1a) Plugin context
+    // 1a) Create the plugin context
     nsn_datapath_ctx_t ctx;
     memory_zero_struct(&ctx);
     size_t ip_str_size = 16;
 
-    ctx.local_ip = mem_arena_push_array(data_arena.arena, char, ip_str_size);
-    bzero(ctx.local_ip, ip_str_size);
+    // 1b) Retrieve the local IP address from the config file
     char* string_buf = mem_arena_push_array(data_arena.arena, char, ip_str_size*4);
     bzero(string_buf, ip_str_size*4);
     sprintf(string_buf, "plugins.%s", to_cstr(datapath_name));
-    string_t local_ip_str = str_lit(string_buf);
-    nsn_config_get_string(config, str_lit(string_buf), str_lit("ip"), &local_ip_str);
-    mem_arena_pop(data_arena.arena, 64);
-
+    string_t local_ip;
+    local_ip.data = (u8*)malloc(ip_str_size);
+    local_ip.len = 0;
+    nsn_config_get_string(config, str_cstr(string_buf), str_lit("ip"), &local_ip);
+    mem_arena_pop(data_arena.arena, ip_str_size*4);
+    
+    ctx.local_ip = to_cstr(local_ip);
     ctx.max_tx_burst = args->max_tx_burst;
     ctx.max_rx_burst = args->max_rx_burst;
 
-    // 1b) List of peer's IP
-    // TODO: Read these two lines from the config file
+    // 1c) TODO: Retrieve the list of peer's IPs from the config file
     ctx.n_peers = 2;
     char* config_file[] = {"10.0.0.212", "10.0.0.213"};
 
@@ -612,6 +619,9 @@ wait:
             ep[i] = NULL;
         }
     }
+
+    // Save a pointer to the UPDATE function in the plugin descriptor
+    plugin->update = ops.update;
 
     // Initialize the plugin
     ops.init(&ctx, ep, array_count(plugin->streams));
@@ -686,10 +696,12 @@ wait:
 
     log_debug("[thread %d] unloading library\n", self);
     nsn_os_unload_library(module);
+
+    plugin->update = NULL;
     
     mem_arena_pop(data_arena.arena, sizeof(char)*ip_str_size*ctx.n_peers); // peers' IPs
     mem_arena_pop(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers); // ctx.peers
-    mem_arena_pop(data_arena.arena, 16); // ctx.local_ip
+    free(ctx.local_ip);
 
     state = at_load(&args->state, mo_rlx);
     log_debug("[thread %d] state: %s (%d)\n", self, nsn_dataplane_thread_state_str[state], state);
@@ -740,7 +752,8 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
     }
     nsn_plugin_t *plugin = &plugin_set.plugins[stream_idx];
     _nsn_inner_stream_t *stream = &plugin->streams[stream_idx];
-    
+
+    // If sink, create the ring. Here, because if it fails, it has no other side effect.
     if(type == NSN_CHANNEL_TYPE_SINK) {
         nsn_cmsg_create_sink_t *reply_snk = (nsn_cmsg_create_sink_t *)(cmsghdr + 1);
 
@@ -757,15 +770,9 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         atu32 n_sinks = stream->n_sinks;
         stream->sinks[n_sinks].rx_cons = rx_cons_ring;
         stream->sinks[n_sinks].sink_id = (u32)reply_snk->sink_id;
-        
-        // Update the number of sinks in the plugin
-        at_store(&stream->n_sinks, n_sinks + 1, mo_rlx);
-    } else {
-        atu32 n_source = stream->n_srcs;
-        at_store(&stream->n_srcs, n_source + 1, mo_rlx);
     }
-
-    // if this is the first src/snk (=channel) in the stream, start the first 
+    
+    // if this is the first src/snk (=channel) in the PLUGIN, start the first 
     // data plane thread. In the future, this will be delegated to a thread pool manager.
     atu32 active_channels = plugin->active_channels;
     if (active_channels == 0) {
@@ -785,6 +792,24 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         }
         // start the thread
         at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+    } 
+    // If the PLUGIN is running, but this is the first channel in the STREAM,
+    // we must tell the PLUGIN to update the STREAM state.
+    else if (!stream->ep.data) {
+        // This creates a connection/initializes network state!
+        // IT MUST BE DONE *BEFORE* UPDATING N_SRC/N_SINKS and N_ACTIVE_CHANNELS
+        assert(!plugin->update);
+        log_debug("creating stream EP data: new active channel\n");
+        plugin->update(stream->ep.data);
+    }
+
+    // Update the number of srcs/sinks in the plugin
+    if(type == NSN_CHANNEL_TYPE_SINK) {
+        atu32 n_sinks = stream->n_sinks;
+        at_store(&stream->n_sinks, n_sinks + 1, mo_rlx);
+    } else {
+        atu32 n_source = stream->n_srcs;
+        at_store(&stream->n_srcs, n_source + 1, mo_rlx);
     }
 
     // Ref count of the channels (src/snk) active in the stream
@@ -861,6 +886,17 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     } else {
         atu32 active_src = stream->n_srcs;
         at_store(&stream->n_srcs, active_src - 1, mo_rlx);
+    }
+
+    // In case the plugin is still running but the stream has no more active channels,
+    // we must tell the plugin to delete the stream state
+    if (active_channels - 1 > 0 && stream->n_sinks == 0 && stream->n_srcs == 0) {
+        // This destroys the connection/cleans the network state!
+        // IT MUST BE DONE *AFTER* UPDATING N_SRC/N_SINKS and N_ACTIVE_CHANNELS
+        assert(plugin->update);
+        log_debug("destroying stream EP data: no more active channels\n");
+        plugin->update(stream->ep.data);
+        stream->ep.data = NULL;
     }
 
     return 0;

@@ -56,6 +56,8 @@ typedef NSN_DATAPATH_INIT(nsn);
 typedef NSN_DATAPATH_TX(nsn);
 #define NSN_DATAPATH_RX(name)                   int name##_datapath_rx(nsn_buf_t *bufs, usize *buf_count, nsn_endpoint_t *endpoint)
 typedef NSN_DATAPATH_RX(nsn);
+#define NSN_DATAPATH_UPDATE(name)               int name##_datapath_update(nsn_endpoint_t *endpoint)
+typedef NSN_DATAPATH_UPDATE(nsn);
 #define NSN_DATAPATH_DEINIT(name)               int name##_datapath_deinit(nsn_datapath_ctx_t *ctx, nsn_endpoint_t **endpoints, usize endpoint_count)
 typedef NSN_DATAPATH_DEINIT(nsn);
 

@@ -26,45 +26,49 @@ static char*  local_ip;
 static char** peers;
 static u16    n_peers;
 
-NSN_DATAPATH_INIT(udpsock)
+NSN_DATAPATH_UPDATE(udpsock)
 {
-    char *port_str = NULL;
-    int fd = 0, flags = 0, reuseaddr = 0;
+    if (endpoint == NULL) {
+        fprintf(stderr, "[udpsock] invalid endpoint\n");
+        return -1;
+    }
 
-    // Initialize local state 
-    n_peers = ctx->n_peers;
-    peers = ctx->peers;
-    local_ip = ctx->local_ip;
-
-    // TODO: Should we fail entirely if a peer cannot be reached? For the moment, yes.
-    for(usize i = 0; i < endpoint_count; i++) {
-        if (endpoints[i] == NULL) {
-            continue;
+    // Case 1. Delete endpoint data.
+    if(endpoint->data) {
+        struct udpsock_ep *conn = (struct udpsock_ep *)endpoint->data;
+        if (conn->s_sockfd != -1) {
+            close(conn->s_sockfd);
         }
+        free(endpoint->data);
+        endpoint->data = NULL;
+    } 
+    // Case 2. Create endpoint data.
+    else { 
+        int fd = 0, flags = 0, reuseaddr = 0;
 
         // create the state of the endpoint, which will hold connection data
-        endpoints[i]->data = malloc(sizeof(struct udpsock_ep));
-        if (endpoints[i]->data == NULL) {
+        endpoint->data = malloc(sizeof(struct udpsock_ep));
+        if (endpoint->data == NULL) {
             fprintf(stderr, "malloc() failed\n");
             return -1;
         }
-        endpoints[i]->data_size = sizeof(struct udpsock_ep);
+        endpoint->data_size = sizeof(struct udpsock_ep);
 
         // initialize the state of the endpoint 
-        struct udpsock_ep *conn = (struct udpsock_ep *)endpoints[i]->data;
+        struct udpsock_ep *conn = (struct udpsock_ep *)endpoint->data;
         // Source address is the local_ip (config file)
         strncpy(conn->s_addr, local_ip, strlen(local_ip));
         // Source port is the app_id
-        conn->s_port = endpoints[i]->app_id;
+        conn->s_port = endpoint->app_id;
         if (conn->s_port == 0) {
-            free(endpoints[i]->data);
+            free(endpoint->data);
             fprintf(stderr, "[udpsock] invalid app_id %u\n", conn->s_port);
             return -1;
         }
 
         fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd == -1) {
-            free(endpoints[i]->data);
+            free(endpoint->data);
             fprintf(stderr, "[udpsock] socket() failed\n");
             return -1;
         }
@@ -72,7 +76,7 @@ NSN_DATAPATH_INIT(udpsock)
         flags = fcntl(fd, F_GETFL, 0);
         if (flags == -1) {
             close(fd);
-            free(endpoints[i]->data);
+            free(endpoint->data);
             fprintf(stderr, "[udpsock] fcntl() failed\n");
             return -1;
         }
@@ -80,7 +84,7 @@ NSN_DATAPATH_INIT(udpsock)
         flags |= O_NONBLOCK;
         if (fcntl(fd, F_SETFL, flags) == -1) {
             close(fd);
-            free(endpoints[i]->data);
+            free(endpoint->data);
             fprintf(stderr, "[udpsock] fcntl() failed\n");
             return -1;
         }
@@ -88,7 +92,7 @@ NSN_DATAPATH_INIT(udpsock)
         reuseaddr = 1;
         if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr, sizeof(reuseaddr)) == -1) {
             close(fd);
-            free(endpoints[i]->data);
+            free(endpoint->data);
             fprintf(stderr, "[udpsock] setsockopt() failed\n");
             return -1;
         }
@@ -99,7 +103,7 @@ NSN_DATAPATH_INIT(udpsock)
         conn->sock_addr.sin_addr.s_addr = inet_addr(conn->s_addr);
         if (bind(fd, (struct sockaddr *)&conn->sock_addr, sizeof(conn->sock_addr)) == -1) {
             close(fd);
-            free(endpoints[i]->data);
+            free(endpoint->data);
             fprintf(stderr, "[udpsock] bind() failed\n");
             return -1;
         }
@@ -109,7 +113,30 @@ NSN_DATAPATH_INIT(udpsock)
     }
 
     return 0;
+}
 
+NSN_DATAPATH_INIT(udpsock)
+{
+    // Initialize local state 
+    n_peers = ctx->n_peers;
+    peers = ctx->peers;
+    local_ip = ctx->local_ip;
+
+    // Setup the connections to the peers
+    // TODO: Should we fail entirely if a peer cannot be reached? For the moment, yes.
+    int ret = 0;
+    for(usize i = 0; i < endpoint_count; i++) {
+        if (endpoints[i] == NULL) {
+            continue;
+        }
+        ret = udpsock_datapath_update(endpoints[i]);
+        if (ret < 0) {
+            fprintf(stderr, "[udpsock] udpsock_datapath_update() failed\n");
+            return ret;
+        }
+    }
+
+    return ret;
 }
 
 NSN_DATAPATH_TX(udpsock)
@@ -139,8 +166,6 @@ NSN_DATAPATH_TX(udpsock)
                     return tx_count;
                 }
             }
-            printf("[udpsock] Sent %ld bytes\n", ret); 
-            memory_zero_struct(&send_addr.sin_addr);            
         }
         tx_count++;
     }
@@ -197,14 +222,16 @@ NSN_DATAPATH_DEINIT(udpsock)
         if (endpoints[i] == NULL) {
             continue;
         }
-
-        struct udpsock_ep *conn = (struct udpsock_ep *)endpoints[i]->data;
-        if (conn->s_sockfd != -1) {
-            close(conn->s_sockfd);
-        }
-
-        free(endpoints[i]->data);
+        res = udpsock_datapath_update(endpoints[i]);   
+        if (res < 0) {
+            fprintf(stderr, "[udpsock] udpsock_datapath_update() failed\n");
+            return res;
+        }    
     }
-    
+
+    n_peers = 0;
+    peers = NULL;
+    local_ip = NULL;
+
     return res;
 }
