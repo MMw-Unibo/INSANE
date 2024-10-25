@@ -799,7 +799,7 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         // This creates a connection/initializes network state!
         // IT MUST BE DONE *BEFORE* UPDATING N_SRC/N_SINKS and N_ACTIVE_CHANNELS
         assert(plugin->update && !stream->ep.data);
-        plugin->update(stream->ep.data);
+        plugin->update(&stream->ep);
         log_debug("Updated DP: new active channel!\n");
     }
 
