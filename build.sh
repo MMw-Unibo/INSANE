@@ -29,4 +29,5 @@ cd build
 $CC $CFLAGS $LDFLAGS ../src/nsnd.c $DEFINES -o nsnd 
 $CC $CFLAGS $LDFLAGS ../src/nsn_app_tx.c $DEFINES -o nsn-app-tx
 $CC $CFLAGS $LDFLAGS ../src/nsn_app_rx.c $DEFINES -o nsn-app-rx
+$CC $CFLAGS $LDFLAGS ../src/nsn_app_perf.c $DEFINES -o nsn-perf
 cd ..

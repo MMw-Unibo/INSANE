@@ -29,7 +29,14 @@ main(void)
     i64 end = nsn_os_get_time_ns();
     printf("nsn_init() took %.2f us\n", (end - start) / 1000.0);
 
-    nsn_stream_t stream = nsn_create_stream(NULL);
+    // Set the desired QoS
+    nsn_options_t opts;
+    opts.consumption = NSN_QOS_CONSUMPTION_POLL;
+    opts.datapath = NSN_QOS_DATAPATH_DEFAULT;
+    opts.determinism = NSN_QOS_DETERMINISM_DEFAULT;
+    opts.reliability = NSN_QOS_RELIABILITY_UNRELIABLE;
+
+    nsn_stream_t stream = nsn_create_stream(opts);
     if (stream == NSN_INVALID_STREAM_HANDLE) {
         printf("nsn_create_stream() failed\n");
         res = -1;

@@ -80,6 +80,8 @@ struct nsn_cmsg_create_stream
     uint32_t plugin_idx;
     // Index of the stream in the stream table
     uint32_t stream_idx;
+    // QoS options
+    nsn_options_t opts;
     // Name of the tx_prod ring
     char tx_prod[NSN_MAX_RING_NAME_SIZE]; 
 };

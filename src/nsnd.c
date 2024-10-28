@@ -526,6 +526,7 @@ string_list_t arg_list = {0};
 nsn_cfg_t *config      = NULL;
 ////////
 
+// --- Datapath thread -----------------------------------------------------
 void *
 dataplane_thread_proc(void *arg)
 {
@@ -718,6 +719,19 @@ quit:
     return NULL;
 }
 
+// --- QoS Mapping ---------------------------------------------------------
+uint32_t nsn_qos_to_plugin_idx(nsn_options_t qos)
+{
+    log_warn("QoS mapping not implemented: defaulting to 0,0,0,0\n");
+    nsn_unused(qos);
+
+    // TODO: We need to list the available plugins. Then implement the
+    // algorithm described in the paper to find the plugin to match. If 
+    // it does not exist, just return an error.
+
+    return 0;
+}
+
 // --- Helper Functions ---------------------------------------------------------
 // Helps creating a source/sink. If necessary, it starts a new thread for the dataplane.
 // Returns 0 on success, -1 on error.
@@ -900,7 +914,7 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     return 0;
 }
 
-// --- Main -------------------------------------------------------------------
+// --- IPC thread -------------------------------------------------------------
 
 int 
 main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg, 
@@ -986,9 +1000,18 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 break;
             }
 
-            // TODO(lr): Here we should put the logic for the QoS-to-plugin mapping.
-            // For the moment, just use the first one
-            uint32_t plugin_idx = 0;
+
+            // QoS-to-plugin mapping
+            nsn_cmsg_create_stream_t *msg = (nsn_cmsg_create_stream_t*)(cmsghdr + 1);
+            uint32_t plugin_idx = nsn_qos_to_plugin_idx(msg->opts);
+            if (plugin_idx == NSN_INVALID_PLUGIN_HANDLE) {
+                log_error("no plugin found for QoS %d\n", msg->opts);
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 3;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
             nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
 
             // Find the first available stream index
@@ -1004,7 +1027,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 log_error("no more streams available for plugin %d\n", plugin_idx);
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 3;
+                *error_code     = 4;
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
                 break;
             }
@@ -1030,7 +1053,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 // return error message
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 4;
+                *error_code     = 5;
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
                 break;
             }
@@ -1246,7 +1269,7 @@ clean_and_next:
 }
 
 
-// --- Os Initialization --------------------------------------------------------
+// --- Os Initialization ------------------------------------------------------
 
 void
 os_init(void)
@@ -1289,6 +1312,7 @@ os_init(void)
     cpu_hz = (i64)(cpu_mhz * 1000000);
 }
 
+// --- Main -------------------------------------------------------------------
 int 
 main(int argc, char *argv[])
 {

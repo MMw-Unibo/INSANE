@@ -34,32 +34,8 @@ typedef struct nsn_buffer {
 
 static inline int nsn_buffer_is_valid(nsn_buffer_t *buf) { return buf->data != NULL; }
 
-typedef enum datapath_qos
-{
-    datapath_slow,
-    datapath_fast
-} datapath_qos_t;
-
-typedef enum consumption_qos
-{
-    consumption_low,
-    consumption_high
-} consumption_qos_t;
-
-typedef enum determinism_qos
-{
-    determinism_no,
-    determinism_timesensitive
-} determinism_qos_t;
-
-typedef enum transport_qos
-{
-    unreliable_dgram,
-    reliable_stream
-} transport_qos_t;
-
 //--------------------------------------------------------------------------------------------------
-// QoS API
+// QoS options
 //--------------------------------------------------------------------------------------------------
 
 typedef struct nsn_options {
@@ -68,6 +44,18 @@ typedef struct nsn_options {
     int determinism;
     int reliability;
 } nsn_options_t;
+
+#define NSN_QOS_DATAPATH_DEFAULT 0x0
+#define NSN_QOS_DATAPATH_FAST    0x1
+
+#define NSN_QOS_CONSUMPTION_LOW  0x0
+#define NSN_QOS_CONSUMPTION_POLL 0x1
+
+#define NSN_QOS_DETERMINISM_DEFAULT 0x0
+#define NSN_QOS_DETERMINISM_TIMESENSITIVE 0x1
+
+#define NSN_QOS_RELIABILITY_UNRELIABLE 0x0
+#define NSN_QOS_RELIABILITY_RELIABLE   0x1
 
 //--------------------------------------------------------------------------------------------------
 #define NSN_INVALID_SNK UINT32_MAX
@@ -131,7 +119,7 @@ int nsn_close();
  * @param    opt QoS options for this stream
  * @returns  The handler to the created stream
  */
-nsn_stream_t nsn_create_stream(nsn_options_t *opts);
+nsn_stream_t nsn_create_stream(nsn_options_t opts);
 
 /**
  * @brief    Close an INSANE stream

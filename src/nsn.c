@@ -376,7 +376,7 @@ nsn_close()
 
 // -----------------------------------------------------------------------------
 nsn_stream_t
-nsn_create_stream(nsn_options_t *opts)
+nsn_create_stream(nsn_options_t opts)
 {
     nsn_stream_t stream = NSN_INVALID_STREAM_HANDLE;
     if (n_str == NSN_MAX_STREAMS) {
@@ -391,11 +391,16 @@ nsn_create_stream(nsn_options_t *opts)
             }
         }
     }
-    
-    if (opts == NULL) {
-        // TODO(garbu): set default options
-    }
 
+    // Sanity check the QoS options
+    if (opts.consumption < 0 || opts.consumption > 1 ||
+        opts.datapath < 0 || opts.datapath > 1 ||
+        opts.determinism < 0 || opts.determinism > 1 ||
+        opts.reliability < 0 || opts.reliability > 1) {
+        log_warn("invalid QoS options\n");
+        return NSN_INVALID_STREAM_HANDLE;
+    }
+    
     temp_mem_arena_t temp = temp_mem_arena_begin(arena);
     byte *cmsg = mem_arena_push_array(temp.arena, byte, 4096);
 
@@ -403,8 +408,11 @@ nsn_create_stream(nsn_options_t *opts)
     cmsghdr->type   = NSN_CMSG_TYPE_CREATE_STREAM;
     cmsghdr->app_id = app_id;
 
+    nsn_cmsg_create_stream_t* msg = (nsn_cmsg_create_stream_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->opts = opts;
+
     // TODO: The mapping between the requested QoS and a plugin happens in the daemon. We should send the policies and the daemon should return the corresponding stream index.
-    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_stream_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
 
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
         fprintf(stderr, "failed to create stream with error '%s', is it running?\n", strerror(errno));
@@ -416,7 +424,7 @@ nsn_create_stream(nsn_options_t *opts)
     }
 
     // Get the name of the tx_prod ring from the daemon and attach to it
-    nsn_cmsg_create_stream_t* msg = (nsn_cmsg_create_stream_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg = (nsn_cmsg_create_stream_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
     streams[stream]._idx = msg->stream_idx;
     streams[stream].tx_prod = nsn_lookup_ringbuf(rings_zone, str_lit(msg->tx_prod));
 

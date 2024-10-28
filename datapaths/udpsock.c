@@ -158,7 +158,7 @@ NSN_DATAPATH_TX(udpsock)
 
         // Send the buf to all the peers
         for(int p = 0; p < n_peers; p++) {
-            printf("[udpsock] Sending to %s\n", peers[p]);
+            // printf("[udpsock] Sending to %s\n", peers[p]);
             inet_pton(AF_INET, peers[p], &send_addr.sin_addr);
             while((ret = sendto(conn->s_sockfd, data, size, 0, (struct sockaddr *)&send_addr, sizeof(send_addr))) < 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
