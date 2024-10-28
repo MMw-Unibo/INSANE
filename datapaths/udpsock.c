@@ -194,21 +194,23 @@ NSN_DATAPATH_RX(udpsock)
     char *data =  (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size);    
     usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
 
-    // In UDP, we only receive 1 pkt per time - no burst receive
-    while((ret = recvfrom(ep_sk->s_sockfd, data, endpoint->io_bufs_size, 0, NULL, NULL)) < 0) {
-        //Check the reason of the -1: if not expected, return the descriptor and exit
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            nsn_ringbuf_enqueue_burst(endpoint->free_slots, &bufs[i], sizeof(bufs[i]), 1, NULL);
+    // In UDP, we receive 1 pkt per time - no burst receive
+    if ((ret = recvfrom(ep_sk->s_sockfd, data, endpoint->io_bufs_size, 0, NULL, NULL)) > 0) {
+        // Set the size as packet metadata
+        *size = ret;
+        i++;
+        *buf_count = *buf_count - 1;
+        printf("[udpsock] Received %ld bytes\n", ret);
+    } else {
+        // TODO: This is not ideal: if the receive is -1 (no data), which is the most common case,
+        // we should re-enqueue the descriptor. Find a way to improve this.
+        nsn_ringbuf_enqueue_burst(endpoint->free_slots, &bufs[i], sizeof(bufs[i]), 1, NULL);       
+        if( 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            // Something failed 
             printf("recvfrom() failed: %s\n", strerror(errno));        
             return 0;
         }
     } 
-
-    // Set the size as packet metadata
-    *size = ret;
-    i++;
-    *buf_count = *buf_count - 1;
-    printf("[udpsock] Received %ld bytes\n", ret);
 
     return i;
 }

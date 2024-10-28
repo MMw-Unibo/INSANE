@@ -79,6 +79,8 @@ typedef uint32_t nsn_source_t;
 #define NSN_INVALID_STREAM_HANDLE  UINT32_MAX
 typedef uint32_t nsn_stream_t;
 
+#define NSN_INVALID_PLUGIN_HANDLE  UINT32_MAX
+
 typedef void *handle_data_cb;
 
 //--------------------------------------------------------------------------------------------------

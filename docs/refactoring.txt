@@ -1,0 +1,91 @@
+This is a memo for the implementation of the INSANE middleware.
+The "TODO" marks refers to things that must be completed for the first v2.
+The "Future Work" marks refer to longer-term plans.
+
+=== APP CONNECTION AND DAEMON state
+* [Future Work]: If an application fails (e.g., segfaults), we should detect that and remove it from the daemon state.
+* [Future Work]: In the IPC thread, except from the CONNECT case, we should check that the app_id passed from an app to the daemon is both valid and correct (i.e., the one actually associated with that app). If not, we should at least TERMINATE the application issuing the request and then introduce some mechanism to ensure that no app is sending us a different app_id than the one it was assigned. It would be a big security issue.
+
+==== MEMORY LAYOUT
+We need to have different memory areas. One ARENA will hold data that is stictly private to the daemon. Then, for each application we have a separate ARENA for the data and for the rings. The latter is handled by a per-app MEMORY MANAGER. The memory manager manages the app arena using ZONES (that concept is not available when directly manupulating an arena). In particular:
+(a) Memory Slots are created and initialized in the "nsn_memory_manager_create" function.
+(b) A ring pool is creates as a new zone, with capacity to hold n rings. About the rings, see the specific section. The layout of the pool is: [pool_descriptor][ring tracker(true=occupied,false=free)][rings]. "count" is the number of rings that the pool can handle. "ecount" is the number of elements that each ring will hold. 
+
+This new design requires two main changes compared to v1:
+* TODO: Assign a different L4 port to each application and configure the NIC RSS filter to place incoming packets in the memory area of the right applications. To do that without an extra copy, some providers (e.g., DPDK, RDMA) must configure the NIC RSS filter based on the L4 port. [PROBLEM on DPDK]: We need to tell the rte_eth_rx_burst function to take descriptors from OUR POOL and do something similar to what we do in transmission. Not sure it can be done... Two options:
+--> we just copy the payload ( :( )
+--> we split the slot pool in a TX and a RX area, and duplicate the pool_get ring: one for tx, one for rx, containing each only slots in their area. This way an rx slot will never be occupied by a tx slot. RX slots can be still used in tx (e.g.,in case of splicing) before being freed. The pool_put would remain one.
+
+* TODO: A separate TX ring for each stream requires the daemon a scheduler to decide which packets to send on the network. It might use a simple RoundRobin policy, but also prioritize some applications if needed.
+
+==== PLUGIN discovery and THREAD pool
+
+We need to keep track of:
+* which plugins are currently loaded/available [i.e., which plugin the apps can currently use]
+* the set of threads that are currently running that plugin (and their associated state)
+* the set of STREAMS that are currently using the plugin
+When we have such info, we can use it to decide when to resume/pause one or more threads once a stream is stopped/created.
+
+However, remember that the threads in the pool are not natively bound to a specific plugin. So they exist independently of the plugins that are loaded. We want to enable, in the future, the possibility to assign either 1 thread to n plugins, 1 thread to 1 plugin, or n threads to 1 plugin. Hence:
+* in the plugin struct, a pointer&counter keeps track of the threads of the thread pool that are currently running the plugin
+* [Future Work] we need to expand the thread pool and provide a utility that keeps track of which thread is running which plugin, and potentially a thread manager that the plugin can call to request a thread, hiding the load balancing logic from it. We currently just select thread 0 for plugin 0, thread 1 for plugin 1, and so on.
+
+[Future Work] Currently, we stick to a static 1 thread-1 plugin strategy: each thread is controlled through a datapath argument struct (struct nsn_dataplane_thread_args) that is shared with the thread, has a switch (RUN/WAIT), and has a SINGLE datapath name. To enable our desired behavior, we should improve that and maybe allow more than one dp to be run by one thread (long-term goal). That also includes a mechanism to detach a thread from a plugin (currently we can only attach, and only once). 
+With less pressure, we also need to detect at startup time which plugins are currently available and can be used by the app (e.g., RDMA is loaded AND there is RDMA capability on the host). Also, using the info of how many streams are open for a plugin, balance the workload assigned to the thread pool, shrink/enlarge the pool based on load.
+
+=== STREAM and CHANNELS
+
+The STREAM is not actually a channel. It just defines the plugin from which the channel will be handled. Hence, its handler is just the plugin index in the daemon plugin table. Opening a stream has the effect of:
+1) obtaining a ref to that index. TODO: This step is where the QoS-to-plugin logic belongs. That's currently the main purpose of creating a new stream.
+2) creating a tx_ring from the app to the selected plugin
+3) [Future Work]: maybe opening a stream might include dynamically locating the plugin/adding it to the stream option? 
+
+The SOURCE/SINK creation is when a new channel endpoint is created. That means that communication can start, so this triggers, if necessary, the associated daplane thread(s) to be attached to the stream of the channel (if not already attached) and to resume (if not already running) its operations.
+* [Future Work] Dynamic Thread De/Attachment. Currently, attaching a thread to a plugin is not reversible: once attached, the thread is forever associated with that plugin and is never returned to the pool. Ideally, we would like to be able to detach the thread from the plugin if not needed. 
+
+--> TODO: nsn_consume_data(). How do we return the correct data len?
+
+=== RINGS and MEMORY SLOTS
+In the init of the memory manager, we create a zone to hold a POOL of ring buffers. Inside the zone, we keep the following rings:
+1) free_slots: this is the only point of access to the memory slot and it is a singletons for each app. The free_slots is provided to the application as the tx_cons ring, from which it can obtain clean memory slot, and as rx_prod, which enables the application to return the slots once they are no longer needed. At the same time, each plugin uses the free_slots to free slots after transmission and to obtain slots for placing incoming data from the NIC. TODO: This latter use case is problematic for DPDK (see above in memory layout, below in the datapath section).
+2-3) tx_prod and rx_cons: the rings the application uses respectively to submit tx request and to obtain incoming data. These are plugin-specific and so are created on-demand at stream creation, and destroyed at stream destruction.
+
+The lookup of a ring requires first to retrieve the zone, then from the zone the pool, and finally to go through the ring tracker and compare the ring names with the desired one.
+[Future Work] Overall probably we need a memory manager also for the app. It would be much better to place the whole memory manager logic into a separate library file.
+
+Do not use "capacity" but instead "count" to know the max number of elements a ring can hold. Total byte size is esize*size.
+
+The esize must be 8 byte (u64) or things will fail.
+
+=== DATAPATH
+
+--> APP ISOLATION. We create an overlay network for each APP based on the L4 port (L4 port == APP ID). The reason is technical: this is necessary for some plugins to configure the NIC in order to get isolated, zero-copy receive. E.g., DPDK can use the RSS filter to place packets for different L4 ports to different memory areas (only standard protocol fields can be used). 
+    > As a consequence, we need to keep a state for each *stream* (i.e., couple of plugin type + app_id). This state includes a bunch of items and is represented by the endpoint_t struct: app id, pointers to the data zones, pointers to the free_slots ring, etc. Included in this struct is a plugin-specific opaque pointer that is managed by each plugin and contains, e.g., open sockets etc. This state is currently kept in the *daemon* and passed to the plugin at every datapath operation [alternative: keep it in the plugin and pass a stream id every time].
+        TODO: Currently, the state is created on plugin start and pause, based on the apps connected at that time. We should also find a way to dynamically add/remove to/from the state the new apps that are created or those that are disconected. And we need to do that NOT in the datapath because creating a connection would stall the data plane!
+    > As a consequence, each APP has a config file where we place the app id. All the apps with the same APP ID share a common name space for channel ids. [Alternatively we can list the app ids in the daemon configuration file, but for the moment I kept it separated]
+
+--> RX. The current implementation implies that the *plugin* gets the buffer to host incoming data, thus enabling certain plugins to do zero-copy receive. The plugin gets an index from the free_slots ring, computes the buffer offset and places the incoming data there.
+    *  TODO: [udpsock]: the rx implementation is not ideal. If the receive of the async socket is -1 (no data), which is the most common case, we immediately re-enqueue the descriptor we just dequeued. Find a way to improve this!!
+--> TX. Symmetrically, the plugin receives pre-allocated buffers to transmit and, once transmitted, has the responsibility to free them on behalf of the daemon.
+
+IOBUFS are freed: (a) by the plugin after TX; (b) by the app after RX. No free is needed by the daemon.
+
+[Future Work] The plugins that use UDP could use UDP multicast instead of a multicast send.
+
+=======================================================================================
+TODO next: 
+
+1) Tes the DP update in case a stream is added/deleted while the plugin is running, by using an app with a different app_id so you force a new stream to be created.
+--> TODO: fixed a bug, but now: i'm not sure if the DP is updated correctly at start of the new app. Must check: if data reach the network, it works. BUT, there is currently an error in the app: it looks like the tx_prod ring of the app is NULL. Why is that?
+    * FIXED, ****STILL TO COMMIT****:
+        The problem is that in the library we use the STREAM_ID returned by the daemon as the INDEX of the LOCAL stream vector. Of course this is WRONG: the segfault is because we try to use the ID=1 to select a stream of the local app, when the correct thing to do would be to choose the stream 0. SOLUTION: separate those two concepts. We currently use the ID returned by the daemon as stream_t, returned to the user (in the app!). We must separate those two concepts: the STREAM of the nsn.c must have an ID (kept only for lib-to-daemon interactions) and an IDX (used locally as the stream_t returned to the user).
+    * NEW PROBLEM: Once fixed the previous issue, it still DOES NOT SEND data (apparently) and it looks like there are many errors when closing. But at least no segfaults... 
+
+
+2) Support multiple daemons! Currently the value of the destination is hard-coded. Need to become a list in a separate configuration file.
+--> TODO: read the IP list from the config file (ask Garbu)
+
+3) Datapaths. Currently we do atomic_load even from the daemon. But the only writer of active_channels is the daemon. So the daemon is safe to do reads without atomic; it must use atomic_write to write. It is the plugin thread that must always do atomic_load.
+
+4) When I close an app and then try to CTRL+C the daemon, it does not exit. Why? Not always, but most of the time.
+

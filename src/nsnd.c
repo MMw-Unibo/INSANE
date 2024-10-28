@@ -776,8 +776,8 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
     // data plane thread. In the future, this will be delegated to a thread pool manager.
     atu32 active_channels = plugin->active_channels;
     if (active_channels == 0) {
-        // Currenlty, we just consider that thread j is assigned to plugin j.
-        uint32_t thread_idx = stream_idx;
+        // Currently, we just consider that thread j is assigned to plugin j.
+        uint32_t thread_idx = plugin_idx;
         struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
         // It might be the case that the thread is already associated with the plugin,
         // until we implement a thread pool manager. In this case, no need to add a 
@@ -800,7 +800,7 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         // IT MUST BE DONE *BEFORE* UPDATING N_SRC/N_SINKS and N_ACTIVE_CHANNELS
         assert(plugin->update && !stream->ep.data);
         plugin->update(&stream->ep);
-        log_debug("Updated DP: new active channel!\n");
+        log_debug("Updated DP: new active channel for stream %u\n", stream_idx);
     }
 
     // Update the number of srcs/sinks in the plugin
@@ -835,26 +835,25 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
         return -1;
     }
 
-    // Check that the stream index is valid
-        nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
+    nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
     uint32_t plugin_idx = reply->plugin_idx;
     uint32_t stream_idx = (uint32_t)reply->stream_idx;
     if (plugin_idx >= plugin_set.count || stream_idx >= array_count(plugin_set.plugins[plugin_idx].streams)) {
-        log_error("stream index %d is out of bounds\n", stream_idx);
+        log_error("plugin/stream index is out of bound\n");
         return -2;
     }
-    nsn_plugin_t *plugin = &plugin_set.plugins[stream_idx];
+    nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
     _nsn_inner_stream_t *stream = &plugin->streams[stream_idx];
 
     // Ref count of the channels (src/snk) active in the stream
-    atu32 active_channels = plugin->active_channels;
+    atu32 active_channels = at_load(&plugin->active_channels, mo_rlx);
     at_store(&plugin->active_channels, active_channels - 1, mo_rlx);
     
     // if the stream has no more active channels, stop the data plane thread 
     // (which remains attached to the plugin, until we implement a thread pool manager)
     // (ideally, the thread should go back into the pool)
     // Currently, we just consider that thread j is assigned to plugin j.
-    uint32_t thread_idx = stream_idx;
+    uint32_t thread_idx = plugin_idx;
     struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
     if(active_channels - 1 == 0) {
         at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
@@ -862,7 +861,7 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
 
     if (type == NSN_CHANNEL_TYPE_SINK) {
 
-        atu32 active_snk = stream->n_sinks;
+        atu32 active_snk = at_load(&stream->n_sinks, mo_rlx);
         u32 idx = UINT32_MAX;
         for(u32 i = 0; i < array_count(stream->sinks); i++) {
             if(stream->sinks[i].sink_id == ((nsn_cmsg_create_sink_t *)(cmsghdr + 1))->sink_id) {
@@ -882,9 +881,8 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
         stream->sinks[idx].rx_cons = NULL;
         stream->sinks[idx].sink_id = UINT32_MAX;
         at_store(&stream->n_sinks, active_snk - 1, mo_rlx);
-
     } else {
-        atu32 active_src = stream->n_srcs;
+        atu32 active_src = at_load(&stream->n_srcs, mo_rlx);
         at_store(&stream->n_srcs, active_src - 1, mo_rlx);
     }
 
@@ -892,10 +890,10 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     // we must tell the plugin to delete the stream state
     if (active_channels - 1 > 0 && stream->n_sinks == 0 && stream->n_srcs == 0) {
         // This destroys the connection/cleans the network state!
-        // IT MUST BE DONE *AFTER* UPDATING N_SRC/N_SINKS and N_ACTIVE_CHANNELS
-        assert(plugin->update);
-        log_debug("destroying stream EP data: no more active channels\n");
-        plugin->update(stream->ep.data);
+        // IT MUST BE DONE *AFTER* UPDATING N_SRC/N_SINKS
+        assert(plugin->update && stream->ep.data);
+        log_debug("Updated DP: no active channels for stream %u\n", stream_idx);
+        plugin->update(&stream->ep);
         stream->ep.data = NULL;
     }
 
