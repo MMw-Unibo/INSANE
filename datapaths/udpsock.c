@@ -125,11 +125,9 @@ NSN_DATAPATH_INIT(udpsock)
     // Setup the connections to the peers
     // TODO: Should we fail entirely if a peer cannot be reached? For the moment, yes.
     int ret = 0;
-    for(usize i = 0; i < endpoint_count; i++) {
-        if (endpoints[i] == NULL) {
-            continue;
-        }
-        ret = udpsock_datapath_update(endpoints[i]);
+    ep_initializer_t *ep_in;
+    list_for_each_entry(ep_in, endpoint_list, node) {
+        ret = udpsock_datapath_update(ep_in->ep);
         if (ret < 0) {
             fprintf(stderr, "[udpsock] udpsock_datapath_update() failed\n");
             return ret;
@@ -220,15 +218,13 @@ NSN_DATAPATH_DEINIT(udpsock)
     nsn_unused(ctx);
 
     int res = 0;
-    for(usize i = 0; i < endpoint_count; i++) {
-        if (endpoints[i] == NULL) {
-            continue;
-        }
-        res = udpsock_datapath_update(endpoints[i]);   
+    struct ep_initializer *ep_in;
+    list_for_each_entry(ep_in, endpoint_list, node) {
+        res = udpsock_datapath_update(ep_in->ep);
         if (res < 0) {
             fprintf(stderr, "[udpsock] udpsock_datapath_update() failed\n");
             return res;
-        }    
+        }
     }
 
     n_peers = 0;

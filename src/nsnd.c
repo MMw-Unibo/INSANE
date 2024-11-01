@@ -429,29 +429,30 @@ app_pool_try_alloc_and_init_slot(nsn_app_pool_t *pool, int app_id, nsn_mem_manag
 // --- Plugin, Streams, Endpoints, Sinks -------------------------------------------------
 
 // Sink: needed to dispatch data to the right sink
-typedef struct _nsn_inner_sink _nsn_inner_sink_t;
-struct _nsn_inner_sink
+typedef struct nsn_inner_sink nsn_inner_sink_t;
+struct nsn_inner_sink
 {
+    list_head_t   node;
     nsn_ringbuf_t *rx_cons;
     u32           sink_id;
 };
 
 // Stream: state for a specific plugin for a specific app_id
-typedef struct _nsn_inner_stream _nsn_inner_stream_t;
-struct _nsn_inner_stream
+typedef struct nsn_inner_stream nsn_inner_stream_t;
+struct nsn_inner_stream
 {
-    // When set to a value different from UINT32_MAX, the stream is active and this
-    // value is a shortcut to the plugin index.
-    u32                 plugin_idx;
+    list_head_t         node;
+    u32                 plugin_idx; // Shortcut to the plugin
+    u32                 idx;        // Index of this stream
 
     // tx ring from srcs to the plugin
-    nsn_ringbuf_t*      tx_prod; // TODO: This should be protected from critical races
+    nsn_ringbuf_t*      tx_prod;
     atu32               n_srcs;
 
-    // rx rings from the plugin to the sinks
-    //TODO: parametrize this and dynamicaly allocate with mem_arena_push_array
-    _nsn_inner_sink_t   sinks[8]; 
-    atu32               n_sinks;
+    // Sinks active for this stream
+    list_head_t        sinks; 
+    nsn_mutex_t        sinks_lock;
+    atu32              n_sinks;
 
     // Endpoint info (for the plugin)
     nsn_endpoint_t          ep;
@@ -460,17 +461,14 @@ struct _nsn_inner_stream
 typedef struct nsn_plugin nsn_plugin_t;
 struct nsn_plugin
 {
-    string_t name;
-    nsn_os_thread_t* threads;
-    usize thread_count;
-
-    atu32 active_channels;  // No. of total src+snk
-    //TODO: parametrize this and dynamicaly allocate with mem_arena_push_array
-    // Could this become a LIST? It would be better for the datapath.
-    _nsn_inner_stream_t streams[8]; //Streams that use this plugin
-
-    // Pointer to the plugin's UPDATE function
-    nsn_datapath_update* update;
+    string_t             name;    // The name of the plugin
+    nsn_os_thread_t*     threads; // The threads that run the plugin
+    usize                thread_count; // The number of those threads
+    u32                  active_channels; // No. of total src+snk
+    list_head_t          streams; // List of streams that use this plugin
+    nsn_mutex_t          streams_lock; // Lock for the streams list   
+    u32                  stream_id_cnt; //used to assign stream_ids
+    nsn_datapath_update* update; // The plugin's UPDATE function
 };
 
 typedef struct nsn_plugin_set nsn_plugin_set_t;
@@ -525,6 +523,27 @@ nsn_thread_pool_t thread_pool = {0};
 string_list_t arg_list = {0};
 nsn_cfg_t *config      = NULL;
 ////////
+
+// --- Datapath helpers -----------------------------------------------------
+static void prepare_ep_list(list_head_t* ep_list, nsn_plugin_t *plugin, temp_mem_arena_t* data_arena) {
+    nsn_inner_stream_t *stream;
+    ep_initializer_t *ep_el;
+    list_for_each_entry(stream, &plugin->streams, node) {
+        ep_el = mem_arena_push(data_arena->arena, sizeof(ep_initializer_t));
+        ep_el->ep = &stream->ep;
+        list_add_tail(ep_list, &ep_el->node);
+    }
+}
+
+static void clean_ep_list(list_head_t *ep_list, temp_mem_arena_t* data_arena) {
+    ep_initializer_t *ep_el;
+    while(!list_empty(ep_list)) {
+        ep_el = list_last_entry(ep_list, ep_initializer_t, node);
+        ep_el->node.prev->next = ep_el->node.next;
+        list_del(&ep_el->node);
+        mem_arena_pop(data_arena->arena, sizeof(ep_initializer_t));
+    }
+}
 
 // --- Datapath thread -----------------------------------------------------
 void *
@@ -611,22 +630,19 @@ wait:
         strcpy(ctx.peers[i], config_file[i]);
     }
 
-    // 2) Endpoints for each stream: plugin-specific data to init&keep connections.
-    nsn_endpoint_t *ep[array_count(plugin->streams)];
-    for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
-        if (plugin->streams[i].plugin_idx != UINT32_MAX) {
-            ep[i] = &plugin->streams[i].ep;
-        } else {
-            ep[i] = NULL;
-        }
-    }
-
     // Save a pointer to the UPDATE function in the plugin descriptor
     plugin->update = ops.update;
 
-    // Initialize the plugin
-    ops.init(&ctx, ep, array_count(plugin->streams));
+    // 2) Initialize the plugin
+    list_head(ep_list); 
+    nsn_os_mutex_lock(&plugin->streams_lock);
+    prepare_ep_list(&ep_list, plugin, &data_arena);
+    nsn_os_mutex_unlock(&plugin->streams_lock);
+    ops.init(&ctx, &ep_list);
+    clean_ep_list(&ep_list, &data_arena);
 
+    // 3) Start the dataplane loop
+    nsn_inner_stream_t *stream;
     while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_RUNNING) {
         // TODO: dpdk example, in the final code the string "dpdk" should be replaced by the name of the datapath
         // and has to be done in a parameterized way. 
@@ -637,10 +653,9 @@ wait:
         // Then we should protect them with locks? or similar? 
 
         // TX routine
-        for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
-            _nsn_inner_stream_t *stream = &plugin->streams[i];
-            if (stream->plugin_idx == UINT32_MAX ||
-                at_load(&stream->n_srcs, mo_rlx) == 0) {
+        nsn_os_mutex_lock(&plugin->streams_lock);
+        list_for_each_entry(stream, &plugin->streams, node) {
+            if (!at_load(&stream->n_srcs, mo_rlx)) {
                 continue;
             }
 
@@ -663,10 +678,8 @@ wait:
         }
 
         // RX routine
-        for (uint32_t i = 0; i < array_count(plugin->streams); i++) {
-            _nsn_inner_stream_t *stream = &plugin->streams[i];
-            if (stream->plugin_idx == UINT32_MAX ||
-                at_load(&stream->n_sinks, mo_rlx) == 0) {
+        list_for_each_entry(stream, &plugin->streams, node) {
+            if (at_load(&stream->n_sinks, mo_rlx) == 0) {
                 continue;
             }
 
@@ -676,24 +689,40 @@ wait:
             usize np_rx = ops.rx(io_buffs, &io_max, &stream->ep);
             
             // 2. Dispatch the packets to the sinks
+            bool delivered;
             for(uint32_t j = 0; j < np_rx; j++) {
                 uint8_t* data = (uint8_t*)(stream->ep.tx_zone + 1) + (io_buffs[j].index * stream->ep.io_bufs_size);
                 nsn_hdr_t *hdr = (nsn_hdr_t *)data;
-                // TODO: Check if the sink exists! 
-                // TODO: We also need to find an efficient way to get the sink INDEX (not id) from the channel id.
-                log_debug("pkt received on channel %u\n", self, hdr->channel_id);
-                nsn_ringbuf_t *rx_cons = stream->sinks[hdr->channel_id].rx_cons;
-                if (nsn_ringbuf_enqueue_burst(rx_cons, &io_buffs[j].index, sizeof(io_buffs[j].index), 1, NULL) == 0) {
-                    log_error("[thread %d] Failed to enqueue pkt to sink\n", self);
+                nsn_inner_sink_t* sink;
+                delivered = false;
+                nsn_os_mutex_lock(&stream->sinks_lock);
+                list_for_each_entry(sink, &stream->sinks, node) {
+                    if (sink->sink_id == hdr->channel_id) {
+                        log_debug("pkt received on channel %u\n", self, hdr->channel_id);
+                        if (nsn_ringbuf_enqueue_burst(sink->rx_cons, &io_buffs[j].index, sizeof(io_buffs[j].index), 1, NULL) == 0) {
+                            log_error("[thread %d] Failed to enqueue pkt to sink\n", self);
+                        }
+                        delivered = true;
+                        break;
+                    }
+                }
+                nsn_os_mutex_unlock(&stream->sinks_lock);
+                if(!delivered) {
+                    log_warn("No sink found for channel %u\n", hdr->channel_id);
                 }
             }
         }
+        nsn_os_mutex_unlock(&plugin->streams_lock);
     }
 
     log_debug("[thread %d] deinit\n", self);
-    if (ops.deinit(NULL, ep, array_count(plugin->streams))) {
+    nsn_os_mutex_lock(&plugin->streams_lock);
+    prepare_ep_list(&ep_list, plugin, &data_arena);
+    nsn_os_mutex_unlock(&plugin->streams_lock);
+    if (ops.deinit(NULL, &ep_list)) {
         log_error("[thread %d] Failed to deinit\n", self);
     }
+    clean_ep_list(&ep_list, &data_arena);
 
     log_debug("[thread %d] unloading library\n", self);
     nsn_os_unload_library(module);
@@ -756,18 +785,29 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         return -1;
     }
 
-    // Check that the stream index is valid
+    // Find the (valid) plugin
     nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
     uint32_t plugin_idx = reply->plugin_idx;
-    uint32_t stream_idx = (uint32_t)reply->stream_idx;
-    if (plugin_idx >= plugin_set.count || stream_idx >= array_count(plugin_set.plugins[plugin_idx].streams)) {
-        log_error("stream index %d is out of bounds\n", stream_idx);
+    if (plugin_idx >= plugin_set.count) {
+        log_error("plugin index %d is out of bound\n");
         return -2;
     }
     nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
-    _nsn_inner_stream_t *stream = &plugin->streams[stream_idx];
 
-    // If sink, create the ring. Here, because if it fails, it has no other side effect.
+    // Find the (valid) stream
+    uint32_t stream_idx = (uint32_t)reply->stream_idx;
+    nsn_inner_stream_t *stream;
+    list_for_each_entry(stream, &plugin->streams, node) {
+        if (stream->idx == stream_idx) {
+            break;
+        }
+    }
+    if (!stream) {
+        log_error("stream %d not found in the plugin\n", stream_idx);
+        return -3;
+    }
+
+    // If sink, create the descriptor and the ring. Here, because if it fails, it has no other side effect.
     if(type == NSN_CHANNEL_TYPE_SINK) {
         nsn_cmsg_create_sink_t *reply_snk = (nsn_cmsg_create_sink_t *)(cmsghdr + 1);
 
@@ -780,16 +820,21 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
             return -3;
         }
 
-        // Associate the ring to the plugin
-        atu32 n_sinks = stream->n_sinks;
-        stream->sinks[n_sinks].rx_cons = rx_cons_ring;
-        stream->sinks[n_sinks].sink_id = (u32)reply_snk->sink_id;
+        // Create the sink descriptor
+        nsn_inner_sink_t *sink = malloc(sizeof(nsn_inner_sink_t));
+        sink->rx_cons = rx_cons_ring;
+        sink->sink_id = (u32)reply_snk->sink_id;
+
+        // Add the sink to the stream
+        nsn_os_mutex_lock(&stream->sinks_lock);
+        list_add_tail(&sink->node, &stream->sinks);
+        nsn_os_mutex_unlock(&stream->sinks_lock);
     }
     
     // if this is the first src/snk (=channel) in the PLUGIN, start the first 
     // data plane thread. In the future, this will be delegated to a thread pool manager.
-    atu32 active_channels = plugin->active_channels;
-    if (active_channels == 0) {
+    // This will also automatically create the network state for all the streams.
+    if (plugin->active_channels == 0) {
         // Currently, we just consider that thread j is assigned to plugin j.
         uint32_t thread_idx = plugin_idx;
         struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
@@ -817,17 +862,14 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         log_debug("Updated DP: new active channel for stream %u\n", stream_idx);
     }
 
-    // Update the number of srcs/sinks in the plugin
+    // Update the number of srcs/sinks in the plugin and stream
+    // This will make the datapath aware of the new channel.
+    ++plugin->active_channels;
     if(type == NSN_CHANNEL_TYPE_SINK) {
-        atu32 n_sinks = stream->n_sinks;
-        at_store(&stream->n_sinks, n_sinks + 1, mo_rlx);
+        atomic_fetch_add(&stream->n_sinks, 1);
     } else {
-        atu32 n_source = stream->n_srcs;
-        at_store(&stream->n_srcs, n_source + 1, mo_rlx);
+        atomic_fetch_add(&stream->n_srcs, 1);
     }
-
-    // Ref count of the channels (src/snk) active in the stream
-    at_store(&plugin->active_channels, active_channels + 1, mo_rlx);
 
     return 0;
 }
@@ -849,19 +891,60 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
         return -1;
     }
 
+    // Check plugin id and retrieve the plugin
     nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
     uint32_t plugin_idx = reply->plugin_idx;
-    uint32_t stream_idx = (uint32_t)reply->stream_idx;
-    if (plugin_idx >= plugin_set.count || stream_idx >= array_count(plugin_set.plugins[plugin_idx].streams)) {
-        log_error("plugin/stream index is out of bound\n");
+    if (plugin_idx >= plugin_set.count) {
+        log_error("plugin index is out of bound\n");
         return -2;
-    }
+    } 
     nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
-    _nsn_inner_stream_t *stream = &plugin->streams[stream_idx];
+    
+    // Check stream id and retrieve the stream
+    uint32_t stream_idx = (uint32_t)reply->stream_idx;
+    nsn_inner_stream_t *stream;
+    list_for_each_entry(stream, &plugin->streams, node) {
+        if (stream->idx == stream_idx) {
+            break;
+        }
+    }
+    if (!stream) {
+        log_error("stream %d not found in the plugin\n", stream_idx);
+        return -3;
+    }
+
+    if (type == NSN_CHANNEL_TYPE_SINK) {
+        nsn_inner_sink_t *sink;
+        list_for_each_entry(sink, &stream->sinks, node) {
+            if(sink->sink_id == ((nsn_cmsg_create_sink_t *)(cmsghdr + 1))->sink_id) {
+                break;
+            }
+        }
+        if(!sink) {
+            log_error("sink %d not found in the stream\n", ((nsn_cmsg_create_sink_t *)(cmsghdr + 1))->sink_id);
+            return -4;
+        }     
+        
+        nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
+        int err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(sink->rx_cons->name));
+        if (err < 0) {
+            log_error("Failed to destroy the rx_cons ring\n");
+            return -5;
+        }
+
+        // Remove the sink from the stream and update the number of sinks in the stream
+        nsn_os_mutex_lock(&stream->sinks_lock);
+        list_del(&sink->node);
+        atomic_fetch_sub(&stream->n_sinks, 1);
+        nsn_os_mutex_unlock(&stream->sinks_lock);
+
+        free(sink);
+    } else {
+        atomic_fetch_sub(&stream->n_srcs, 1);
+    }
 
     // Ref count of the channels (src/snk) active in the stream
-    atu32 active_channels = at_load(&plugin->active_channels, mo_rlx);
-    at_store(&plugin->active_channels, active_channels - 1, mo_rlx);
+    --plugin->active_channels;
     
     // if the stream has no more active channels, stop the data plane thread 
     // (which remains attached to the plugin, until we implement a thread pool manager)
@@ -869,40 +952,12 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     // Currently, we just consider that thread j is assigned to plugin j.
     uint32_t thread_idx = plugin_idx;
     struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
-    if(active_channels - 1 == 0) {
+    if(!plugin->active_channels) {
         at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
-    }
-
-    if (type == NSN_CHANNEL_TYPE_SINK) {
-
-        atu32 active_snk = at_load(&stream->n_sinks, mo_rlx);
-        u32 idx = UINT32_MAX;
-        for(u32 i = 0; i < array_count(stream->sinks); i++) {
-            if(stream->sinks[i].sink_id == ((nsn_cmsg_create_sink_t *)(cmsghdr + 1))->sink_id) {
-                idx = i;
-                break;
-            }
-        }        
-        nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
-        nsn_ringbuf_t *rx_cons_ring = stream->sinks[idx].rx_cons;     
-        int err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(rx_cons_ring->name));
-        if (err < 0) {
-            log_error("Failed to destroy the rx_cons ring\n");
-            return -3;
-        }
-
-        // Clean the local state
-        stream->sinks[idx].rx_cons = NULL;
-        stream->sinks[idx].sink_id = UINT32_MAX;
-        at_store(&stream->n_sinks, active_snk - 1, mo_rlx);
-    } else {
-        atu32 active_src = at_load(&stream->n_srcs, mo_rlx);
-        at_store(&stream->n_srcs, active_src - 1, mo_rlx);
-    }
-
-    // In case the plugin is still running but the stream has no more active channels,
+    } 
+    // In case the plugin is still running but this stream has no more active channels,
     // we must tell the plugin to delete the stream state
-    if (active_channels - 1 > 0 && stream->n_sinks == 0 && stream->n_srcs == 0) {
+    else if(!at_load(&stream->n_sinks, mo_rlx) && !at_load(&stream->n_srcs, mo_rlx)) {
         // This destroys the connection/cleans the network state!
         // IT MUST BE DONE *AFTER* UPDATING N_SRC/N_SINKS
         assert(plugin->update && stream->ep.data);
@@ -1014,30 +1069,20 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             }
             nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
 
-            // Find the first available stream index
-            uint32_t stream_idx = UINT32_MAX;
-            for (usize i = 0; i < array_count(plugin->streams); i++) {
-                if (plugin->streams[i].plugin_idx == UINT32_MAX) {
-                    stream_idx = (uint32_t)i;
-                    plugin->streams[i].plugin_idx = plugin_idx;
-                    break;
-                }
-            }
-            if (stream_idx >= array_count(plugin->streams)) {
-                log_error("no more streams available for plugin %d\n", plugin_idx);
-                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
-                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 4;
-                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
-                break;
-            }
+            // Create the stream descriptor
+            nsn_inner_stream_t *stream = malloc(sizeof(nsn_inner_stream_t));
+            stream->plugin_idx = plugin_idx;
+            stream->idx = plugin->stream_id_cnt++;
+            atomic_store(&stream->n_srcs, 0);
+            atomic_store(&stream->n_sinks, 0);
+            stream->sinks = list_head_init(stream->sinks);
+            nsn_os_mutex_init(&stream->sinks_lock);
 
-            // Return the index of the plugin as stream handler
+            // Set the index of the plugin and stream in the reply
+            uint32_t stream_idx = stream->idx;
             nsn_cmsg_create_stream_t *reply = (nsn_cmsg_create_stream_t*)(cmsghdr + 1);
             reply->plugin_idx = plugin_idx;
             reply->stream_idx = stream_idx;
-
-            _nsn_inner_stream_t *stream = &plugin->streams[stream_idx];
 
             // Create the tx ring buffer. The "consumer" and "producer" definitions are relative to the application.
             // The tx_cons and the rx_prod are the same ring, the free_slots ring, which is already available to the app.
@@ -1049,7 +1094,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             if (!tx_prod_ring) {
                 log_error("Failed to create the tx_prod ring\n", tx_prod_ring);
                 // clean the stream
-                stream->plugin_idx = UINT32_MAX;
+                free(stream);
                 // return error message
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
@@ -1057,7 +1102,6 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
                 break;
             }
-
             // Associate the tx ring with the plugin
             stream->tx_prod = tx_prod_ring;
 
@@ -1068,6 +1112,11 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             stream->ep.tx_meta_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_META_NAME));
             stream->ep.io_bufs_size = mem_cfg.io_buffer_size;            
            
+            // Add the stream to the plugin
+            nsn_os_mutex_lock(&plugin->streams_lock);
+            list_add_tail(&plugin->streams, &stream->node);
+            nsn_os_mutex_unlock(&plugin->streams_lock);
+
             // Successful operation: return success
             cmsghdr->type = NAN_CSMG_TYPE_CREATED_STREAM;
             reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_stream_t);
@@ -1094,12 +1143,13 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 break;
             }
 
-            // Check that the stream index is valid
             nsn_cmsg_create_stream_t *reply = (nsn_cmsg_create_stream_t *)(cmsghdr + 1);
             uint32_t plugin_idx = (uint32_t)reply->plugin_idx;
             uint32_t stream_idx = (uint32_t)reply->stream_idx;
-            if (plugin_idx >= plugin_set.count || stream_idx >= array_count(plugin_set.plugins[plugin_idx].streams)) {
-                log_error("stream index %d is out of bounds\n", stream_idx);
+
+            // Check that the plugin index is valid
+            if (plugin_idx >= plugin_set.count) {
+                log_error("plugin index %d is out of bounds\n", stream_idx);
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
                 *error_code     = 2;
@@ -1107,17 +1157,35 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 break;
             }
 
-            // check that no channel is active for this stream
+            // Check that the stream index is valid
             nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
-            _nsn_inner_stream_t *stream = &plugin->streams[stream_idx];
-            if (stream->n_sinks > 0 || stream->n_srcs > 0) {
-                log_error("stream %d has active channels (src/snk)\n", stream_idx);
+            nsn_inner_stream_t *stream;
+            list_for_each_entry(stream, &plugin->streams, node) {
+                if (stream->idx == stream_idx) {
+                    break;
+                }
+            }
+            if (!stream) {
+                log_error("stream %d not found in the plugin\n", stream_idx);
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
                 *error_code     = 3;
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
                 break;
             }
+
+            // check that no channel is active for this stream
+            u32 n_sinks = at_load(&stream->n_sinks, mo_rlx);
+            u32 n_srcs  = at_load(&stream->n_srcs, mo_rlx);
+            if (n_sinks > 0 || n_srcs > 0) {
+                log_error("stream %d has active channels (src/snk)\n", stream_idx);
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 4;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
             // 3) [Future Work] Detach the thread(s) associated with this stream. Here, or proactively at channel destruction.
 
             // 4) destroy the tx_prod ring
@@ -1129,19 +1197,16 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 log_error("Failed to destroy the tx_prod ring\n");
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 4;
+                *error_code     = 5;
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
                 break;
             }
             
             // Finalize the destruction of the stream
-            stream->tx_prod = NULL;
-            stream->plugin_idx = UINT32_MAX; // TODO: This should be protected from critical races
-            stream->ep.app_id = UINT32_MAX;
-            stream->ep.free_slots = NULL;
-            stream->ep.tx_zone = NULL;
-            stream->ep.tx_meta_zone = NULL;
-            stream->ep.io_bufs_size = 0;
+            nsn_os_mutex_lock(&plugin->streams_lock);
+            list_del(&stream->node);
+            nsn_os_mutex_unlock(&plugin->streams_lock);
+            free(stream);
 
             // Return success
             cmsghdr->type = NSN_CMSG_TYPE_DESTROYED_STREAM;
@@ -1383,19 +1448,15 @@ main(int argc, char *argv[])
     plugin_set.plugins = mem_arena_push_array(arena, nsn_plugin_t, 1);
     plugin_set.count   = 1;
     for (usize i = 0; i < plugin_set.count; i++) {
-        plugin_set.plugins[i].name = str_lit("udpsock");
-        plugin_set.plugins[i].thread_count = 0;
-        plugin_set.plugins[i].threads = mem_arena_push_array(arena, nsn_os_thread_t,
-                                                    NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN);
-        plugin_set.plugins[i].active_channels = 0;
-        for(usize j = 0; j < array_count(plugin_set.plugins[i].streams); j++) {
-            plugin_set.plugins[i].streams[j].plugin_idx = UINT32_MAX;
-            plugin_set.plugins[i].streams[j].n_srcs = 0;
-            plugin_set.plugins[i].streams[j].n_sinks = 0;
-            for(usize k = 0; k < array_count(plugin_set.plugins[i].streams[j].sinks); k++) {
-                plugin_set.plugins[i].streams[j].sinks[k].sink_id = UINT32_MAX;
-            }
-        }
+        nsn_plugin_t *plugin = &plugin_set.plugins[i];
+        plugin->name = str_lit("udpsock");
+        plugin->thread_count = 0;
+        plugin->threads = mem_arena_push_array(arena, nsn_os_thread_t,
+                                        NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN);
+        plugin->active_channels = 0;
+        plugin->streams = list_head_init(plugin->streams);
+        nsn_os_mutex_init(&plugin->streams_lock);
+        plugin->stream_id_cnt = 0;
     }
 
     // init SIG_INT handler

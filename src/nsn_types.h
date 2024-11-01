@@ -128,6 +128,7 @@ struct list_head
 static inline void list_init(list_head_t *h)                        { h->next = h; h->prev = h; }
 static inline void list_add(list_head_t *h, list_head_t *n)         { n->next = h->next; n->prev = h; h->next->prev = n; h->next = n; }
 static inline void list_add_tail(list_head_t *h, list_head_t *n)    { n->next = h; n->prev = h->prev; h->prev->next = n; h->prev = n; }
+static inline void list_del(list_head_t *n)                         { n->next->prev = n->prev; n->prev->next = n->next; }
 static inline bool list_empty(list_head_t *h)                     { return h->next == h; }
 
 #ifndef typeof
