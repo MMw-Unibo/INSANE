@@ -162,13 +162,31 @@ nsn_os_mutex_unlock(struct nsn_mutex *mutex)
 }
 
 int
-nsn_os_conditional_variable_init(struct nsn_conditional_variable *cv)
+nsn_os_cnd_init(struct nsn_cnd *cv)
 {
     pthread_condattr_t attr;
     pthread_condattr_init(&attr);
     int result = pthread_cond_init(&cv->handle, &attr);
     pthread_condattr_destroy(&attr);
     return result;
+}
+
+int
+nsn_os_cnd_destroy(struct nsn_cnd *cv)
+{
+    return pthread_cond_destroy(&cv->handle);
+}
+
+int
+nsn_os_cnd_wait(struct nsn_cnd *cv, struct nsn_mutex *mutex)
+{
+    return pthread_cond_wait(&cv->handle, &mutex->handle);
+}
+
+int
+nsn_os_cnd_signal(struct nsn_cnd *cv)
+{
+    return pthread_cond_signal(&cv->handle);
 }
 
 // --- File --------------------------------------------------------------------

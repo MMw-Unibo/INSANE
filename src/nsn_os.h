@@ -103,7 +103,9 @@ int  nsn_os_mutex_init(struct nsn_mutex *mutex);
 void nsn_os_mutex_lock(struct nsn_mutex *mutex);
 void nsn_os_mutex_unlock(struct nsn_mutex *mutex);
 
-struct nsn_conditional_variable
+// conditional variable
+typedef struct nsn_cnd nsn_cnd_t;
+struct nsn_cnd
 {
 #if NSN_OS_LINUX
     pthread_cond_t handle;
@@ -112,9 +114,12 @@ struct nsn_conditional_variable
 #endif
 };
 
-// #define NSN_OS_INVALID_CONDITIONAL_VARIABLE_HANDLE ((struct nsn_conditional_variable){0})
+// #define NSN_OS_INVALID_CONDITIONAL_VARIABLE_HANDLE ((nsn_cnd_t){0})
 
-int nsn_os_conditional_variable_create(struct nsn_conditional_variable *cv);
+int nsn_os_cnd_create(nsn_cnd_t *cv);
+int nsn_os_cnd_destroy(nsn_cnd_t *cv);
+int nsn_os_cnd_wait(nsn_cnd_t *cv, nsn_mutex_t *mutex);
+int nsn_os_cnd_signal(nsn_cnd_t *cv);
 
 // --- File --------------------------------------------------------------------
 

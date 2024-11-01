@@ -501,6 +501,9 @@ struct nsn_dataplane_thread_args
     nsn_plugin_t      *plugin_data;
     int                max_tx_burst;
     int                max_rx_burst;
+    nsn_cnd_t          cv;
+    nsn_mutex_t        lock;
+    bool               dp_ready;
 };
 
 typedef struct nsn_thread_pool nsn_thread_pool_t;
@@ -641,6 +644,12 @@ wait:
     ops.init(&ctx, &ep_list);
     clean_ep_list(&ep_list, &data_arena);
 
+    // Signal that the datapath is ready
+    nsn_os_mutex_lock(&args->lock);
+    args->dp_ready = true;
+    nsn_os_cnd_signal(&args->cv);
+    nsn_os_mutex_unlock(&args->lock);
+
     // 3) Start the dataplane loop
     nsn_inner_stream_t *stream;
     while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_RUNNING) {
@@ -736,6 +745,11 @@ wait:
     state = at_load(&args->state, mo_rlx);
     log_debug("[thread %d] state: %s (%d)\n", self, nsn_dataplane_thread_state_str[state], state);
 
+    nsn_os_mutex_lock(&args->lock);
+    args->dp_ready = false;
+    nsn_os_cnd_signal(&args->cv);
+    nsn_os_mutex_unlock(&args->lock);
+
     if (state == NSN_DATAPLANE_THREAD_STATE_WAIT)
     {
         log_debug("[thread %d] moving to wait state\n", self);
@@ -827,7 +841,7 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
 
         // Add the sink to the stream
         nsn_os_mutex_lock(&stream->sinks_lock);
-        list_add_tail(&sink->node, &stream->sinks);
+        list_add_tail(&stream->sinks, &sink->node);
         nsn_os_mutex_unlock(&stream->sinks_lock);
     }
     
@@ -851,6 +865,12 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         }
         // start the thread
         at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+        // wait for the initialization to complete
+        nsn_os_mutex_lock(&dp_args->lock);
+        while (!dp_args->dp_ready) {
+            nsn_os_cnd_wait(&dp_args->cv, &dp_args->lock);
+        }
+        nsn_os_mutex_unlock(&dp_args->lock);
     } 
     // If the PLUGIN is running, but this is the first channel in the STREAM,
     // we must tell the PLUGIN to update the STREAM state.
@@ -932,20 +952,34 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
             return -5;
         }
 
-        // Remove the sink from the stream and update the number of sinks in the stream
+        // Ref count of the channels (src/snk) active in the stream
+        --plugin->active_channels;
+
+        // Update the number of sinks in the stream: stop receiving if this was the last one
+        atomic_fetch_sub(&stream->n_sinks, 1);
+       
+        // Remove the sink from the stream's sink list
         nsn_os_mutex_lock(&stream->sinks_lock);
         list_del(&sink->node);
-        atomic_fetch_sub(&stream->n_sinks, 1);
         nsn_os_mutex_unlock(&stream->sinks_lock);
 
         free(sink);
     } else {
+        // Ref count of the channels (src/snk) active in the stream
+        --plugin->active_channels;
+
+        // Ensure we are not leaving packets unsent (this was the last channel and the ring will be destroyed)
+        // FIXME: we should make this asyncrhonous, as it might take time, during which other apps are blocked!
+        if(!plugin->active_channels) {
+            while(nsn_ringbuf_count(stream->tx_prod) > 0) {
+                nsn_pause();
+            }
+        }
+
+        // Update the number of srcs in the stream: stop sending if this was the last one
         atomic_fetch_sub(&stream->n_srcs, 1);
     }
-
-    // Ref count of the channels (src/snk) active in the stream
-    --plugin->active_channels;
-    
+   
     // if the stream has no more active channels, stop the data plane thread 
     // (which remains attached to the plugin, until we implement a thread pool manager)
     // (ideally, the thread should go back into the pool)
@@ -953,7 +987,14 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     uint32_t thread_idx = plugin_idx;
     struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
     if(!plugin->active_channels) {
+        // pause the dp thread
         at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
+        // wait for the thread to switch to the wait state
+        nsn_os_mutex_lock(&dp_args->lock);
+        while (dp_args->dp_ready) {
+            nsn_os_cnd_wait(&dp_args->cv, &dp_args->lock);
+        }
+        nsn_os_mutex_unlock(&dp_args->lock);
     } 
     // In case the plugin is still running but this stream has no more active channels,
     // we must tell the plugin to delete the stream state
@@ -1509,8 +1550,11 @@ main(int argc, char *argv[])
         log_trace("creating thread %d\n", i);
         thread_pool.thread_args[i] = 
             (struct nsn_dataplane_thread_args){ .state = NSN_DATAPLANE_THREAD_STATE_WAIT,
+                                                .dp_ready = false,
                                                 .max_tx_burst = max_tx_burst,
                                                 .max_rx_burst = max_rx_burst };
+        nsn_os_mutex_init(&thread_pool.thread_args[i].lock);
+        nsn_os_cnd_init(&thread_pool.thread_args[i].cv);
         thread_pool.threads[i] = nsn_os_thread_create(dataplane_thread_proc, &thread_pool.thread_args[i]);
         if (thread_pool.threads[i].handle == 0) {
             log_error("Failed to create thread %d\n", i);

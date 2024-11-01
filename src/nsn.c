@@ -203,8 +203,8 @@ nsn_init()
 
     // set a timeout for the socket
     struct timeval tv;
-    tv.tv_sec  = 0;
-    tv.tv_usec = 25000; //TODO: Why on some machines it takes forever? 5ms should be far enough!
+    tv.tv_sec  = 5;
+    tv.tv_usec = 0;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
     // send a message to the daemon to create a new instance
@@ -768,7 +768,7 @@ nsn_buffer_t nsn_get_buffer(size_t size, int flags) {
     }
 
     uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
-    printf("Got iobuf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
+    // printf("Got iobuf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
     buf.data      = data + INSANE_HEADER_LEN;
     buf.len = tx_buf_size;
 
@@ -804,7 +804,7 @@ int nsn_emit_data(nsn_source_t source, nsn_buffer_t buf) {
     while(nsn_ringbuf_enqueue_burst(str->tx_prod, &buf.index, sizeof(buf.index), 1, NULL) == 0) {
         SPIN_LOOP_PAUSE();
     }
-    printf("Emitted iobuf #%lu\n", buf.index);
+    // printf("Emitted iobuf #%lu\n", buf.index);
 
     return buf.index;
 }
