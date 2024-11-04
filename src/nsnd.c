@@ -908,7 +908,7 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     }
     if(app_idx > app_pool.count) {
         log_error("app %d not found in the pool\n", app_id);
-        return -1;
+        return 1;
     }
 
     // Check plugin id and retrieve the plugin
@@ -916,7 +916,7 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     uint32_t plugin_idx = reply->plugin_idx;
     if (plugin_idx >= plugin_set.count) {
         log_error("plugin index is out of bound\n");
-        return -2;
+        return 2;
     } 
     nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
     
@@ -930,7 +930,7 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     }
     if (!stream) {
         log_error("stream %d not found in the plugin\n", stream_idx);
-        return -3;
+        return 3;
     }
 
     if (type == NSN_CHANNEL_TYPE_SINK) {
@@ -942,14 +942,14 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
         }
         if(!sink) {
             log_error("sink %d not found in the stream\n", ((nsn_cmsg_create_sink_t *)(cmsghdr + 1))->sink_id);
-            return -4;
+            return 4;
         }     
         
         nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
         int err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(sink->rx_cons->name));
         if (err < 0) {
             log_error("Failed to destroy the rx_cons ring\n");
-            return -5;
+            return 5;
         }
 
         // Ref count of the channels (src/snk) active in the stream
@@ -964,18 +964,16 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
         nsn_os_mutex_unlock(&stream->sinks_lock);
 
         free(sink);
-    } else {
+    } else {        
+        // Ensure we are not leaving packets unsent (this was the last channel and the ring will be destroyed)
+        u32 nb_pk = 0;
+        if(plugin->active_channels - 1 == 0 && (nb_pk = nsn_ringbuf_count(stream->tx_prod)) > 0) {
+            // The caller will try again later
+            log_trace("destroy last src detected %u pending packets: retry\n", nb_pk);
+            return EINVAL;
+        }
         // Ref count of the channels (src/snk) active in the stream
         --plugin->active_channels;
-
-        // Ensure we are not leaving packets unsent (this was the last channel and the ring will be destroyed)
-        // FIXME: we should make this asyncrhonous, as it might take time, during which other apps are blocked!
-        if(!plugin->active_channels) {
-            while(nsn_ringbuf_count(stream->tx_prod) > 0) {
-                nsn_pause();
-            }
-        }
-
         // Update the number of srcs in the stream: stop sending if this was the last one
         atomic_fetch_sub(&stream->n_srcs, 1);
     }

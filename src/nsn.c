@@ -595,20 +595,33 @@ nsn_destroy_source(nsn_source_t source) {
     msg->stream_idx = streams[sources[source_idx].stream]._idx;
     msg->source_id  = sources[source_idx].id;
 
-    sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_source_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+    byte *reply = mem_arena_push_array(temp.arena, byte, 4096);
+    nsn_cmsg_hdr_t *replyhdr = (nsn_cmsg_hdr_t *)reply;
 
-    if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
-        fprintf(stderr, "failed to create source with error '%s', is it running?\n", strerror(errno));
-        ok = -1;
-        goto clean_and_exit;
-    } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
-        int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-        fprintf(stderr, "failed to create source with error '%d'\n", error); 
-        ok = -1;
-        goto clean_and_exit;
+   bool stop = false;
+   int ret;
+   while (!stop) {
+        sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_source_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+        
+        ret = recvfrom(sockfd, reply, 4096, 0, NULL, NULL);
+        if (ret == -1) {
+            fprintf(stderr, "failed to destroy source with error '%s', is it running?\n", strerror(errno));
+            ok = -1;
+            goto clean_and_exit;
+        } else if (replyhdr->type == NSN_CMSG_TYPE_ERROR) {
+            int error = *(int *)(reply + sizeof(nsn_cmsg_hdr_t));
+            if (error == -EINVAL) {
+                // retry
+                continue;
+            }
+            fprintf(stderr, "failed to destroy source with error '%d'\n", error); 
+            ok = -1;
+            goto clean_and_exit;
+        }
+        stop = true;
     }
 
-    // If we receive no error, we can proceed to the destruction of the source
+    // We can proceed to the destruction of the source
     sources[source_idx].id = NSN_INVALID_SRC;
     sources[source_idx].is_active = false;
     sources[source_idx].stream = NSN_INVALID_STREAM_HANDLE;
