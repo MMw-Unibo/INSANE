@@ -681,7 +681,7 @@ wait:
             if(nbufs > 0) {
                 int tx_count = ops.tx(io_indexes, nbufs, &stream->ep);
                 if (tx_count < 0) {
-                    log_error("[thread %d] Failed to transmit\n", self);
+                    log_error("[thread %d] Failed to transmit\n");
                 } 
             }
         }
@@ -707,7 +707,7 @@ wait:
                 nsn_os_mutex_lock(&stream->sinks_lock);
                 list_for_each_entry(sink, &stream->sinks, node) {
                     if (sink->sink_id == hdr->channel_id) {
-                        log_debug("pkt received on channel %u\n", self, hdr->channel_id);
+                        log_debug("pkt received on channel %u\n", hdr->channel_id);
                         if (nsn_ringbuf_enqueue_burst(sink->rx_cons, &io_buffs[j].index, sizeof(io_buffs[j].index), 1, NULL) == 0) {
                             log_error("[thread %d] Failed to enqueue pkt to sink\n", self);
                         }
