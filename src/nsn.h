@@ -32,7 +32,7 @@ typedef struct nsn_buffer {
 
 //--------------------------------------------------------------------------------------------------
 
-static inline int nsn_buffer_is_valid(nsn_buffer_t *buf) { return buf->data != NULL; }
+static inline int nsn_buffer_is_valid(nsn_buffer_t *buf) { return buf->len != 0; }
 
 //--------------------------------------------------------------------------------------------------
 // QoS options

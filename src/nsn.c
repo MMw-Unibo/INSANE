@@ -861,9 +861,10 @@ nsn_buffer_t nsn_consume_data(nsn_sink_t sink, int flags) {
     }
 
     uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
-    printf("Received on buf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
+    usize   len   = ((nsn_meta_t*)(tx_buf_meta + 1) + buf.index)->len;
     buf.data      = data + INSANE_HEADER_LEN;
-    buf.len = ((nsn_meta_t*)(tx_buf_meta + 1) + buf.index)->len - INSANE_HEADER_LEN; 
+    buf.len = len - INSANE_HEADER_LEN; 
+    printf("Received on buf #%lu, data %p, len %lu\n", buf.index, data, buf.len);
 
     return buf;
 }

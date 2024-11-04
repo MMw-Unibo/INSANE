@@ -196,21 +196,21 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
             sleep(params->sleep_time);
         }
 
-        buf_send  = nsn_get_buffer(params->payload_size, 0);
+        buf_send  = nsn_get_buffer(params->payload_size, NSN_BLOCKING);
         send_time = get_clock_realtime_ns();
         if (nsn_buffer_is_valid(&buf_send)) {
             data          = (struct test_data *)buf_send.data;
             data->cnt     = counter++;
             data->tx_time = send_time;
-            buf_send.len  = sizeof(*data);
+            buf_send.len  = params->payload_size;
             strncpy(data->msg, msg, msg_len);
             nsn_emit_data(source, buf_send);
-            // LOG_TRACE("(%d) time: %ld (%ld)", counter, send_time);
 
-            buf_recv      = nsn_consume_data(sink, 0);
+            buf_recv      = nsn_consume_data(sink, NSN_BLOCKING);
             response_time = get_clock_realtime_ns();
             latency       = response_time - send_time;
             nsn_release_data(buf_recv);
+            
             fprintf(stdout, "%.3f\n", (float)latency / 1000.0f);
         }
     }
@@ -227,20 +227,14 @@ void do_pong(nsn_stream_t *stream, test_config_t *params) {
     nsn_sink_t   sink   = nsn_create_sink(stream, params->app_source_id, NULL);
     nsn_source_t source = nsn_create_source(stream, params->app_source_id);
 
-    nsn_buffer_t buf_recv, buf_send;
+    nsn_buffer_t buf;
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
-        buf_send = nsn_get_buffer(1024, 0);
-        buf_recv = nsn_consume_data(sink, 0);
-        log_trace("Forwarding sample %d to buffer idx=%d\n",
-                  ((struct test_data *)buf_recv.data)->cnt, buf_send.index);
-
-        if (nsn_buffer_is_valid(&buf_send)) {
-            // TODO(lr): Design a "splicing" mechanism to avoid this copy
-            memcpy(buf_send.data, buf_recv.data, buf_recv.len);
-            buf_send.len = buf_recv.len;
-            nsn_emit_data(source, buf_send);
+        buf = nsn_consume_data(sink, NSN_BLOCKING);
+        fprintf(stderr, "Forwarding sample %lu to buffer idx=%lu\n",
+                  ((struct test_data *)buf.data)->cnt, buf.index);
+        if (nsn_buffer_is_valid(&buf)) {
+            nsn_emit_data(source, buf);
         }
-        nsn_release_data(buf_recv);
         counter++;
     }
 
