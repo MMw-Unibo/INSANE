@@ -558,7 +558,9 @@ dataplane_thread_proc(void *arg)
     this_thread.is_main_thread   = false;
     nsn_thread_set_ctx(&this_thread);
 
+#ifdef NSN_ENABLE_LOGGER
     int self = nsn_os_current_thread_id();
+#endif
     u32 state;
 
     temp_mem_arena_t data_arena = nsn_thread_scratch_begin(NULL, 0);
@@ -1365,8 +1367,9 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
     }
 
     if (send_reply) {  
-        if (sendto(sockfd, cmsghdr, reply_len, 0, (struct sockaddr *)&temp_addr, temp_len) < 0)
+        if (sendto(sockfd, cmsghdr, reply_len, 0, (struct sockaddr *)&temp_addr, temp_len) < 0) {
             log_error("error sending reply to app %d (%s): %s\n", app_id, temp_addr.sun_path, strerror(errno));
+        }
     }   
 
 clean_and_next: 
@@ -1429,20 +1432,8 @@ main(int argc, char *argv[])
     main_thread.is_main_thread   = true;
     nsn_thread_set_ctx(&main_thread);
 
-    logger_init(NULL);
-    logger_set_level(LOGGER_LEVEL_TRACE);
-
-    os_init();
-    printf("### INSANE stats:\n"
-           "  - CPU frequency: %ld\n"
-           "  - sizeof(nsn_zone): %ld\n"
-           "  - sizeof(nsn_ringbuf): %ld\n"
-           "  - sizeof(nsn_ringbuf_pool): %ld\n",
-           cpu_hz, sizeof(nsn_mm_zone_t), sizeof(nsn_ringbuf_t), sizeof(nsn_ringbuf_pool_t));
-
     instance_id   = nsn_os_get_process_id();
-    state_arena = mem_arena_alloc(megabytes(1));
-
+    state_arena   = mem_arena_alloc(megabytes(1));
     for (int i = 0; i < argc; i++)
         str_list_push(state_arena, &arg_list, str_cstr(argv[i]));
 
@@ -1457,10 +1448,33 @@ main(int argc, char *argv[])
 
     config = nsn_load_config(state_arena, config_filename);
     if (!config) {
-        log_error("Failed to load config file: " str_fmt "\n", str_varg(config_filename));
+        fprintf(stderr, "Failed to load config file: " str_fmt "\n", str_varg(config_filename));
         exit(1);
     }
  
+ #ifdef NSN_ENABLE_LOGGER
+    // Set the log level according to the config file
+    logger_init(NULL);
+    char* log_levels[] = {"error", "warn", "info", "debug", "trace"};
+    char  config_log_level[32];
+    string_t cfg_ll = str_cstr(config_log_level);
+    nsn_config_get_string(config, str_lit("global"), str_lit("log_level"), &cfg_ll);
+    for (usize i = 0; i < array_count(log_levels); i++) {
+        if (!strcmp(log_levels[i], to_cstr(cfg_ll))) {
+            logger_set_level(i);
+            break;    
+        }
+    }
+#endif
+
+    os_init();
+    printf("### INSANE stats:\n"
+           "  - CPU frequency: %ld\n"
+           "  - sizeof(nsn_zone): %ld\n"
+           "  - sizeof(nsn_ringbuf): %ld\n"
+           "  - sizeof(nsn_ringbuf_pool): %ld\n",
+           cpu_hz, sizeof(nsn_mm_zone_t), sizeof(nsn_ringbuf_t), sizeof(nsn_ringbuf_pool_t));
+
     int app_num      = 64;
     int io_bufs_num  = NSN_CFG_DEFAULT_IO_BUFS_NUM;
     int io_bufs_size = NSN_CFG_DEFAULT_IO_BUFS_SIZE;   
@@ -1566,8 +1580,9 @@ main(int argc, char *argv[])
     struct nsn_dataplane_thread_args cp_args = { .state = NSN_DATAPLANE_THREAD_STATE_WAIT  };
     while (g_running) 
     {
-        if (main_thread_control_ipc(sockfd, mem_cfg, &cp_args, 1) < 0)
+        if (main_thread_control_ipc(sockfd, mem_cfg, &cp_args, 1) < 0) {
             log_warn("Failed to handle control ipc\n");
+        }
 
         usleep(1);
     }
