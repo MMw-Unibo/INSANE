@@ -4,6 +4,20 @@ CFLAGS="-g -Wall -Wextra -Werror -std=c11 -fPIC -Wno-unused-function -Wno-unused
 
 DPDK=`pkg-config --cflags --libs libdpdk --static`
 
+BUILD_TYPE=debug
+
+if [ $# -eq 1 ]; then
+    BUILD_TYPE=$1
+fi
+
+if [ $BUILD_TYPE = "debug" ]; then
+    DEFINES="$DEFINES -DDEBUG -DNSN_ENABLE_LOGGER"
+elif [ $BUILD_TYPE = "release" ]; then
+    CFLAGS="$CFLAGS -O3"
+else
+    echo "Invalid build type: $BUILD_TYPE"
+    exit 1
+fi
 # $CC $CFLAGS -c dpdk.c -o dpdk.o
 # $CC $CFLAGS -shared -o libdpdk.so dpdk.o $DPDK 
 

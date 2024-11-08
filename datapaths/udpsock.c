@@ -59,7 +59,7 @@ NSN_DATAPATH_UPDATE(udpsock)
         // initialize the state of the endpoint 
         struct udpsock_ep *conn = (struct udpsock_ep *)endpoint->data;
         // Source address is the local_ip (config file)
-        strncpy(conn->s_addr, local_ip, strlen(local_ip));
+        strcpy(conn->s_addr, local_ip);
         // Source port is the app_id
         conn->s_port = endpoint->app_id;
         if (conn->s_port == 0) {
