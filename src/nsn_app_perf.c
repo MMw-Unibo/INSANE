@@ -182,13 +182,18 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
     nsn_sink_t   sink   = nsn_create_sink(stream, params->app_source_id, NULL);
     nsn_source_t source = nsn_create_source(stream, params->app_source_id);
 
-    char  *msg     = MSG;
-    size_t msg_len = strlen(MSG);
+    // char  *msg     = MSG;
+    // size_t msg_len = strlen(MSG);
 
     uint64_t          counter = 0;
     struct test_data *data;
     nsn_buffer_t      buf_recv, buf_send;
     uint64_t          send_time, response_time, latency;
+
+    if(params->payload_size < sizeof(struct test_data)) {
+        fprintf(stderr, "Payload size too small\n");
+        return;
+    }
 
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
@@ -198,21 +203,24 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
 
         buf_send  = nsn_get_buffer(params->payload_size, NSN_BLOCKING);
         send_time = get_clock_realtime_ns();
-        if (nsn_buffer_is_valid(&buf_send)) {
-            data          = (struct test_data *)buf_send.data;
-            data->cnt     = counter++;
-            data->tx_time = send_time;
-            buf_send.len  = params->payload_size;
-            strncpy(data->msg, msg, msg_len);
-            nsn_emit_data(source, buf_send);
-
-            buf_recv      = nsn_consume_data(sink, NSN_BLOCKING);
-            response_time = get_clock_realtime_ns();
-            latency       = response_time - send_time;
-            nsn_release_data(buf_recv);
-            
-            fprintf(stdout, "%.3f\n", (float)latency / 1000.0f);
+        if (nsn_unlikely(!nsn_buffer_is_valid(&buf_send))) {
+            fprintf(stderr, "Failed to get buffer\n");
+            continue;
         }
+        
+        data          = (struct test_data *)buf_send.data;
+        data->cnt     = counter++;
+        data->tx_time = send_time;
+        buf_send.len  = params->payload_size;
+        // strncpy(data->msg, msg, msg_len);
+        nsn_emit_data(source, buf_send);
+
+        buf_recv      = nsn_consume_data(sink, NSN_BLOCKING);
+        response_time = get_clock_realtime_ns();
+        latency       = response_time - send_time;
+        nsn_release_data(buf_recv);
+        
+        fprintf(stdout, "%.3f\n", (float)latency / 1000.0f);
     }
 
     nsn_destroy_sink(sink);
@@ -230,11 +238,13 @@ void do_pong(nsn_stream_t *stream, test_config_t *params) {
     nsn_buffer_t buf;
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
         buf = nsn_consume_data(sink, NSN_BLOCKING);
-        fprintf(stderr, "Forwarding sample %lu to buffer idx=%lu\n",
-                  ((struct test_data *)buf.data)->cnt, buf.index);
-        if (nsn_buffer_is_valid(&buf)) {
-            nsn_emit_data(source, buf);
+        if (nsn_unlikely(!nsn_buffer_is_valid(&buf))) {
+            fprintf(stderr, "Failing to receive. Continuing...\n");
+            continue;
         }
+        // fprintf(stderr, "Forwarding sample %lu idx=%lu\n",
+        //           ((struct test_data *)buf.data)->cnt, buf.index);
+        nsn_emit_data(source, buf);
         counter++;
     }
 

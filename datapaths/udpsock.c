@@ -20,6 +20,7 @@ struct udpsock_ep {
     char s_addr[UDP_SOCKET_ADDR_MAX]; 
     int  s_sockfd;
     struct sockaddr_in sock_addr;
+    nsn_buf_t pending_rx_buf;
 };
 
 static char*  local_ip;
@@ -39,6 +40,7 @@ NSN_DATAPATH_UPDATE(udpsock)
         if (conn->s_sockfd != -1) {
             close(conn->s_sockfd);
         }
+        nsn_ringbuf_enqueue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);       
         free(endpoint->data);
         endpoint->data = NULL;
     } 
@@ -63,6 +65,13 @@ NSN_DATAPATH_UPDATE(udpsock)
         if (conn->s_port == 0) {
             free(endpoint->data);
             fprintf(stderr, "[udpsock] invalid app_id %u\n", conn->s_port);
+            return -1;
+        }
+
+        // get a descriptor to receive
+        u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
+        if (np == 0) {
+            printf("[udpsock] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
             return -1;
         }
 
@@ -169,7 +178,9 @@ NSN_DATAPATH_TX(udpsock)
     }
 
     // Free the descriptors after using them
-    nsn_ringbuf_enqueue_burst(endpoint->free_slots, bufs, sizeof(bufs[0]), buf_count, NULL);
+    if(nsn_ringbuf_enqueue_burst(endpoint->free_slots, bufs, sizeof(bufs[0]), buf_count, NULL) < buf_count) {
+        fprintf(stderr, "[udpsock] Failed to enqueue %lu descriptors\n", buf_count);
+    }
 
     return tx_count;
 }
@@ -181,32 +192,28 @@ NSN_DATAPATH_RX(udpsock)
     isize ret = 0;
     usize i   = 0;
 
-    // get a descriptor
-    u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &bufs[i], sizeof(bufs[i]), 1, NULL);
-    if (np == 0) {
-        printf("[udpsock] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
-        return 0;
-    }
-
     // set the receive buffer
-    char *data =  (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size);    
+    bufs[i]     = ep_sk->pending_rx_buf;
+    char *data  = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size);    
     usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
 
     // In UDP, we receive 1 pkt per time - no burst receive
     if ((ret = recvfrom(ep_sk->s_sockfd, data, endpoint->io_bufs_size, 0, NULL, NULL)) > 0) {
+        // Update the pending tx descriptor
+        u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &ep_sk->pending_rx_buf, sizeof(ep_sk->pending_rx_buf), 1, NULL);
+        if (np == 0) {
+            printf("[udpsock] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+        }
+        // printf("[udpsock] Received %ld bytes idx = %lu\n", ret, bufs[i].index);
         // Set the size as packet metadata
         *size = ret;
         i++;
         *buf_count = *buf_count - 1;
-        printf("[udpsock] Received %ld bytes\n", ret);
     } else {
-        // TODO: This is not ideal: if the receive is -1 (no data), which is the most common case,
-        // we should re-enqueue the descriptor. Find a way to improve this.
-        nsn_ringbuf_enqueue_burst(endpoint->free_slots, &bufs[i], sizeof(bufs[i]), 1, NULL);       
         if( 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             // Something failed 
             printf("recvfrom() failed: %s\n", strerror(errno));        
-            return 0;
+            return i;
         }
     } 
 

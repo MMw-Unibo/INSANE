@@ -203,8 +203,8 @@ nsn_init()
 
     // set a timeout for the socket
     struct timeval tv;
-    tv.tv_sec  = 5;
-    tv.tv_usec = 0;
+    tv.tv_sec  = 0;
+    tv.tv_usec = 50000;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
     // send a message to the daemon to create a new instance
@@ -738,12 +738,12 @@ nsn_destroy_sink(nsn_sink_t sink) {
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_sink_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
 
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
-        fprintf(stderr, "failed to create sink with error '%s', is it running?\n", strerror(errno));
+        fprintf(stderr, "failed to destroy sink with error '%s', is it running?\n", strerror(errno));
         ok = -1;
         goto clean_and_exit;
     } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
         int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-        fprintf(stderr, "failed to create sink with error '%d'\n", error); 
+        fprintf(stderr, "failed to destroy sink with error '%d'\n", error); 
         ok = -1;
         goto clean_and_exit;
     }
@@ -783,7 +783,7 @@ nsn_buffer_t nsn_get_buffer(size_t size, int flags) {
     uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
     // printf("Got iobuf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
     buf.data      = data + INSANE_HEADER_LEN;
-    buf.len = tx_buf_size;
+    buf.len       = tx_buf_size - INSANE_HEADER_LEN;
 
     return buf;
 }
@@ -863,8 +863,8 @@ nsn_buffer_t nsn_consume_data(nsn_sink_t sink, int flags) {
     uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
     usize   len   = ((nsn_meta_t*)(tx_buf_meta + 1) + buf.index)->len;
     buf.data      = data + INSANE_HEADER_LEN;
-    buf.len = len - INSANE_HEADER_LEN; 
-    printf("Received on buf #%lu, data %p, len %lu\n", buf.index, data, buf.len);
+    buf.len       = len - INSANE_HEADER_LEN; 
+    // printf("Received on buf #%lu, data %p, len %lu\n", buf.index, data, buf.len);
 
     return buf;
 }

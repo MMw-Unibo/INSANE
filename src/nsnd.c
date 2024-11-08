@@ -129,10 +129,10 @@ nsn_ringbuf_pool_t* nsn_memory_manager_get_ringbuf_pool(nsn_mem_manager_t* mem) 
 
 // @param pool: the pool of ring buffers
 // @param ring_name: the name of the ring buffer
-// @param count: the number of elements in the ring buffer
 // @return: a pointer to the ring buffer
+// The size of each ring is fixed and set at pool creation
 nsn_ringbuf_t * 
-nsn_memory_manager_create_ringbuf(nsn_ringbuf_pool_t* pool, string_t ring_name, u32 count) {
+nsn_memory_manager_create_ringbuf(nsn_ringbuf_pool_t* pool, string_t ring_name) {
 
     if(pool->free_slots_count == 0) {
         log_error("No more free slots in the ring buffer pool\n");
@@ -155,7 +155,7 @@ nsn_memory_manager_create_ringbuf(nsn_ringbuf_pool_t* pool, string_t ring_name, 
     // create the ring buffer in the shared memory
     char* ring_data = (char*)(ring_tracker + pool->count);  
     usize ring_size = sizeof(nsn_ringbuf_t) + (pool->ecount * pool->esize);
-    nsn_ringbuf_t* ring = nsn_ringbuf_create(&ring_data[slot*ring_size], ring_name, count);
+    nsn_ringbuf_t* ring = nsn_ringbuf_create(&ring_data[slot*ring_size], ring_name, pool->ecount);
 
     // fill in the descriptorsfor this ring in the pool    
     pool->free_slots_count--;
@@ -286,14 +286,14 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
         return NULL;
     }
 
-    // Create a pool of ring buffers inside the ring zone
-    usize max_rings = 16;
-    nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_create_ringbuf_pool(mem, str_lit(NSN_CFG_DEFAULT_RINGS_ZONE_NAME), max_rings, sizeof(usize), cfg->io_buffer_pool_size);
+    // Create a pool of ring buffers inside the ring zone. In the current design, all the rings have the same size.
+    // TODO: The free_slots can be split into a tx/rx couple of rings, if we decide to keep both the tx and rx memory areas separated. Now we keep 1 zone for slots (tx_zone) and 1 ring for its indexing (NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME).
+    usize max_rings = 8;
+    usize total_free_slots = /*2 * */cfg->io_buffer_pool_size;
+    nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_create_ringbuf_pool(mem, str_lit(NSN_CFG_DEFAULT_RINGS_ZONE_NAME), max_rings, sizeof(usize), total_free_slots);
 
     // Create the ring that keeps the free slot descriptors.
-    // TODO: The free_slots can be split into a tx/rx couple of rings, if we decide to keep both the tx and rx memory areas separated. Now we keep 1 zone for slots (tx_zone) and 1 ring for its indexing (NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME).
-    usize total_free_slots = /*2 * */cfg->io_buffer_pool_size;
-    nsn_ringbuf_t *free_slots_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME), total_free_slots);
+    nsn_ringbuf_t *free_slots_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME));
     if (!free_slots_ring) {
         log_error("Failed to create the free_slots ring\n");
         // TODO: Should we clean the things we created so far? E.g., zones etc?
@@ -622,8 +622,8 @@ wait:
     ctx.max_rx_burst = args->max_rx_burst;
 
     // 1c) TODO: Retrieve the list of peer's IPs from the config file
-    ctx.n_peers = 2;
-    char* config_file[] = {"10.0.0.212", "10.0.0.213"};
+    ctx.n_peers = 1;
+    char* config_file[] = {"10.0.0.212"};
 
     ctx.peers = mem_arena_push(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers);
     bzero(ctx.peers, sizeof(ctx.peers) * ctx.n_peers);
@@ -828,7 +828,7 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         // Create the ring
         snprintf(reply_snk->rx_cons, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "rx_cons_%u_%u", (u32)reply_snk->stream_idx, (u32)reply_snk->sink_id);
         nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
-        nsn_ringbuf_t *rx_cons_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(reply_snk->rx_cons), NSN_CFG_DEFAULT_RX_RING_SIZE);
+        nsn_ringbuf_t *rx_cons_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_cstr(reply_snk->rx_cons));
         if (!rx_cons_ring) {
             log_error("Failed to create the rx_cons ring\n", rx_cons_ring);
             return -3;
@@ -923,47 +923,49 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     // Check stream id and retrieve the stream
     uint32_t stream_idx = (uint32_t)reply->stream_idx;
     nsn_inner_stream_t *stream;
+    nsn_os_mutex_lock(&plugin->streams_lock);
     list_for_each_entry(stream, &plugin->streams, node) {
         if (stream->idx == stream_idx) {
             break;
         }
     }
+    nsn_os_mutex_unlock(&plugin->streams_lock);
     if (!stream) {
         log_error("stream %d not found in the plugin\n", stream_idx);
         return 3;
     }
 
     if (type == NSN_CHANNEL_TYPE_SINK) {
-        nsn_inner_sink_t *sink;
+        nsn_inner_sink_t *sink, *dead_sink;
+        nsn_os_mutex_lock(&stream->sinks_lock);
         list_for_each_entry(sink, &stream->sinks, node) {
             if(sink->sink_id == ((nsn_cmsg_create_sink_t *)(cmsghdr + 1))->sink_id) {
+                // Ref count of the channels (src/snk) active in the stream
+                --plugin->active_channels;
+                // Update the number of sinks in the stream: stop receiving if this was the last one
+                atomic_fetch_sub(&stream->n_sinks, 1);
+                // Remove the sink from the list
+                list_del(&sink->node);
+                dead_sink = sink;
                 break;
             }
         }
-        if(!sink) {
+        nsn_os_mutex_unlock(&stream->sinks_lock);
+        if(!dead_sink) {
             log_error("sink %d not found in the stream\n", ((nsn_cmsg_create_sink_t *)(cmsghdr + 1))->sink_id);
             return 4;
         }     
         
+        // Free the ring buffer
         nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
-        int err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(sink->rx_cons->name));
+        int err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_cstr(dead_sink->rx_cons->name));
         if (err < 0) {
             log_error("Failed to destroy the rx_cons ring\n");
             return 5;
         }
 
-        // Ref count of the channels (src/snk) active in the stream
-        --plugin->active_channels;
-
-        // Update the number of sinks in the stream: stop receiving if this was the last one
-        atomic_fetch_sub(&stream->n_sinks, 1);
-       
-        // Remove the sink from the stream's sink list
-        nsn_os_mutex_lock(&stream->sinks_lock);
-        list_del(&sink->node);
-        nsn_os_mutex_unlock(&stream->sinks_lock);
-
-        free(sink);
+        // Destroy the sink
+        free(dead_sink);
     } else {        
         // Ensure we are not leaving packets unsent (this was the last channel and the ring will be destroyed)
         u32 nb_pk = 0;
@@ -1129,7 +1131,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // The tx_prod is created here for this plugin, allowing all the sources to send data to the plugin.
             snprintf(reply->tx_prod, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%d", app_id);            
             nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
-            nsn_ringbuf_t *tx_prod_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(reply->tx_prod), NSN_CFG_DEFAULT_TX_RING_SIZE);
+            nsn_ringbuf_t *tx_prod_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_cstr(reply->tx_prod));
             if (!tx_prod_ring) {
                 log_error("Failed to create the tx_prod ring\n", tx_prod_ring);
                 // clean the stream

@@ -32,7 +32,7 @@ main(void)
     // Set the desired QoS
     nsn_options_t opts;
     opts.consumption = NSN_QOS_CONSUMPTION_POLL;
-    opts.datapath = NSN_QOS_DATAPATH_DEFAULT;
+    opts.datapath    = NSN_QOS_DATAPATH_DEFAULT;
     opts.determinism = NSN_QOS_DETERMINISM_DEFAULT;
     opts.reliability = NSN_QOS_RELIABILITY_UNRELIABLE;
 
