@@ -193,7 +193,7 @@ nsn_init()
 
     char name[IPC_MAX_PATH_SIZE];
     snprintf(name, IPC_MAX_PATH_SIZE, "%s%d", NSND_TO_NSNAPP_IPC, app_id);
-    strncpy(nsn_app_addr.sun_path, name, sizeof(nsn_app_addr.sun_path) - 1);
+    strncpy(nsn_app_addr.sun_path, name, sizeof(nsn_app_addr.sun_path));
 
     if (bind(sockfd, (struct sockaddr *)&nsn_app_addr, sizeof(struct sockaddr_un)) < 0) {
         fprintf(stderr, "failed to bind to path %s: '%s'\n", name, strerror(errno));

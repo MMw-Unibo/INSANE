@@ -936,7 +936,7 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     }
 
     if (type == NSN_CHANNEL_TYPE_SINK) {
-        nsn_inner_sink_t *sink, *dead_sink;
+        nsn_inner_sink_t *sink, *dead_sink = NULL;
         nsn_os_mutex_lock(&stream->sinks_lock);
         list_for_each_entry(sink, &stream->sinks, node) {
             if(sink->sink_id == ((nsn_cmsg_create_sink_t *)(cmsghdr + 1))->sink_id) {
