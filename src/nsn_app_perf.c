@@ -116,7 +116,7 @@ void do_source(nsn_stream_t *stream, test_config_t *params) {
 
             data->tx_time = tx_time;
             data->cnt     = counter++;
-            strncpy(data->msg, msg, strlen(msg));
+            strncpy(data->msg, msg, strlen(msg) + 1);
 
             buf.len = params->payload_size;
 
@@ -137,7 +137,7 @@ void do_source(nsn_stream_t *stream, test_config_t *params) {
 void do_sink(nsn_stream_t *stream, test_config_t *params) {
 
     nsn_sink_t sink = nsn_create_sink(stream, params->app_source_id, NULL);
-    uint64_t   first_time, last_time;
+    uint64_t   first_time = 0, last_time = 0;
 
     printf("Ready to receive packets\n");
     uint64_t counter = 0;

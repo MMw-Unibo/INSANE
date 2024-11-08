@@ -190,7 +190,6 @@ nsn_init()
 
     nsn_app_addr.sun_family = AF_UNIX;
     
-
     char name[IPC_MAX_PATH_SIZE];
     snprintf(name, IPC_MAX_PATH_SIZE, "%s%d", NSND_TO_NSNAPP_IPC, app_id);
     strncpy(nsn_app_addr.sun_path, name, sizeof(nsn_app_addr.sun_path));
