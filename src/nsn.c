@@ -89,7 +89,7 @@ signal_handler(int signum)
         if (n_src > 0) {
             for (uint32_t i = 0; i < array_count(sources); ++i) {
                 if (sources[i].is_active) {
-                    printf("Destroying source %d\n", sources[i].id);
+                    log_info("Destroying source %d\n", sources[i].id);
                     nsn_destroy_source(sources[i].id);
                 }
             }
@@ -97,7 +97,7 @@ signal_handler(int signum)
         if (n_snk > 0) {
             for (uint32_t i = 0; i < array_count(sinks); ++i) {
                 if (sinks[i].is_active) {
-                    printf("Destroying sink %d\n", sinks[i].id);
+                    log_info("Destroying sink %d\n", sinks[i].id);
                     nsn_destroy_sink(sinks[i].id);
                 }
             }
@@ -106,7 +106,7 @@ signal_handler(int signum)
         if (n_str > 0) {
             for (uint32_t i = 0; i < array_count(streams); ++i) {
                 if (streams[i].is_active) {
-                    printf("Destroying stream %d\n", streams[i].stream_id);
+                    log_info("Destroying stream %d\n", streams[i].stream_id);
                     nsn_destroy_stream(streams[i].stream_id);
                 }
             }
@@ -180,6 +180,21 @@ nsn_init()
     nsn_cfg_t *config = nsn_load_config(arena, str_lit(NSN_APP_DEFAULT_CONFIG_FILE));
     nsn_config_get_int(config, str_lit("app"), str_lit("l4_port"), &app_id);
 
+ #ifdef NSN_ENABLE_LOGGER
+    // Set the log level according to the config file
+    logger_init(NULL);
+    char* log_levels[] = {"error", "warn", "info", "debug", "trace"};
+    char  config_log_level[32];
+    string_t cfg_ll = str_cstr(config_log_level);
+    nsn_config_get_string(config, str_lit("app"), str_lit("log_level"), &cfg_ll);
+    for (usize i = 0; i < array_count(log_levels); i++) {
+        if (!strcmp(log_levels[i], to_cstr(cfg_ll))) {
+            logger_set_level(i);
+            break;    
+        }
+    }
+#endif
+
     temp_mem_arena_t temp = temp_mem_arena_begin(arena);
 
     // open a connection with the insance of the nsn daemon
@@ -195,7 +210,7 @@ nsn_init()
     strncpy(nsn_app_addr.sun_path, name, sizeof(nsn_app_addr.sun_path));
 
     if (bind(sockfd, (struct sockaddr *)&nsn_app_addr, sizeof(struct sockaddr_un)) < 0) {
-        fprintf(stderr, "failed to bind to path %s: '%s'\n", name, strerror(errno));
+        log_error("failed to bind to path %s: '%s'\n", name, strerror(errno));
         goto exit_error;
         return -1;
     }
@@ -219,13 +234,13 @@ nsn_init()
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
     
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
-        fprintf(stderr, "failed to connect to nsnd with error '%s', is it running?\n", strerror(errno));
+        log_error("failed to connect to nsnd with error '%s', is it running?\n", strerror(errno));
         goto exit_error;
     }
 
     if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
         int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-        fprintf(stderr, "failed to connect to nsnd with error '%d'\n", error); 
+        log_error("failed to connect to nsnd with error '%d'\n", error); 
         goto exit_error;
     }
 
@@ -240,10 +255,10 @@ nsn_init()
 
     shm = nsn_shm_attach(arena, resp->shm_name, resp->shm_size);
     if (shm == NULL) {
-        fprintf(stderr, "failed to attach to the shared memory segment\n");
+        log_error("failed to attach to the shared memory segment\n");
         goto exit_error;
     }
-    printf("connected to nsnd, the shm is at /dev/shm/%s, with size %zu\n", resp->shm_name, resp->shm_size);
+    log_info("connected to nsnd, the shm is at /dev/shm/%s, with size %zu\n", resp->shm_name, resp->shm_size);
 
     // // Lookup the free slots ring
     // char* ring_position = (char*)(shm->data + resp->free_slots_ring_offset);
@@ -251,7 +266,7 @@ nsn_init()
     // free_slots_ring = nsn_ringbuf_lookup(ring_position, str_lit(resp->free_slots_ring));
     // log_info("Found ring at %p\n", free_slots_ring);
     // if (free_slots_ring == NULL) {
-    //     fprintf(stderr, "failed to attach to the free slots ring\n");
+    //     log_error("failed to attach to the free slots ring\n");
     //     goto exit_error_close_shm;
     // }
 
@@ -348,13 +363,13 @@ nsn_close()
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
 
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
-        fprintf(stderr, "failed to disconnect from nsnd with error '%s', is it running?\n", strerror(errno));
+        log_error("failed to disconnect from nsnd with error '%s', is it running?\n", strerror(errno));
     } else {
         if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
             int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-            fprintf(stderr, "failed to disconnect from nsnd with error '%d'\n", error); 
+            log_error("failed to disconnect from nsnd with error '%d'\n", error); 
         } else {
-            printf("disconnected from nsnd\n");
+            log_info("disconnected from nsnd\n");
         }
     }
 
@@ -369,6 +384,11 @@ nsn_close()
 
     // release the memory arena
     mem_arena_release(arena);
+
+#ifdef NSN_ENABLE_LOGGER
+    // close the logger
+    logger_close();
+#endif
 
     return 0;
 }
@@ -414,11 +434,11 @@ nsn_create_stream(nsn_options_t opts)
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_stream_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
 
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
-        fprintf(stderr, "failed to create stream with error '%s', is it running?\n", strerror(errno));
+        log_error("failed to create stream with error '%s', is it running?\n", strerror(errno));
         goto exit;
     } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
         int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-        fprintf(stderr, "failed to create stream with error '%d'\n", error); 
+        log_error("failed to create stream with error '%d'\n", error); 
         goto exit;
     }
 
@@ -428,7 +448,7 @@ nsn_create_stream(nsn_options_t opts)
     streams[stream].tx_prod = nsn_lookup_ringbuf(rings_zone, str_lit(msg->tx_prod));
 
     if (streams[stream].tx_prod == NULL) {
-        fprintf(stderr, "stream failed to attach to the tx ring\n");
+        log_error("stream failed to attach to the tx ring\n");
         streams[stream].tx_prod = NULL;
         stream = NSN_INVALID_STREAM_HANDLE;       
         goto exit;
@@ -450,7 +470,7 @@ int
 nsn_destroy_stream(nsn_stream_t stream)
 {
     if (stream == NSN_INVALID_STREAM_HANDLE) {
-        fprintf(stderr, "invalid stream handle\n");
+        log_error("invalid stream handle\n");
         return -1;
     }
 
@@ -477,11 +497,11 @@ nsn_destroy_stream(nsn_stream_t stream)
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_stream_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
 
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
-        fprintf(stderr, "failed to destroy stream with error '%s', is it running?\n", strerror(errno));
+        log_error("failed to destroy stream with error '%s', is it running?\n", strerror(errno));
     } else {
         if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
             int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-            fprintf(stderr, "failed to destroy stream with error '%d'\n", error); 
+            log_error("failed to destroy stream with error '%d'\n", error); 
         } else {
             // clean up the stream descriptor
             streams[stream].is_active = false;
@@ -490,7 +510,7 @@ nsn_destroy_stream(nsn_stream_t stream)
             streams[stream].stream_id = NSN_INVALID_STREAM_HANDLE;
             streams[stream].tx_prod = NULL;
             n_str--;
-            printf("destroyed stream\n");
+            log_info("destroyed stream\n");
         }
     }
 
@@ -503,16 +523,16 @@ nsn_destroy_stream(nsn_stream_t stream)
 nsn_source_t 
 nsn_create_source(nsn_stream_t *stream, uint32_t source_id) {
     if (stream == NULL || *stream >= array_count(streams)) {
-        log_warn("invalid argument: stream\n");
+        log_error("invalid argument: stream\n");
         return NSN_INVALID_SRC;
     }
     if (source_id == NSN_INVALID_SRC) {
-        log_warn("invalid argument: source_id %u\n", source_id);
+        log_error("invalid argument: source_id %u\n", source_id);
         return NSN_INVALID_SRC;
     }
     uint32_t src_idx = NSN_INVALID_SRC;
     if (n_src == NSN_MAX_SOURCES) {
-        log_warn("limit exceeded: too many sources\n");
+        log_error("limit exceeded: too many sources\n");
         return NSN_INVALID_SRC;
     } else {
         // Get the first available source descriptor
@@ -539,12 +559,12 @@ nsn_create_source(nsn_stream_t *stream, uint32_t source_id) {
 
     // If successful, receive two handlers to attach to the TX rings
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
-        fprintf(stderr, "failed to create source with error '%s', is it running?\n", strerror(errno));
+        log_error("failed to create source with error '%s', is it running?\n", strerror(errno));
         source_id = NSN_INVALID_SRC;
         goto exit;
     } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
         int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-        fprintf(stderr, "failed to create source with error '%d'\n", error); 
+        log_error("failed to create source with error '%d'\n", error); 
         source_id = NSN_INVALID_SRC;
         goto exit;
     }
@@ -555,7 +575,7 @@ nsn_create_source(nsn_stream_t *stream, uint32_t source_id) {
     sources[src_idx].stream = *stream;
     n_src++;    
 
-    printf("created source %u in slot %u with is_active=%d\n", source_id, src_idx, sources[src_idx].is_active);
+    log_trace("created source %u in slot %u with is_active=%d\n", source_id, src_idx, sources[src_idx].is_active);
 
 exit:
     temp_mem_arena_end(temp);
@@ -604,7 +624,7 @@ nsn_destroy_source(nsn_source_t source) {
         
         ret = recvfrom(sockfd, reply, 4096, 0, NULL, NULL);
         if (ret == -1) {
-            fprintf(stderr, "failed to destroy source with error '%s', is it running?\n", strerror(errno));
+            log_error("failed to destroy source with error '%s', is it running?\n", strerror(errno));
             ok = -1;
             goto clean_and_exit;
         } else if (replyhdr->type == NSN_CMSG_TYPE_ERROR) {
@@ -613,7 +633,7 @@ nsn_destroy_source(nsn_source_t source) {
                 // retry
                 continue;
             }
-            fprintf(stderr, "failed to destroy source with error '%d'\n", error); 
+            log_error("failed to destroy source with error '%d'\n", error); 
             ok = -1;
             goto clean_and_exit;
         }
@@ -671,19 +691,19 @@ nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb) {
 
     // If successful, receive two handlers
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
-        fprintf(stderr, "failed to create sink with error '%s', is it running?\n", strerror(errno));
+        log_error("failed to create sink with error '%s', is it running?\n", strerror(errno));
         sink_id = NSN_INVALID_SNK;
         goto exit;
     } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
         int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-        fprintf(stderr, "failed to create sink with error '%d'\n", error); 
+        log_error("failed to create sink with error '%d'\n", error); 
         sink_id = NSN_INVALID_SNK;
         goto exit;
     }
 
     sinks[snk_idx].rx_cons = nsn_lookup_ringbuf(rings_zone, str_lit(msg->rx_cons));
     if (sinks[snk_idx].rx_cons == NULL) {
-        fprintf(stderr, "sink failed to attach to the rx ring\n");
+        log_error("sink failed to attach to the rx ring\n");
         sinks[snk_idx].rx_cons = NULL;
         sink_id = NSN_INVALID_SNK;       
         goto exit;
@@ -696,7 +716,7 @@ nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb) {
     sinks[snk_idx].cb = cb;
     n_snk++;    
 
-    printf("created sink %u in slot %u with is_active=%d\n", sink_id, snk_idx, sinks[snk_idx].is_active);
+    log_info("created sink %u in slot %u with is_active=%d\n", sink_id, snk_idx, sinks[snk_idx].is_active);
 
 exit:
     temp_mem_arena_end(temp);
@@ -737,12 +757,12 @@ nsn_destroy_sink(nsn_sink_t sink) {
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_sink_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
 
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
-        fprintf(stderr, "failed to destroy sink with error '%s', is it running?\n", strerror(errno));
+        log_error("failed to destroy sink with error '%s', is it running?\n", strerror(errno));
         ok = -1;
         goto clean_and_exit;
     } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
         int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-        fprintf(stderr, "failed to destroy sink with error '%d'\n", error); 
+        log_error("failed to destroy sink with error '%d'\n", error); 
         ok = -1;
         goto clean_and_exit;
     }
@@ -780,7 +800,7 @@ nsn_buffer_t nsn_get_buffer(size_t size, int flags) {
     }
 
     uint8_t *data = (uint8_t*)(tx_bufs + 1) + (buf.index * tx_buf_size); 
-    // printf("Got iobuf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
+    log_trace("Got iobuf #%lu, data %p, len %lu\n", buf.index, data, tx_buf_size);
     buf.data      = data + INSANE_HEADER_LEN;
     buf.len       = tx_buf_size - INSANE_HEADER_LEN;
 
@@ -816,7 +836,7 @@ int nsn_emit_data(nsn_source_t source, nsn_buffer_t buf) {
     while(nsn_ringbuf_enqueue_burst(str->tx_prod, &buf.index, sizeof(buf.index), 1, NULL) == 0) {
         SPIN_LOOP_PAUSE();
     }
-    // printf("Emitted iobuf #%lu\n", buf.index);
+    log_trace("Emitted iobuf #%lu\n", buf.index);
 
     return buf.index;
 }
@@ -863,7 +883,7 @@ nsn_buffer_t nsn_consume_data(nsn_sink_t sink, int flags) {
     usize   len   = ((nsn_meta_t*)(tx_buf_meta + 1) + buf.index)->len;
     buf.data      = data + INSANE_HEADER_LEN;
     buf.len       = len - INSANE_HEADER_LEN; 
-    // printf("Received on buf #%lu, data %p, len %lu\n", buf.index, data, buf.len);
+    log_trace("Received on buf #%lu, data %p, len %lu\n", buf.index, data, buf.len);
 
     return buf;
 }
