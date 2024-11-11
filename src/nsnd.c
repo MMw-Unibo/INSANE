@@ -160,7 +160,7 @@ nsn_memory_manager_create_ringbuf(nsn_ringbuf_pool_t* pool, string_t ring_name) 
     // fill in the descriptorsfor this ring in the pool    
     pool->free_slots_count--;
 
-    log_info("Ring buffer %.*s created at %p\n", str_varg(ring_name), ring);
+    log_debug("Ring buffer %.*s created at %p\n", str_varg(ring_name), ring);
     return ring;
 }
 
@@ -1058,7 +1058,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         case NSN_CMSG_TYPE_CONNECT:
         {
             if (app_pool_try_alloc_and_init_slot(&app_pool, app_id, mem_cfg)) {
-                log_debug("app %d connected\n", app_id);
+                log_info("app %d connected\n", app_id);
 
                 // Complete the reply
                 cmsghdr->type             = NSN_CMSG_TYPE_CONNECTED;
@@ -1163,6 +1163,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // Successful operation: return success
             cmsghdr->type = NAN_CSMG_TYPE_CREATED_STREAM;
             reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_stream_t);
+            log_info("new stream created for app %d\n", stream_idx, app_id);
 
         } break;
         case NSN_CMSG_TYPE_DESTROY_STREAM:
@@ -1254,6 +1255,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // Return success
             cmsghdr->type = NSN_CMSG_TYPE_DESTROYED_STREAM;
             reply_len = sizeof(nsn_cmsg_hdr_t);
+            log_info("new stream created for app %d\n", stream_idx, app_id);
 
         } break;
         case NSN_CMSG_TYPE_CREATE_SOURCE:
@@ -1272,6 +1274,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // finalize the answer
             cmsghdr->type = NSN_CMSG_TYPE_CREATED_SOURCE;
             reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_source_t);
+            log_info("new source created for app %d\n", app_id);
         } break;
         case NSN_CMSG_TYPE_DESTROY_SOURCE: 
         {
@@ -1287,6 +1290,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             }
 
             reply_len = sizeof(nsn_cmsg_hdr_t);
+            log_info("source destroyed for app %d\n", app_id);
 
         } break;
         case NSN_CMSG_TYPE_CREATE_SINK:
@@ -1305,6 +1309,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // finalize the answer
             cmsghdr->type = NSN_CMSG_TYPE_CREATED_SINK;
             reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_sink_t);
+            log_info("new sink created for app %d\n", app_id);
 
         } break;
         case NSN_CMSG_TYPE_DESTROY_SINK:
@@ -1322,6 +1327,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             }
 
             reply_len = sizeof(nsn_cmsg_hdr_t);
+            log_info("sink destroyed for app %d\n", app_id);
 
         } break;
         case NSN_CMSG_TYPE_DISCONNECT:
@@ -1332,7 +1338,6 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             bool found = false;
             for (usize i = 0; i < app_pool.count; i++) {
                 if (app_pool.apps[i].app_id == app_id) {
-                    log_trace("found app %d in slot %d\n", app_id, i);
                     app_pool.free_apps_slots[i]  = true;
                     app_pool.used               -= 1;
                     found                        = true;
@@ -1353,7 +1358,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
                 *error_code     = 2;
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
             } else {
-                log_debug("app %d disconnected\n", app_id);
+                log_info("app %d disconnected\n", app_id);
                 cmsghdr->type = NSN_CMSG_TYPE_DISCONNECTED;
                 reply_len     = sizeof(nsn_cmsg_hdr_t);
             }
