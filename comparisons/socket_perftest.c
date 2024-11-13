@@ -127,7 +127,7 @@ void do_source(int sd, test_config_t *params) {
             perror("Error sending UDP packet");
             break;
         }
-        fprintf(stdout, "Sent %d packets", ret);
+        // fprintf(stdout, "Sent %d bytes\n", ret);
     }
     printf("Finished sending %lu messages. Exiting...\n", counter);
     free(payload);
@@ -195,7 +195,12 @@ void do_ping(int sd, test_config_t *params) {
     uint64_t         send_time, response_time, latency;
     ssize_t          ret;
 
-    while (g_running) {
+    if(params->payload_size < sizeof(struct test_data)) {
+        fprintf(stderr, "Payload size too small\n");
+        return;
+    }
+
+    while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
         if (params->sleep_time) {
             sleep(params->sleep_time);
@@ -210,7 +215,7 @@ void do_ping(int sd, test_config_t *params) {
         // strncpy(data.msg, msg, strlen(msg) + 1);
 
         /* Send the packet */
-        ret = sendto(sd, &data, sizeof(data), 0, (struct sockaddr *)&params->dst_addr,
+        ret = sendto(sd, &data, params->payload_size, 0, (struct sockaddr *)&params->dst_addr,
                      sizeof(params->dst_addr));
         if (ret < 0) {
             perror("Error sending UDP packet");
@@ -219,7 +224,7 @@ void do_ping(int sd, test_config_t *params) {
         // fprintf(stdout, "(%lu) time: %ld", counter, send_time);
 
         /* Wait for pong */
-        while ((ret = recvfrom(sd, &data, sizeof(data), 0, NULL, NULL)) <= 0)
+        while ((ret = recvfrom(sd, &data, params->payload_size, 0, NULL, NULL)) <= 0)
             ;
         if (params->blocking && ret < 0) {
             perror("Error receiving UDP message");
@@ -229,7 +234,7 @@ void do_ping(int sd, test_config_t *params) {
         response_time = get_clock_realtime_ns();
         latency       = response_time - send_time;
 
-        fprintf(stdout, "(%ld) RTT: %.3f us\n", counter, (float)latency / 1000.0F);
+        fprintf(stdout, "%.3f\n", (float)latency / 1000.0f);
     }
 }
 
@@ -237,19 +242,20 @@ void do_ping(int sd, test_config_t *params) {
 void do_pong(int sd, test_config_t *params) {
     ssize_t          ret;
     struct test_data data;
+    uint64_t         counter = 0;
 
-    while (g_running) {
+    while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
         /* Wait for the ping */
-        while ((ret = recvfrom(sd, &data, sizeof(data), 0, NULL, NULL)) <= 0)
+        while ((ret = recvfrom(sd, &data, params->payload_size, 0, NULL, NULL)) <= 0)
             ;
         if (params->blocking && ret < 0) {
             perror("Error receiving UDP message");
         }
-
+        ++counter;
         /* Send it back */
         // fprintf(stdout, "Forwarding sample %lu", data.cnt);
-        ret = sendto(sd, &data, sizeof(data), 0, (struct sockaddr *)&params->dst_addr,
+        ret = sendto(sd, &data, params->payload_size, 0, (struct sockaddr *)&params->dst_addr,
                      sizeof(params->dst_addr));
         if (ret < 0) {
             perror("Error sending UDP packet");

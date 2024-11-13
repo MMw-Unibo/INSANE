@@ -625,7 +625,7 @@ wait:
 
     // 1c) TODO: Retrieve the list of peer's IPs from the config file
     ctx.n_peers = 1;
-    char* config_file[] = {"10.0.0.212"};
+    char* config_file[] = {"192.168.56.212"};
 
     ctx.peers = mem_arena_push(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers);
     bzero(ctx.peers, sizeof(ctx.peers) * ctx.n_peers);
@@ -1462,6 +1462,7 @@ main(int argc, char *argv[])
     logger_init(NULL);
     char* log_levels[] = {"error", "warn", "info", "debug", "trace"};
     char  config_log_level[32];
+    bzero(config_log_level, 32);
     string_t cfg_ll = str_cstr(config_log_level);
     nsn_config_get_string(config, str_lit("global"), str_lit("log_level"), &cfg_ll);
     for (usize i = 0; i < array_count(log_levels); i++) {

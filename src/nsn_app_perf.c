@@ -52,7 +52,7 @@ typedef struct test_config {
 struct test_data {
     uint64_t cnt;
     uint64_t tx_time;
-    char     msg[64];
+    // char     msg[64];
 };
 
 volatile bool g_running  = true;
@@ -93,7 +93,7 @@ static inline uint64_t get_clock_realtime_ns() {
 //--------------------------------------------------------------------------------------------------
 // source
 void do_source(nsn_stream_t *stream, test_config_t *params) {
-    char             *msg     = MSG;
+    // char             *msg     = MSG;
     uint64_t          counter = 0;
     nsn_buffer_t      buf;
     struct test_data *data;
@@ -113,10 +113,9 @@ void do_source(nsn_stream_t *stream, test_config_t *params) {
 
         if (nsn_buffer_is_valid(&buf)) {
             data = (struct test_data *)buf.data;
-
             data->tx_time = tx_time;
             data->cnt     = counter++;
-            strncpy(data->msg, msg, strlen(msg) + 1);
+            // strncpy(data->msg, msg, strlen(msg) + 1);
 
             buf.len = params->payload_size;
 
@@ -244,8 +243,8 @@ void do_pong(nsn_stream_t *stream, test_config_t *params) {
         }
         // fprintf(stderr, "Forwarding sample %lu idx=%lu\n",
         //           ((struct test_data *)buf.data)->cnt, buf.index);
-        nsn_emit_data(source, buf);
         counter++;
+        nsn_emit_data(source, buf);
     }
 
     nsn_destroy_sink(sink);
