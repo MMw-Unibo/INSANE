@@ -333,16 +333,7 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
         }
         // QoS Reliability
         if (!strncmp(argv[i], "-r", 2) || !strncmp(argv[i], "--qos-rel", 8)) {
-            ENSURE_ONE_MORE_ARGUMENT(argc, argv, i, "--qos-rel")
-            i++;
-            if (!strcmp(argv[i], "rel")) {
-                config->qos_reliability = NSN_QOS_RELIABILITY_RELIABLE;
-            } else if (!strcmp(argv[i], "unrel")) {
-                config->qos_reliability = NSN_QOS_RELIABILITY_UNRELIABLE;
-            } else {
-                fprintf(stderr, "! Invalid value for --qos-rel option: %s\n", argv[i]);
-                return -1;
-            }
+            config->qos_reliability = NSN_QOS_RELIABILITY_RELIABLE;
             continue;
         }        
         // Source id

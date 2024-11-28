@@ -611,6 +611,7 @@ nsn_destroy_source(nsn_source_t source) {
     cmsghdr->app_id = app_id;
 
     nsn_cmsg_create_source_t *msg = (nsn_cmsg_create_source_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->plugin_idx = streams[sources[source_idx].stream].plugin_id;
     msg->stream_idx = streams[sources[source_idx].stream]._idx;
     msg->source_id  = sources[source_idx].id;
 
@@ -620,17 +621,32 @@ nsn_destroy_source(nsn_source_t source) {
    bool stop = false;
    int ret;
    while (!stop) {
-        sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_source_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
+        while(sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_source_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un)) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // retry
+                usleep(10);
+                continue;
+            }
+            log_error("failed to destroy source with error '%s', is it running?\n", strerror(errno));
+            ok = -1;
+            goto clean_and_exit;
+        };
         
         ret = recvfrom(sockfd, reply, 4096, 0, NULL, NULL);
         if (ret == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // retry
+                usleep(10);
+                continue;
+            }
             log_error("failed to destroy source with error '%s', is it running?\n", strerror(errno));
             ok = -1;
             goto clean_and_exit;
         } else if (replyhdr->type == NSN_CMSG_TYPE_ERROR) {
             int error = *(int *)(reply + sizeof(nsn_cmsg_hdr_t));
-            if (error == -EINVAL) {
+            if (error == -EAGAIN || error == -EWOULDBLOCK) {
                 // retry
+                usleep(10);
                 continue;
             }
             log_error("failed to destroy source with error '%d'\n", error); 
@@ -716,7 +732,7 @@ nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb) {
     sinks[snk_idx].cb = cb;
     n_snk++;    
 
-    log_info("created sink %u in slot %u with is_active=%d\n", sink_id, snk_idx, sinks[snk_idx].is_active);
+    log_info("created sink %u\n", sink_id);
 
 exit:
     temp_mem_arena_end(temp);
@@ -751,6 +767,7 @@ nsn_destroy_sink(nsn_sink_t sink) {
     cmsghdr->app_id = app_id;
 
     nsn_cmsg_create_sink_t *msg = (nsn_cmsg_create_sink_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
+    msg->plugin_idx = streams[sinks[sink_idx].stream].plugin_id;
     msg->stream_idx = streams[sinks[sink_idx].stream]._idx;
     msg->sink_id  = sinks[sink_idx].id;
 

@@ -39,6 +39,7 @@
 #define NSN_CFG_DEFAULT_TX_RING_SIZE            4096
 #define NSN_CFG_DEFAULT_RX_RING_SIZE            4096
 #define NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN  2
+#define CONN_MANAGER_TIMEOUT_NS                 1000000000 // 1s
 
 static i64 cpu_hz = -1;
 
@@ -54,11 +55,12 @@ signal_handler(int signum)
 
 struct datapath_ops
 {
-    nsn_datapath_init       *init;
-    nsn_datapath_update     *update;
-    nsn_datapath_tx         *tx;
-    nsn_datapath_rx         *rx;
-    nsn_datapath_deinit     *deinit;
+    nsn_datapath_init         *init;
+    nsn_datapath_conn_manager *conn_manager;
+    nsn_datapath_update       *update;
+    nsn_datapath_tx           *tx;
+    nsn_datapath_rx           *rx;
+    nsn_datapath_deinit       *deinit;
 };
 
 // --- Memory Manager --------------------------------------------------
@@ -437,6 +439,14 @@ struct nsn_inner_sink
     u32           sink_id;
 };
 
+// Sink: needed to dispatch data to the right sink
+typedef struct nsn_inner_source nsn_inner_source_t;
+struct nsn_inner_source
+{
+    list_head_t   node;
+    u32           src_id;
+};
+
 // Stream: state for a specific plugin for a specific app_id
 typedef struct nsn_inner_stream nsn_inner_stream_t;
 struct nsn_inner_stream
@@ -447,7 +457,11 @@ struct nsn_inner_stream
 
     // tx ring from srcs to the plugin
     nsn_ringbuf_t*      tx_prod;
+    list_head_t         sources;
     atu32               n_srcs;
+
+    // tx ring - packets that need a retry send
+    nsn_ringbuf_t*      tx_pending;
 
     // Sinks active for this stream
     list_head_t        sinks; 
@@ -461,14 +475,15 @@ struct nsn_inner_stream
 typedef struct nsn_plugin nsn_plugin_t;
 struct nsn_plugin
 {
-    string_t             name;    // The name of the plugin
-    nsn_os_thread_t*     threads; // The threads that run the plugin
-    usize                thread_count; // The number of those threads
-    u32                  active_channels; // No. of total src+snk
-    list_head_t          streams; // List of streams that use this plugin
-    nsn_mutex_t          streams_lock; // Lock for the streams list   
-    u32                  stream_id_cnt; //used to assign stream_ids
-    nsn_datapath_update* update; // The plugin's UPDATE function
+    string_t                  name;    // The name of the plugin
+    nsn_os_thread_t*          threads; // The threads that run the plugin
+    usize                     thread_count; // The number of those threads
+    u32                       active_channels; // No. of total src+snk
+    list_head_t               streams; // List of streams that use this plugin
+    nsn_mutex_t               streams_lock; // Lock for the streams list   
+    u32                       stream_id_cnt; //used to assign stream_ids
+    nsn_datapath_update       *update; // The plugin's UPDATE function
+    nsn_datapath_conn_manager *conn_manager; // The plugin's connection manager
 };
 
 typedef struct nsn_plugin_set nsn_plugin_set_t;
@@ -528,6 +543,7 @@ nsn_cfg_t *config      = NULL;
 ////////
 
 // --- Datapath helpers -----------------------------------------------------
+// When calling this function, we must hold the lock on the streams list
 static void prepare_ep_list(list_head_t* ep_list, nsn_plugin_t *plugin, temp_mem_arena_t* data_arena) {
     nsn_inner_stream_t *stream;
     ep_initializer_t *ep_el;
@@ -538,6 +554,7 @@ static void prepare_ep_list(list_head_t* ep_list, nsn_plugin_t *plugin, temp_mem
     }
 }
 
+// When calling this function, we must hold the lock on the streams list
 static void clean_ep_list(list_head_t *ep_list, temp_mem_arena_t* data_arena) {
     ep_initializer_t *ep_el;
     while(!list_empty(ep_list)) {
@@ -594,6 +611,8 @@ wait:
     memory_zero_struct(&ops);
     snprintf(fn_name, sizeof(fn_name), "%s_datapath_init", to_cstr(datapath_name));
     ops.init   = (nsn_datapath_init*)nsn_os_get_proc_address(module, fn_name);
+    snprintf(fn_name, sizeof(fn_name), "%s_datapath_conn_manager", to_cstr(datapath_name));
+    ops.conn_manager = (nsn_datapath_conn_manager*)nsn_os_get_proc_address(module, fn_name);
     snprintf(fn_name, sizeof(fn_name), "%s_datapath_update", to_cstr(datapath_name));
     ops.update = (nsn_datapath_update*)nsn_os_get_proc_address(module, fn_name);
     snprintf(fn_name, sizeof(fn_name), "%s_datapath_tx", to_cstr(datapath_name));
@@ -625,7 +644,7 @@ wait:
 
     // 1c) TODO: Retrieve the list of peer's IPs from the config file
     ctx.n_peers = 1;
-    char* config_file[] = {"192.168.56.212"};
+    char* config_file[] = {"10.0.0.212"};
 
     ctx.peers = mem_arena_push(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers);
     bzero(ctx.peers, sizeof(ctx.peers) * ctx.n_peers);
@@ -635,7 +654,8 @@ wait:
         strcpy(ctx.peers[i], config_file[i]);
     }
 
-    // Save a pointer to the UPDATE function in the plugin descriptor
+    // Save a pointer to the CP functions in the plugin descriptor
+    plugin->conn_manager = ops.conn_manager;
     plugin->update = ops.update;
 
     // 2) Initialize the plugin
@@ -664,27 +684,40 @@ wait:
         // Then we should protect them with locks? or similar? 
 
         // TX routine
+        nsn_buf_t io_indexes[ctx.max_tx_burst];
+        uint32_t nbufs = 0;
+        int tx_count;
         nsn_os_mutex_lock(&plugin->streams_lock);
         list_for_each_entry(stream, &plugin->streams, node) {
             if (!at_load(&stream->n_srcs, mo_rlx)) {
                 continue;
             }
 
-            nsn_buf_t io_indexes[ctx.max_tx_burst];
-            uint32_t nbufs = 0;
+            nbufs = 0;
 
-            // 1. Dequeue the io_bufs indexes from the tx_ring
-            nbufs = nsn_ringbuf_dequeue_burst(stream->tx_prod,
+            // 1a. Dequeue the io_bufs indexes from the pending (retry send) ring
+            nbufs = nsn_ringbuf_dequeue_burst(stream->tx_pending,
                                 &io_indexes, sizeof(io_indexes[0]),
                                 ctx.max_tx_burst, NULL);
 
+            // 1b. Dequeue the io_bufs indexes from the tx_prod ring
+            if (nbufs == 0) {
+                nbufs = nsn_ringbuf_dequeue_burst(stream->tx_prod,
+                                    &io_indexes, sizeof(io_indexes[0]),
+                                    ctx.max_tx_burst, NULL);
+            }
 
             // 2. Call the tx function of the datapath
             if(nbufs > 0) {
-                int tx_count = ops.tx(io_indexes, nbufs, &stream->ep);
+                tx_count = ops.tx(io_indexes, nbufs, &stream->ep);
                 if (tx_count < 0) {
                     log_error("[thread %d] Failed to transmit\n");
-                } 
+                } else if ((uint32_t)tx_count < nbufs) {
+                    log_trace("[thread %d] Enqueueing %d packets to retry\n", self, nbufs - tx_count);
+                    nsn_ringbuf_enqueue_burst(stream->tx_pending, 
+                                &io_indexes[tx_count], sizeof(io_indexes[0]), 
+                                nbufs - tx_count, NULL);
+                }
             }
         }
 
@@ -739,6 +772,7 @@ wait:
     nsn_os_unload_library(module);
 
     plugin->update = NULL;
+    plugin->conn_manager = NULL;
     
     mem_arena_pop(data_arena.arena, sizeof(char)*ip_str_size*ctx.n_peers); // peers' IPs
     mem_arena_pop(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers); // ctx.peers
@@ -767,14 +801,20 @@ quit:
 // --- QoS Mapping ---------------------------------------------------------
 uint32_t nsn_qos_to_plugin_idx(nsn_options_t qos)
 {
-    log_warn("QoS mapping not implemented: defaulting to 0,0,0,0\n");
-    nsn_unused(qos);
+    log_warn("QoS mapping not completely implemented\n");
+    
 
     // TODO: We need to list the available plugins. Then implement the
     // algorithm described in the paper to find the plugin to match. If 
     // it does not exist, just return an error.
 
-    return 0;
+    if (qos.reliability == NSN_QOS_RELIABILITY_RELIABLE) {
+        log_info("QOS: reliable => selected TCP plugin\n");
+        return 1;
+    } else {
+        log_info("QOS: unreliable => selected UDP plugin\n");
+        return 0;
+    }
 }
 
 // --- Helper Functions ---------------------------------------------------------
@@ -839,12 +879,19 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         // Create the sink descriptor
         nsn_inner_sink_t *sink = malloc(sizeof(nsn_inner_sink_t));
         sink->rx_cons = rx_cons_ring;
-        sink->sink_id = (u32)reply_snk->sink_id;
+        sink->sink_id = (u32)reply_snk->sink_id; // TODO: Check that sink id is free
 
         // Add the sink to the stream
         nsn_os_mutex_lock(&stream->sinks_lock);
         list_add_tail(&stream->sinks, &sink->node);
         nsn_os_mutex_unlock(&stream->sinks_lock);
+    } else {
+        // Create the source descriptor
+        nsn_inner_source_t *source = malloc(sizeof(nsn_inner_source_t));
+        source->src_id = reply->source_id; // TODO: Check that src id is free
+
+        // no lock: we keep sources only to guarantee their uniqueness, not to share them.
+        list_add_tail(&stream->sources, &source->node);
     }
     
     // if this is the first src/snk (=channel) in the PLUGIN, start the first 
@@ -870,6 +917,7 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         // wait for the initialization to complete
         nsn_os_mutex_lock(&dp_args->lock);
         while (!dp_args->dp_ready) {
+            log_debug("Retry for the dataplane thread to be ready\n");
             nsn_os_cnd_wait(&dp_args->cv, &dp_args->lock);
         }
         nsn_os_mutex_unlock(&dp_args->lock);
@@ -940,6 +988,11 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     if (type == NSN_CHANNEL_TYPE_SINK) {
         nsn_inner_sink_t *sink, *dead_sink = NULL;
         nsn_os_mutex_lock(&stream->sinks_lock);
+        if (list_empty(&stream->sinks)) {
+            nsn_os_mutex_unlock(&stream->sinks_lock);
+            log_warn("no sinks in the stream\n");
+            return 4;
+        }
         list_for_each_entry(sink, &stream->sinks, node) {
             if(sink->sink_id == ((nsn_cmsg_create_sink_t *)(cmsghdr + 1))->sink_id) {
                 // Ref count of the channels (src/snk) active in the stream
@@ -971,15 +1024,38 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     } else {        
         // Ensure we are not leaving packets unsent (this was the last channel and the ring will be destroyed)
         u32 nb_pk = 0;
-        if(plugin->active_channels - 1 == 0 && (nb_pk = nsn_ringbuf_count(stream->tx_prod)) > 0) {
+        if(plugin->active_channels - 1 == 0 && (
+                   (nb_pk = nsn_ringbuf_count(stream->tx_prod)) > 0
+                || (nb_pk = nsn_ringbuf_count(stream->tx_pending)) > 0)) {
             // The caller will try again later
             log_trace("destroy last src detected %u pending packets: retry\n", nb_pk);
             return EINVAL;
         }
-        // Ref count of the channels (src/snk) active in the stream
-        --plugin->active_channels;
-        // Update the number of srcs in the stream: stop sending if this was the last one
-        atomic_fetch_sub(&stream->n_srcs, 1);
+
+        nsn_inner_source_t *src, *dead_src = NULL;
+        if (list_empty(&stream->sources)) {
+            log_warn("no sources in the stream\n");
+            return 6;
+        }
+        list_for_each_entry(src, &stream->sources, node) {
+            if(src->src_id == ((nsn_cmsg_create_source_t *)(cmsghdr + 1))->source_id) {
+                // Ref count of the channels (src/snk) active in the stream
+                --plugin->active_channels;
+                // Update the number of srcs in the stream: stop sending if this was the last one
+                atomic_fetch_sub(&stream->n_srcs, 1);
+                // Remove the sink from the list
+                list_del(&src->node);
+                dead_src = src;
+                break;
+            }
+        }
+        if(!dead_src) {
+            log_error("source %d not found in the stream\n", ((nsn_cmsg_create_source_t *)(cmsghdr + 1))->source_id);
+            return 7;
+        }     
+        
+        // Destroy the src
+        free(src);
     }
    
     // if the stream has no more active channels, stop the data plane thread 
@@ -1015,12 +1091,8 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
 // --- IPC thread -------------------------------------------------------------
 
 int 
-main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg, 
-    struct nsn_dataplane_thread_args *dp_args, usize dp_args_count)
+main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
 {
-    nsn_unused(dp_args);
-    nsn_unused(dp_args_count);
-
     // send a message to the daemon to create a new instance
     int res = 0;
     temp_mem_arena_t temp_arena = nsn_thread_scratch_begin(NULL, 0);
@@ -1079,7 +1151,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         } break;        
         case NSN_CMSG_TYPE_CREATE_STREAM:
         {
-            log_debug("received new stream message from app %d\n", app_id);
+            log_trace("received new stream message from app %d\n", app_id);
             
             // Check that the app_id exists
             uint32_t app_idx = UINT32_MAX;
@@ -1117,6 +1189,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             stream->plugin_idx = plugin_idx;
             stream->idx = plugin->stream_id_cnt++;
             atomic_store(&stream->n_srcs, 0);
+            stream->sources = list_head_init(stream->sources);
             atomic_store(&stream->n_sinks, 0);
             stream->sinks = list_head_init(stream->sinks);
             nsn_os_mutex_init(&stream->sinks_lock);
@@ -1131,7 +1204,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // The tx_cons and the rx_prod are the same ring, the free_slots ring, which is already available to the app.
             // The rx_cons is created at sink creation, allowing each sink to receive incoming data from the plugin.
             // The tx_prod is created here for this plugin, allowing all the sources to send data to the plugin.
-            snprintf(reply->tx_prod, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%d", app_id);            
+            snprintf(reply->tx_prod, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%u", stream_idx);            
             nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
             nsn_ringbuf_t *tx_prod_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_cstr(reply->tx_prod));
             if (!tx_prod_ring) {
@@ -1148,6 +1221,29 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // Associate the tx ring with the plugin
             stream->tx_prod = tx_prod_ring;
 
+            // Create the tx pending ring buffer. The size must be the max_tx_burst configured in the datapath: in the
+            // worst case, we need to retransmit all the packets we tried to send. We will always check here first. But 
+            // because the ring size is fixed for the pool, and it is not worth to create a new pool for "small rings" yet,
+            // we will just use the default size for now.
+            char tx_pending_ring_name[NSN_CFG_RINGBUF_MAX_NAME_SIZE];
+            snprintf(tx_pending_ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_pending_%u", stream_idx);      
+            nsn_ringbuf_t *tx_pending_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_cstr(tx_pending_ring_name));
+            if (!tx_pending_ring) {
+                log_error("Failed to create the tx_pending ring\n", tx_pending_ring);
+                // destroy the tx_prod ring
+                nsn_memory_manager_destroy_ringbuf(ring_pool, str_cstr(reply->tx_prod));
+                // clean the stream
+                free(stream);
+                // return error message
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 6;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+            // Associate the tx pending ring with the plugin
+            stream->tx_pending = tx_pending_ring;
+
             // Prepare the endpoint
             stream->ep.app_id = app_id;
             stream->ep.free_slots = nsn_memory_manager_lookup_ringbuf(app_pool.apps[app_idx].mem, str_lit(NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME));
@@ -1163,12 +1259,12 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // Successful operation: return success
             cmsghdr->type = NAN_CSMG_TYPE_CREATED_STREAM;
             reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_stream_t);
-            log_info("new stream created for app %d\n", stream_idx, app_id);
+            log_info("[plugin %u] new stream created for app %d\n", plugin_idx, stream_idx, app_id);
 
         } break;
         case NSN_CMSG_TYPE_DESTROY_STREAM:
         {
-            log_debug("received destroy stream message from app %d\n", app_id);
+            log_trace("received destroy stream message from app %d\n", app_id);
 
             // Check that the app_id exists
             uint32_t app_idx = UINT32_MAX;
@@ -1234,14 +1330,26 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
 
             // 4) destroy the tx_prod ring
             nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_get_ringbuf_pool(app_pool.apps[app_idx].mem);
-            char tx_prod_ring_name[NSN_CFG_RINGBUF_MAX_NAME_SIZE];
-            snprintf(tx_prod_ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%d", app_id);
-            int err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_lit(tx_prod_ring_name));
+            char ring_name[NSN_CFG_RINGBUF_MAX_NAME_SIZE];
+            snprintf(ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_prod_%u", stream_idx);
+            int err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_cstr(ring_name));
             if (err < 0) {
                 log_error("Failed to destroy the tx_prod ring\n");
                 cmsghdr->type = NSN_CMSG_TYPE_ERROR;
                 int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
                 *error_code     = 5;
+                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
+                break;
+            }
+
+            // 5) destroy the tx_pending ring
+            snprintf(ring_name, NSN_CFG_RINGBUF_MAX_NAME_SIZE, "tx_pending_%u", stream_idx);
+            err = nsn_memory_manager_destroy_ringbuf(ring_pool, str_cstr(ring_name));
+            if (err < 0) {
+                log_error("Failed to destroy the tx_pending ring\n");
+                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
+                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
+                *error_code     = 6;
                 reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
                 break;
             }
@@ -1255,12 +1363,12 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
             // Return success
             cmsghdr->type = NSN_CMSG_TYPE_DESTROYED_STREAM;
             reply_len = sizeof(nsn_cmsg_hdr_t);
-            log_info("new stream created for app %d\n", stream_idx, app_id);
+            log_info("stream %u destroyed for app %d\n", stream_idx, app_id);
 
         } break;
         case NSN_CMSG_TYPE_CREATE_SOURCE:
         {
-            log_debug("received new source message from app %d\n", app_id);
+            log_trace("received new source message from app %d\n", app_id);
            
             int err = 0;
             if ((err = ipc_create_channel(app_id, cmsghdr, NSN_CHANNEL_TYPE_SOURCE)) != 0) {
@@ -1278,7 +1386,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         } break;
         case NSN_CMSG_TYPE_DESTROY_SOURCE: 
         {
-            log_debug("received destroy source message from app %d\n", app_id);
+            log_trace("received destroy source message from app %d\n", app_id);
 
             int err = 0;
             if ((err = ipc_destroy_channel(app_id, cmsghdr, NSN_CHANNEL_TYPE_SOURCE)) != 0) {
@@ -1295,7 +1403,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         } break;
         case NSN_CMSG_TYPE_CREATE_SINK:
         {
-            log_debug("received new sink message from app %d\n", app_id);
+            log_trace("received new sink message from app %d\n", app_id);
 
             int err = 0;
             if ((err = ipc_create_channel(app_id, cmsghdr, NSN_CHANNEL_TYPE_SINK)) != 0) {
@@ -1314,7 +1422,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         } break;
         case NSN_CMSG_TYPE_DESTROY_SINK:
         {
-            log_debug("received destroy sink message from app %d\n", app_id);
+            log_trace("received destroy sink message from app %d\n", app_id);
             
             // destroy the channel and its side effects
             int err = 0;
@@ -1332,7 +1440,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg,
         } break;
         case NSN_CMSG_TYPE_DISCONNECT:
         {
-            log_debug("received disconnect message from app %d\n", app_id);
+            log_trace("received disconnect message from app %d\n", app_id);
 
             // check if the app is in the pool
             bool found = false;
@@ -1382,6 +1490,36 @@ clean_and_next:
     return res;
 }
 
+// -- Connection manager thread ------------------------------------------------
+
+int
+main_thread_connection_manager() {
+    
+    temp_mem_arena_t data_arena = nsn_thread_scratch_begin(NULL, 0);
+
+    for (usize i = 0; i < plugin_set.count; i++) {
+        nsn_plugin_t *plugin = &plugin_set.plugins[i];
+        if(plugin->conn_manager) {
+            list_head(ep_list); 
+            nsn_os_mutex_lock(&plugin->streams_lock);
+            // we might have waited on the lock, so we need to check again
+            if(!plugin->conn_manager) {
+                nsn_os_mutex_unlock(&plugin->streams_lock);
+                continue;
+            }
+            prepare_ep_list(&ep_list, plugin, &data_arena);
+            nsn_os_mutex_unlock(&plugin->streams_lock);
+            if(!list_empty(&ep_list)) {
+                plugin->conn_manager(&ep_list);
+            }
+            clean_ep_list(&ep_list, &data_arena);
+        }
+    }
+
+    nsn_thread_scratch_end(data_arena);
+
+    return 0;
+}
 
 // --- Os Initialization ------------------------------------------------------
 
@@ -1506,11 +1644,13 @@ main(int argc, char *argv[])
 
     // TODO: Automatically detect which plugins are available and can be used by the daemon.
     // Currently, we only consider 1 as available (make it the "udpsock" plugin).
-    plugin_set.plugins = mem_arena_push_array(arena, nsn_plugin_t, 1);
-    plugin_set.count   = 1;
+    char* plugin_set_names[] = {"udpsock", "tcpsock"};
+    plugin_set.count   = 2;
+
+    plugin_set.plugins = mem_arena_push_array(arena, nsn_plugin_t, plugin_set.count);
     for (usize i = 0; i < plugin_set.count; i++) {
         nsn_plugin_t *plugin = &plugin_set.plugins[i];
-        plugin->name = str_lit("udpsock");
+        plugin->name = str_lit(plugin_set_names[i]);
         plugin->thread_count = 0;
         plugin->threads = mem_arena_push_array(arena, nsn_os_thread_t,
                                         NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN);
@@ -1562,7 +1702,7 @@ main(int argc, char *argv[])
     // the name is set when the thread moves to the RUNNING state, as it will try to load the dll.
     // The association is done when a new stream for a new plugin is set, and currently is permanent.
     // Future work will include a way to dynamically attach/detach threads to/from plugins.
-    thread_pool.count = 1;
+    thread_pool.count = 2;
     thread_pool.threads = mem_arena_push_array(arena, nsn_os_thread_t, thread_pool.count);
     thread_pool.thread_args = mem_arena_push_array(arena, struct nsn_dataplane_thread_args, 
                                                         thread_pool.count);
@@ -1582,15 +1722,24 @@ main(int argc, char *argv[])
         }
     }
 
+    i64 now, last_time = nsn_os_get_time_ns();
+
     // Control path
-    struct nsn_dataplane_thread_args cp_args = { .state = NSN_DATAPLANE_THREAD_STATE_WAIT  };
     while (g_running) 
     {
-        if (main_thread_control_ipc(sockfd, mem_cfg, &cp_args, 1) < 0) {
+        if (main_thread_control_ipc(sockfd, mem_cfg) < 0) {
             log_warn("Failed to handle control ipc\n");
         }
 
-        usleep(1);
+        now = nsn_os_get_time_ns();
+        if (now - last_time > CONN_MANAGER_TIMEOUT_NS) {
+            last_time = now;
+            if (main_thread_connection_manager() < 0) {
+                log_warn("Failed to handle connection manager\n");
+            }
+        } else {
+            usleep(1);
+        }
     }
 
     // Stop the threads in the thread pool

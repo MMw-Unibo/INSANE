@@ -59,6 +59,8 @@ struct ep_initializer
 
 #define NSN_DATAPATH_INIT(name)                 int name##_datapath_init(nsn_datapath_ctx_t *ctx, list_head_t* endpoint_list)
 typedef NSN_DATAPATH_INIT(nsn);
+#define NSN_DATAPATH_CONN_MANAGER(name)         int name##_datapath_conn_manager(list_head_t* endpoint_list)
+typedef NSN_DATAPATH_CONN_MANAGER(nsn);
 #define NSN_DATAPATH_TX(name)                   int name##_datapath_tx(nsn_buf_t *bufs, usize buf_count, nsn_endpoint_t *endpoint)
 typedef NSN_DATAPATH_TX(nsn);
 #define NSN_DATAPATH_RX(name)                   int name##_datapath_rx(nsn_buf_t *bufs, usize *buf_count, nsn_endpoint_t *endpoint)

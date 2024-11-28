@@ -26,3 +26,6 @@ fi
 
 $CC $CFLAGS -c udpsock.c -o udpsock.o
 $CC $CFLAGS -shared -o libudpsock.so udpsock.o
+
+$CC $CFLAGS -c tcpsock.c -o tcpsock.o
+$CC $CFLAGS -shared -o libtcpsock.so tcpsock.o

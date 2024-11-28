@@ -124,6 +124,12 @@ NSN_DATAPATH_UPDATE(udpsock)
     return 0;
 }
 
+NSN_DATAPATH_CONN_MANAGER(udpsock)
+{
+    nsn_unused(endpoint_list);
+    return 0;
+}
+
 NSN_DATAPATH_INIT(udpsock)
 {
     // Initialize local state 
