@@ -238,7 +238,7 @@ __nsn_ringbuf_dequeue_elems(nsn_ringbuf_t *rb, u32 cons_head, void *obj_table, u
                 dst[i++] = ring[idx++];
             }
         } else {
-            for (i = 0; i < n; i++, idx++)
+            for (i = 0; idx < size && i < n; i++, idx++)
                 dst[i] = ring[idx];
             for (idx = 0; i < n; i++, idx++)
                 dst[i] = ring[idx];
