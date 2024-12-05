@@ -622,27 +622,26 @@ nsn_destroy_source(nsn_source_t source) {
    int ret;
    while (!stop) {
         while(sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_source_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un)) < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // retry
-                usleep(10);
-                continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                log_error("failed to destroy source with error '%s', is it running?\n", strerror(errno));
+                ok = -1;
+                goto clean_and_exit;
             }
-            log_error("failed to destroy source with error '%s', is it running?\n", strerror(errno));
-            ok = -1;
-            goto clean_and_exit;
-        };
+            // retry
+            usleep(10);
+        }
         
-        ret = recvfrom(sockfd, reply, 4096, 0, NULL, NULL);
-        if (ret == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // retry
-                usleep(10);
-                continue;
+        while((ret = recvfrom(sockfd, reply, 4096, 0, NULL, NULL)) < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                log_error("failed to destroy source with error '%s', is it running?\n", strerror(errno));
+                ok = -1;
+                goto clean_and_exit;
             }
-            log_error("failed to destroy source with error '%s', is it running?\n", strerror(errno));
-            ok = -1;
-            goto clean_and_exit;
-        } else if (replyhdr->type == NSN_CMSG_TYPE_ERROR) {
+            // retry
+            usleep(10);
+        }
+
+        if (replyhdr->type == NSN_CMSG_TYPE_ERROR) {
             int error = *(int *)(reply + sizeof(nsn_cmsg_hdr_t));
             if (error == -EAGAIN || error == -EWOULDBLOCK) {
                 // retry
