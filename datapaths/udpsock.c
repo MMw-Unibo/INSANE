@@ -176,16 +176,17 @@ NSN_DATAPATH_TX(udpsock)
             while((ret = sendto(conn->s_sockfd, data, size, 0, (struct sockaddr *)&send_addr, sizeof(send_addr))) < 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     printf("[udpsock] sendto() failed: %s\n", strerror(errno));
-                    return tx_count;
+                    goto finalize_and_exit;
                 }
             }
         }
         tx_count++;
     }
 
-    // Free the descriptors after using them
-    if(nsn_ringbuf_enqueue_burst(endpoint->free_slots, bufs, sizeof(bufs[0]), buf_count, NULL) < buf_count) {
-        fprintf(stderr, "[udpsock] Failed to enqueue %lu descriptors\n", buf_count);
+finalize_and_exit:
+    // Free the descriptors (only those actually sent) after using them
+    if(nsn_ringbuf_enqueue_burst(endpoint->free_slots, bufs, sizeof(bufs[0]), tx_count, NULL) < (u32)tx_count) {
+        fprintf(stderr, "[udpsock] Failed to enqueue %d descriptors\n", tx_count);
     }
 
     return tx_count;

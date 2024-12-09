@@ -63,10 +63,6 @@ static int try_connect_peer(const char* peer, u16 port) {
     }
 
 
-    // TCP does not allow to have more than one socket on the same port,
-    // unless it is a server socket. So, for all the client connections,
-    // we must rely on ephemeral ports.
-
     struct sockaddr_in sock_addr;
     memory_zero_struct(&sock_addr);
     sock_addr.sin_family      = AF_INET;
@@ -383,6 +379,7 @@ NSN_DATAPATH_TX(tcpsock)
                     if (p > 0) {
                         fprintf(stderr, "[tcpsock] send() size failed: %s\n", strerror(errno));
                         close(conn->s_sockfd[p]);
+                        conn->s_sockfd[p] = -1;
                         atomic_fetch_sub(&conn->connected_peers, 1); 
                         // continue because we already sent the pkt to at least one peer
                         continue;
@@ -393,11 +390,11 @@ NSN_DATAPATH_TX(tcpsock)
                 } else {
                     fprintf(stderr, "[tcpsock] send() size failed: %s\n", strerror(errno));
                     close(conn->s_sockfd[p]);
+                    conn->s_sockfd[p] = -1;
                     atomic_fetch_sub(&conn->connected_peers, 1); 
                     continue;
                 }
             } 
-            fprintf(stderr, "[tcpsock] sending %lu bytes...", size);
 
             // Then, the actual packet. Now that we committed by sending a size, we must send synchronously
             nb_tx = 0;
@@ -405,8 +402,9 @@ NSN_DATAPATH_TX(tcpsock)
                 if((ret = write(conn->s_sockfd[p], data, size - nb_tx)) < 0) {
                     if (errno != EAGAIN && errno != EWOULDBLOCK) {
                         // fatal error: stop sending data to this peer
-                        fprintf(stderr, "\n[tcpsock] send() data failed: %s\n", strerror(errno));
+                        fprintf(stderr, "[tcpsock] send() data failed AT %u: %s\n", debug_tx+1, strerror(errno));
                         close(conn->s_sockfd[p]);
+                        conn->s_sockfd[p] = -1;
                         atomic_fetch_sub(&conn->connected_peers, 1); 
                         break;
                     }
@@ -417,10 +415,9 @@ NSN_DATAPATH_TX(tcpsock)
                 data  += ret;
             }
             if(nsn_unlikely(nb_tx != size)) {
-                fprintf(stderr, "\n[tcpsock] error: sent %lu bytes, but expected were %lu\n", nb_tx, size);
+                fprintf(stderr, "[tcpsock] error: sent %lu bytes, but expected were %lu\n", nb_tx, size);
                 continue;
             }
-            fprintf(stderr, "... sent %ld bytes index %lu\n", nb_tx, bufs[i].index);
         }
 
         tx_count++;
@@ -465,7 +462,6 @@ NSN_DATAPATH_RX(tcpsock)
                 atomic_fetch_sub(&ep_sk->connected_peers, 1);
                 continue;
             }    
-            fprintf(stderr, "[tcpsock] receiving %lu bytes...", buf_size);
 
             // Wait for the full packet. We assume that it is sent immediately.
             nb_rx = 0;
@@ -473,7 +469,7 @@ NSN_DATAPATH_RX(tcpsock)
                 if((ret = read(ep_sk->s_sockfd[p], data, buf_size - nb_rx)) < 0) {
                     if(errno != EAGAIN && errno != EWOULDBLOCK) {
                         // Something failed 
-                        fprintf(stderr, "\nrecvfrom() failed: %s\n", strerror(errno));
+                        fprintf(stderr, "\n[tcpsock] recvfrom() failed: %s\n", strerror(errno));
                         close(ep_sk->s_sockfd[p]);
                         ep_sk->s_sockfd[p] = -1;
                         atomic_fetch_sub(&ep_sk->connected_peers, 1);
@@ -485,10 +481,8 @@ NSN_DATAPATH_RX(tcpsock)
                 data  += ret;
             }
             if (nsn_unlikely(nb_rx != buf_size)) {
-                fprintf(stderr, "... but received %lu\n", nb_rx);
                 continue;
             }
-            fprintf(stderr, "... received %ld bytes idx = %lu\n", nb_rx, bufs[i].index);
 
             // Update the pending tx descriptor
             u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &ep_sk->pending_rx_buf, sizeof(ep_sk->pending_rx_buf), 1, NULL);
