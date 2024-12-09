@@ -644,7 +644,7 @@ wait:
 
     // 1c) TODO: Retrieve the list of peer's IPs from the config file
     ctx.n_peers = 1;
-    char* config_file[] = {"10.0.0.212"};
+    char* config_file[] = {"192.168.56.212"};
 
     ctx.peers = mem_arena_push(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers);
     bzero(ctx.peers, sizeof(ctx.peers) * ctx.n_peers);
@@ -697,13 +697,13 @@ wait:
 
             // 1a. Dequeue the io_bufs indexes from the pending (retry send) ring
             nbufs = nsn_ringbuf_dequeue_burst(stream->tx_pending,
-                                &io_indexes, sizeof(io_indexes[0]),
+                                io_indexes, sizeof(io_indexes[0]),
                                 ctx.max_tx_burst, NULL);
 
             // 1b. Dequeue the io_bufs indexes from the tx_prod ring
             if (nbufs == 0) {
                 nbufs = nsn_ringbuf_dequeue_burst(stream->tx_prod,
-                                    &io_indexes, sizeof(io_indexes[0]),
+                                    io_indexes, sizeof(io_indexes[0]),
                                     ctx.max_tx_burst, NULL);
             }
 
@@ -742,7 +742,7 @@ wait:
                 nsn_os_mutex_lock(&stream->sinks_lock);
                 list_for_each_entry(sink, &stream->sinks, node) {
                     if (sink->sink_id == hdr->channel_id) {
-                        log_debug("pkt received on channel %u\n", hdr->channel_id);
+                        log_trace("pkt received on channel %u\n", hdr->channel_id);
                         if (nsn_ringbuf_enqueue_burst(sink->rx_cons, &io_buffs[j].index, sizeof(io_buffs[j].index), 1, NULL) == 0) {
                             log_error("[thread %d] Failed to enqueue pkt to sink\n", self);
                         }

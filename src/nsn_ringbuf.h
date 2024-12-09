@@ -39,6 +39,7 @@ u32 nsn_ringbuf_destroy(nsn_ringbuf_t *ring);
 
 u32 nsn_ringbuf_get_capacity(nsn_ringbuf_t *rb);
 u32 nsn_ringbuf_count(nsn_ringbuf_t *rb);
+u32 nsn_ringbuf_peek(nsn_ringbuf_t *rb, void *obj_table, u32 n);
 
 u32 nsn_ringbuf_enqueue_burst(nsn_ringbuf_t *rb, const void *obj_table, u32 esize, u32 n, u32 *free_space);
 u32 nsn_ringbuf_dequeue_burst(nsn_ringbuf_t *rb, void *obj_table, u32 esize, u32 n, u32 *available);

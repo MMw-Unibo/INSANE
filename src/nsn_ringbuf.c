@@ -76,6 +76,22 @@ nsn_ringbuf_count(nsn_ringbuf_t *rb)
 	return (count > rb->capacity) ? rb->capacity : count;
 }
 
+u32
+nsn_ringbuf_peek(nsn_ringbuf_t *rb, void *obj_table, u32 n) {
+    u32 elems = nsn_ringbuf_count(rb);
+    if (elems > 0) {
+        u32 size  = rb->size;
+        u32 idx   = rb->cons.head & (size - 1);
+        u64 *ring = (u64 *)&rb[1];
+        u64 *dst  = (u64 *)obj_table;
+        for(u32 i = 0; i < elems && i < n; i++) {
+            dst[i] =  ring[idx];
+            idx = (idx + 1 == size) ? 0 : idx + 1;
+        }
+    }
+    return elems;
+}
+
 static inline u32
 __nsn_ringbuf_move_prod_head(nsn_ringbuf_t *rb, u32 n, atu32 *old_head, atu32 *new_head, u32 *free_entries)
 {
