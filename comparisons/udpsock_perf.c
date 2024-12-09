@@ -27,7 +27,7 @@
 #define MIN_PAYLOAD_SIZE 16
 
 #define INSANE_PORT    9999
-#define DST_QUEUE_SIZE 4000000
+#define DST_QUEUE_SIZE 4194304
 
 #define IP_SRC "192.168.56.211"
 #define IP_DST "192.168.56.212"
@@ -56,7 +56,7 @@ typedef struct test_config {
 struct test_data {
     uint64_t cnt;
     uint64_t tx_time;
-    char     msg[64];
+    // char     msg[64];
 };
 
 volatile uint8_t g_running  = 1;
@@ -96,7 +96,7 @@ static inline uint64_t get_clock_realtime_ns() {
 
 //--------------------------------------------------------------------------------------------------
 void do_source(int sd, test_config_t *params) {
-    char             *msg     = MSG;
+    // char             *msg     = MSG;
     uint64_t          counter = 0;
     char             *payload;
     struct test_data *data;
@@ -119,7 +119,7 @@ void do_source(int sd, test_config_t *params) {
         data          = (struct test_data *)payload;
         data->tx_time = tx_time;
         data->cnt     = counter++;
-        strncpy(data->msg, msg, strlen(msg) + 1);
+        // strncpy(data->msg, msg, strlen(msg) + 1);
 
         ret = sendto(sd, payload, params->payload_size, 0, (struct sockaddr *)&params->dst_addr,
                      sizeof(params->dst_addr));
@@ -191,7 +191,6 @@ void do_sink(int sd, test_config_t *params) {
 void do_ping(int sd, test_config_t *params) {
     // char            *msg     = MSG;
     uint64_t         counter = 0;
-    struct test_data data;
     uint64_t         send_time, response_time, latency;
     ssize_t          ret;
 
@@ -199,6 +198,7 @@ void do_ping(int sd, test_config_t *params) {
         fprintf(stderr, "Payload size too small\n");
         return;
     }
+    struct test_data *data = (struct test_data*)malloc(params->payload_size);
 
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
@@ -210,12 +210,12 @@ void do_ping(int sd, test_config_t *params) {
         send_time = get_clock_realtime_ns();
 
         /* Fill the packet */
-        data.tx_time = send_time;
-        data.cnt     = counter++;
+        data->tx_time = send_time;
+        data->cnt     = counter++;
         // strncpy(data.msg, msg, strlen(msg) + 1);
 
         /* Send the packet */
-        ret = sendto(sd, &data, params->payload_size, 0, (struct sockaddr *)&params->dst_addr,
+        ret = sendto(sd, data, params->payload_size, 0, (struct sockaddr *)&params->dst_addr,
                      sizeof(params->dst_addr));
         if (ret < 0) {
             perror("Error sending UDP packet");
@@ -224,7 +224,7 @@ void do_ping(int sd, test_config_t *params) {
         // fprintf(stdout, "(%lu) time: %ld", counter, send_time);
 
         /* Wait for pong */
-        while ((ret = recvfrom(sd, &data, params->payload_size, 0, NULL, NULL)) <= 0)
+        while ((ret = recvfrom(sd, data, params->payload_size, 0, NULL, NULL)) <= 0)
             ;
         if (params->blocking && ret < 0) {
             perror("Error receiving UDP message");
@@ -236,32 +236,41 @@ void do_ping(int sd, test_config_t *params) {
 
         fprintf(stdout, "%.3f\n", (float)latency / 1000.0f);
     }
+
+    free(data);
 }
 
 //--------------------------------------------------------------------------------------------------
 void do_pong(int sd, test_config_t *params) {
     ssize_t          ret;
-    struct test_data data;
     uint64_t         counter = 0;
+
+    if(params->payload_size < sizeof(struct test_data)) {
+        fprintf(stderr, "Payload size too small\n");
+        return;
+    }
+    struct test_data *data = (struct test_data*)malloc(params->payload_size);
 
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
         /* Wait for the ping */
-        while ((ret = recvfrom(sd, &data, params->payload_size, 0, NULL, NULL)) <= 0)
+        while ((ret = recvfrom(sd, data, params->payload_size, 0, NULL, NULL)) <= 0)
             ;
         if (params->blocking && ret < 0) {
             perror("Error receiving UDP message");
         }
         ++counter;
         /* Send it back */
-        // fprintf(stdout, "Forwarding sample %lu", data.cnt);
-        ret = sendto(sd, &data, params->payload_size, 0, (struct sockaddr *)&params->dst_addr,
+        // fprintf(stdout, "Forwarding sample %lu", data->cnt);
+        ret = sendto(sd, data, params->payload_size, 0, (struct sockaddr *)&params->dst_addr,
                      sizeof(params->dst_addr));
         if (ret < 0) {
             perror("Error sending UDP packet");
             break;
         }
     }
+
+    free(data);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -365,7 +374,7 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
 // MAIN
 int main(int argc, char *argv[]) {
     signal(SIGINT, handle);
-    printf("Welcome to the test of the raw socket (UDP) performance\n");
+    printf("Welcome to the test of the UDP socket performance\n");
 
     /* Check test arguments */
     test_config_t params;

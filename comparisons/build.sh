@@ -24,5 +24,6 @@ else
 fi
 
 cd build
-$CC $CFLAGS $LDFLAGS ../socket_perftest.c $DEFINES -o socket-perftest
+$CC $CFLAGS $LDFLAGS ../udpsock_perf.c $DEFINES -o udpsock-perf
+$CC $CFLAGS $LDFLAGS ../tcpsock_perf.c $DEFINES -o tcpsock-perf
 cd ..
