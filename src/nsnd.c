@@ -680,9 +680,6 @@ wait:
 
         // IOBUFS are freed: (a) by the plugin after TX; (b) by the app after RX. No free is needed by the daemon.
 
-        // TODO: Using arrays here is highly inefficient. Can we use lists? 
-        // Then we should protect them with locks? or similar? 
-
         // TX routine
         nsn_buf_t io_indexes[ctx.max_tx_burst];
         uint32_t nbufs = 0;
@@ -1029,7 +1026,7 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
                 || (nb_pk = nsn_ringbuf_count(stream->tx_pending)) > 0)) {
             // The caller will try again later
             log_trace("destroy last src detected %u pending packets: retry\n", nb_pk);
-            return EINVAL;
+            return EAGAIN;
         }
 
         nsn_inner_source_t *src, *dead_src = NULL;

@@ -6,6 +6,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #define TCP_SOCKET_ADDR_MAX 64
 
@@ -62,6 +63,9 @@ static int try_connect_peer(const char* peer, u16 port) {
         return -1;
     }
 
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (int[]){4194304}, sizeof(int));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (int[]){4194304}, sizeof(int));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (int[]){1}, sizeof(int));
 
     struct sockaddr_in sock_addr;
     memory_zero_struct(&sock_addr);
@@ -300,7 +304,24 @@ NSN_DATAPATH_CONN_MANAGER(tcpsock)
                     break;
                 }
             }
-            // TODO: close the connection if the peer is not in the list/wrong port
+            
+            // Set the proper flags
+            setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, (int[]){4194304}, sizeof(int));
+            setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, (int[]){4194304}, sizeof(int));
+            setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (int[]){1}, sizeof(int));
+
+            int flags = fcntl(client_fd, F_GETFL, 0);
+            if (flags == -1) {
+                fprintf(stderr, "[tcpsock] fcntl() failed: %s\n", strerror(errno));
+                close(client_fd);
+                return -1;
+            }
+            flags |= O_NONBLOCK;
+            if (fcntl(client_fd, F_SETFL, flags) == -1) {
+                fprintf(stderr, "[tcpsock] fcntl() failed: %s\n", strerror(errno));
+                close(client_fd);
+                return -1;
+            }   
         }
         if (client_fd < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
             fprintf(stderr, "[tcpsock] connection manager: accept failed: %s\n", strerror(errno));
@@ -357,7 +378,7 @@ NSN_DATAPATH_TX(tcpsock)
         char* data = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size); 
         usize size = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;  
 
-        if (nsn_unlikely(size > endpoint->io_bufs_size)) {
+        if (nsn_unlikely(size == 0 || size > endpoint->io_bufs_size)) {
             fprintf(stderr, "[tcpsock] Invalid packet size: %lu. Discarding packet...\n", size);
             tx_count++;
             continue;
@@ -371,38 +392,46 @@ NSN_DATAPATH_TX(tcpsock)
             }
 
             // First, packet size. Asynchronous!
-            if (nsn_unlikely((ret = write(conn->s_sockfd[p], &size, sizeof(size))) < 0)) {    
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // Because we cannot guarantee that all peers have received this packet, we consider this
-                    // as an error case. To avoid this, we need to design a more sophisticated protocol that 
-                    // keeps track of which peer received which packet.
-                    if (p > 0) {
+            nb_tx = 0;
+            char* buf_size_ptr = (char*)&size;
+            while(nb_tx < sizeof(size)) {
+                if ((ret = send(conn->s_sockfd[p], buf_size_ptr, sizeof(size) - nb_tx, MSG_DONTWAIT)) < 0) {    
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        if (p == 0 && !nb_tx) {
+                            // no send happens now: retry! Do not continue as we would disalign the peers
+                            // we can do this because we haven't sent anything yet
+                            goto finalize_send;
+                        } else {
+                            // because we already sent some bytes (to p or to some other peer), we are now
+                            // committed to send the entire message, so we must retry the send here until it
+                            // is either successful or it fails.
+                            ret = 0;
+                            goto retry;
+                        }
+                    } else {
                         fprintf(stderr, "[tcpsock] send() size failed: %s\n", strerror(errno));
                         close(conn->s_sockfd[p]);
                         conn->s_sockfd[p] = -1;
                         atomic_fetch_sub(&conn->connected_peers, 1); 
-                        // continue because we already sent the pkt to at least one peer
-                        continue;
-                    } else {
-                        // no send happens now: retry! Do not continue as we would disalign the peers
-                        goto finalize_send;
+                        break;
                     }
-                } else {
-                    fprintf(stderr, "[tcpsock] send() size failed: %s\n", strerror(errno));
-                    close(conn->s_sockfd[p]);
-                    conn->s_sockfd[p] = -1;
-                    atomic_fetch_sub(&conn->connected_peers, 1); 
-                    continue;
                 }
+retry:
+                nb_tx += ret;
+                buf_size_ptr += ret;
             } 
+            if (nb_tx != sizeof(size)) {
+                fprintf(stderr, "[tcpsock] error: sent %ld bytes, but expected were %lu\n", ret, sizeof(size));
+                continue;
+            }
 
             // Then, the actual packet. Now that we committed by sending a size, we must send synchronously
             nb_tx = 0;
             while(nb_tx < size) {
-                if((ret = write(conn->s_sockfd[p], data, size - nb_tx)) < 0) {
+                if((ret = send(conn->s_sockfd[p], data, size - nb_tx, MSG_DONTWAIT)) < 0) {
                     if (errno != EAGAIN && errno != EWOULDBLOCK) {
                         // fatal error: stop sending data to this peer
-                        fprintf(stderr, "[tcpsock] send() data failed AT %u: %s\n", debug_tx+1, strerror(errno));
+                        fprintf(stderr, "[tcpsock] send() data failed: %s\n", strerror(errno));
                         close(conn->s_sockfd[p]);
                         conn->s_sockfd[p] = -1;
                         atomic_fetch_sub(&conn->connected_peers, 1); 
@@ -414,7 +443,7 @@ NSN_DATAPATH_TX(tcpsock)
                 nb_tx += ret;
                 data  += ret;
             }
-            if(nsn_unlikely(nb_tx != size)) {
+            if(nb_tx != size) {
                 fprintf(stderr, "[tcpsock] error: sent %lu bytes, but expected were %lu\n", nb_tx, size);
                 continue;
             }
@@ -451,61 +480,87 @@ NSN_DATAPATH_RX(tcpsock)
         if (ep_sk->s_sockfd[p] == -1) {
             continue;
         }
-        
+
+        nb_rx = 0;
         buf_size = 0;
-        if (nsn_likely((ret = read(ep_sk->s_sockfd[p], &buf_size, sizeof(buf_size)))) > 0) {
-            // if something fails now, we must close the connection as the protocol is broken
-            if (nsn_unlikely(buf_size > endpoint->io_bufs_size)) {
-                fprintf(stderr, "[tcpsock] rx protocol error: invalid packet size %lu\n", buf_size);
-                close(ep_sk->s_sockfd[p]);
-                ep_sk->s_sockfd[p] = -1;
-                atomic_fetch_sub(&ep_sk->connected_peers, 1);
-                continue;
-            }    
-
-            // Wait for the full packet. We assume that it is sent immediately.
-            nb_rx = 0;
-            while (nb_rx < buf_size) {            
-                if((ret = read(ep_sk->s_sockfd[p], data, buf_size - nb_rx)) < 0) {
-                    if(errno != EAGAIN && errno != EWOULDBLOCK) {
-                        // Something failed 
-                        fprintf(stderr, "\n[tcpsock] recvfrom() failed: %s\n", strerror(errno));
-                        close(ep_sk->s_sockfd[p]);
-                        ep_sk->s_sockfd[p] = -1;
-                        atomic_fetch_sub(&ep_sk->connected_peers, 1);
-                        break;       
-                    }
-                    continue;
+        char *buf_size_ptr = (char*)&buf_size;
+        while (nb_rx < sizeof(buf_size)) {            
+            if ((ret = recv(ep_sk->s_sockfd[p], buf_size_ptr, sizeof(buf_size) - nb_rx, MSG_DONTWAIT)) <= 0) {
+                if (ret == 0) {
+                    // Connection closed
+                    fprintf(stderr, "[tcpsock] connection closed by %s\n", peers[p]);
+                    close(ep_sk->s_sockfd[p]);
+                    ep_sk->s_sockfd[p] = -1;
+                    atomic_fetch_sub(&ep_sk->connected_peers, 1);
+                    break;
                 }
-                nb_rx += ret;
-                data  += ret;
-            }
-            if (nsn_unlikely(nb_rx != buf_size)) {
+                if(errno != EAGAIN && errno != EWOULDBLOCK) {
+                    // Something failed 
+                    fprintf(stderr, "[tcpsock] recv() failed: %s\n", strerror(errno));
+                    close(ep_sk->s_sockfd[p]);
+                    ep_sk->s_sockfd[p] = -1;
+                    atomic_fetch_sub(&ep_sk->connected_peers, 1);
+                    break;       
+                }
+
+                // I'm here because I received EAGAIN or EWOULDBLOCK
+                // If I have received some bytes, I must retry, otherwise I must return
+                if (nb_rx == 0) {
+                    break;
+                }
+
                 continue;
             }
-
-            // Update the pending tx descriptor
-            u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &ep_sk->pending_rx_buf, sizeof(ep_sk->pending_rx_buf), 1, NULL);
-            if (np == 0) {
-                fprintf(stderr, "[tcpsock] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
-                return i;
-            }
-
-            // Set the size as packet metadata
-            *size = buf_size;
-            i++;
-            *buf_count = *buf_count - 1;
-        } else {
-            if(errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS) {
-                // Something failed 
-                fprintf(stderr, "read() failed: %s\n", strerror(errno));    
-                close(ep_sk->s_sockfd[p]);
-                ep_sk->s_sockfd[p] = -1;    
-                atomic_fetch_sub(&ep_sk->connected_peers, 1);
-            }
+            nb_rx += ret;
+            buf_size_ptr += ret;
+        }
+        if (nb_rx != sizeof(buf_size)) {
             continue;
         }
 
+        // if something fails now, we must close the connection as the protocol is broken
+        if (buf_size == 0 || buf_size > endpoint->io_bufs_size) {
+            fprintf(stderr, "[tcpsock] rx protocol error: invalid packet size %lu\n", buf_size);
+            close(ep_sk->s_sockfd[p]);
+            ep_sk->s_sockfd[p] = -1;
+            atomic_fetch_sub(&ep_sk->connected_peers, 1);
+            continue;
+        }    
+
+        // Wait for the full packet. We assume that it is sent immediately.
+        nb_rx = 0;
+        while (nb_rx < buf_size) {            
+            if((ret = recv(ep_sk->s_sockfd[p], data, buf_size - nb_rx, MSG_DONTWAIT)) <= 0) {
+                if(errno != EAGAIN && errno != EWOULDBLOCK) {
+                    // Something failed 
+                    fprintf(stderr, "\n[tcpsock] recvfrom() failed: %s\n", strerror(errno));
+                    close(ep_sk->s_sockfd[p]);
+                    ep_sk->s_sockfd[p] = -1;
+                    atomic_fetch_sub(&ep_sk->connected_peers, 1);
+                    break;       
+                }
+                continue;
+            }
+            nb_rx += ret;
+            data  += ret;
+        }
+        if (nb_rx != buf_size) {
+            fprintf(stderr, "[tcpsock] recv() failed before receiving all data: %s\n", strerror(errno));
+            continue;
+        }
+
+        // Update the pending tx descriptor
+        u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &ep_sk->pending_rx_buf, sizeof(ep_sk->pending_rx_buf), 1, NULL);
+        if (np == 0) {
+            fprintf(stderr, "[tcpsock] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+            return i;
+        }
+
+        // Set the size as packet metadata
+        *size = buf_size;
+        i++;
+        *buf_count = *buf_count - 1;
+        
         // set the receive buffer for next rx
         bufs[i] = ep_sk->pending_rx_buf;
         data    = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size);    
