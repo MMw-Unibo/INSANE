@@ -531,7 +531,7 @@ NSN_DATAPATH_RX(tcpsock)
         nb_rx = 0;
         while (nb_rx < buf_size) {            
             if((ret = recv(ep_sk->s_sockfd[p], data, buf_size - nb_rx, MSG_DONTWAIT)) <= 0) {
-                if(errno != EAGAIN && errno != EWOULDBLOCK) {
+                if(ret == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
                     // Something failed 
                     fprintf(stderr, "\n[tcpsock] recvfrom() failed: %s\n", strerror(errno));
                     close(ep_sk->s_sockfd[p]);
