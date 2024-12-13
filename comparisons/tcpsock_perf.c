@@ -13,6 +13,7 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include <netinet/tcp.h>
 
 #define unused(x) (void)(x)
 
@@ -95,13 +96,68 @@ static inline uint64_t get_clock_realtime_ns() {
     return ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 
+static ssize_t send_data(int sd, char *data, size_t size, test_config_t *params) {
+    ssize_t nb_tx = 0;
+    ssize_t ret;
+    char *tmp_data = data;
+    while(nb_tx < (ssize_t)size) {
+        if((ret = write(sd, tmp_data, size - nb_tx)) < 0) {  
+            if (!params->blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // retry
+                continue;
+            }
+            fprintf(stderr, "write() size failed: %s\n", strerror(errno));
+            return -1;
+        }  
+        nb_tx += ret;
+        tmp_data += ret;
+    }
+    if(nb_tx != (ssize_t)size) {
+        fprintf(stderr, "error: sent %lu bytes, but expected were %lu\n", nb_tx, size);
+        return -1;
+    }
+
+    return nb_tx;
+}
+
+static ssize_t recv_data(int sd, char *data, size_t size, test_config_t *params) {
+    ssize_t nb_rx = 0;
+    ssize_t ret;
+    char *tmp_data = data;
+    while (nb_rx < (ssize_t)size) {            
+        if((ret = read(sd, tmp_data, size - nb_rx)) <= 0) {
+            if(!params->blocking && ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // retry
+                continue;
+            }
+            // Something failed 
+            if (ret == 0) {
+                fprintf(stderr, "read() failed: connection reset by peer\n");
+                return ret;
+            } else {
+                fprintf(stderr, "read() failed: %s\n", strerror(errno));
+                return -1;
+            }
+        }
+        nb_rx    += ret;
+        tmp_data += ret;
+    }
+    
+    if (nb_rx != (ssize_t)size) {
+        fprintf(stderr, "Received packet size does not match the expected size\n");
+        return -1;
+    }    
+
+    return nb_rx;
+}
+
 //--------------------------------------------------------------------------------------------------
 void do_source(int sd, test_config_t *params) {
     // char             *msg     = MSG;
     uint64_t          counter = 0;
-    char             *payload, *tmp_data;
+    char             *payload;
     struct test_data *data;
-    int               ret;
+    ssize_t           ret;
 
     // Allocate payload of proper size
     payload = (char *)malloc(params->payload_size);
@@ -119,65 +175,40 @@ void do_source(int sd, test_config_t *params) {
         // Fill it up the buffer
         data          = (struct test_data *)payload;
         data->tx_time = tx_time;
-        data->cnt     = counter++;
+        data->cnt     = counter;
         // strncpy(data->msg, msg, strlen(msg) + 1);
 
         /* First, send the packet size */
-        while ((ret = write(sd, &params->payload_size, sizeof(params->payload_size)) < 0)) {    
-            if (!params->blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // retry
-                usleep(1);
-                tx_time = get_clock_realtime_ns();
-                data->tx_time = tx_time;
-                continue;
-            }
-            perror("Error sending TCP packet size\n");
-            return;
-        }
+        if ((ret = send_data(sd, (char*)&params->payload_size, sizeof(params->payload_size), params)) < (ssize_t)sizeof(params->payload_size)) {
+            goto stop;
+        }        
 
         /* Then, send the actual data */
-        size_t nb_tx = 0;
-        tmp_data = payload;
-        while(nb_tx < params->payload_size) {
-            if((ret = write(sd, tmp_data, params->payload_size - nb_tx)) < 0) {
-                if (params->blocking || (!params->blocking && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                    fprintf(stderr, "send() data failed %s\n", strerror(errno));
-                    return;
-                }
-                continue;
-            }
-            nb_tx += ret;
-            tmp_data  += ret;
+        if ((ret = send_data(sd, payload, params->payload_size, params)) < (ssize_t)params->payload_size) {
+            goto stop;
         }
 
-        if(nb_tx != params->payload_size) {
-            fprintf(stderr, "error: sent %lu bytes, but expected were %lu\n", nb_tx, params->payload_size);
-            return;
-        }
+        ++counter;
 
     }
     printf("Finished sending %lu messages. Exiting...\n", counter);
 
     // Wait for the other part to close the connection
-    while((ret = read(sd, data, 1)) > 0) {
-        if (!params->blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // retry
-            usleep(1);
-            continue;
-        }
+    while((ret = read(sd, payload, 1)) > 0) {
+        usleep(1);
     }
 
+stop:
     free(payload);
 }
 
 //--------------------------------------------------------------------------------------------------
 void do_sink(int sd, test_config_t *params) {
-    char             *payload, *data_ptr;
-    uint64_t          first_time = 0, last_time = 0;
-    uint64_t          counter = 0;
-    size_t            nb_rx;
-    int               ret;
-    size_t            recv_size;
+    char     *payload;
+    uint64_t first_time = 0, last_time = 0;
+    uint64_t counter = 0;
+    ssize_t  ret;
+    ssize_t   recv_size;
     
     // Allocate payload of proper size
     payload = (char *)malloc(params->payload_size);
@@ -187,52 +218,24 @@ void do_sink(int sd, test_config_t *params) {
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
         /* First receive the packet size */
-        while ((ret = read(sd, &recv_size, sizeof(recv_size))) <= 0) {
-            if (!params->blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // retry
-                usleep(1);
-                continue;
-            }
-            perror("Error receiving TCP packet size");
-            free(payload);
-            return;   
+        if ((ret = recv_data(sd, (char*)&recv_size, sizeof(recv_size), params)) < (ssize_t)sizeof(recv_size)) {
+            goto stop;
         }
-
-        if (recv_size != params->payload_size) {
+        if (recv_size != (ssize_t)params->payload_size) {
             fprintf(stderr, "Received packet size does not match the expected size\n");
-            free(payload);
-            return;
+            goto stop;
         }
-
-        /* Receive the pong packet data */
-        nb_rx = 0;
-        data_ptr = payload;
-        while (nb_rx < recv_size) {            
-            if((ret = read(sd, data_ptr, recv_size - nb_rx)) < 0) {
-                if(params->blocking || (!params->blocking && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                    // Something failed 
-                    fprintf(stderr, "\nrecvfrom() failed: %s\n", strerror(errno));
-                    free(payload);
-                    return;
-                }
-                continue;
-            }
-            nb_rx += ret;
-            data_ptr  += ret;
-        }
-
-        if (nb_rx != params->payload_size) {
-            fprintf(stderr, "Received packet size does not match the expected size\n");
-            free(payload);
-            return;
+        
+        /* Receive the packet data */
+        if ((ret = recv_data(sd, payload, recv_size, params)) < recv_size) {
+            goto stop;
         }
 
         if (counter == 0) {
             first_time = get_clock_realtime_ns();
         }
 
-        counter++;
-
+        ++counter;
         // struct test_data *data = (struct test_data *)payload;
         // fprintf(stderr, "(%ld) received: %ld, %s)\n", counter, data->cnt, data->msg);
     }
@@ -256,6 +259,7 @@ void do_sink(int sd, test_config_t *params) {
     fprintf(stdout, "%lu,%lu,%.3f,%.3f,%.3f\n", counter, params->payload_size,
             (double)elapsed_time_ns / ((double)1e6), throughput, mbps);
 
+stop:
     free(payload);
 }
 
@@ -265,7 +269,7 @@ void do_ping(int sd, test_config_t *params) {
     uint64_t         counter = 0;
     uint64_t         send_time, response_time, latency;
     ssize_t          ret;
-    char            *tmp_data;
+    ssize_t           recv_size;
 
     if(params->payload_size < sizeof(struct test_data)) {
         fprintf(stderr, "Payload size too small\n");
@@ -291,66 +295,29 @@ void do_ping(int sd, test_config_t *params) {
         // strncpy(data.msg, msg, strlen(msg) + 1);
 
         /* First, send the packet size */
-        while ((ret = write(sd, &params->payload_size, sizeof(params->payload_size)) < 0)) {    
-            if (!params->blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // retry
-                continue;
-            }
-            perror("Error sending TCP packet size");
-            return;
-        }
+        if ((ret = send_data(sd, (char*)&params->payload_size, sizeof(params->payload_size), params)) < (ssize_t)sizeof(params->payload_size)) {
+            goto stop;
+        }        
 
         /* Then, send the actual data */
-        size_t nb_tx = 0;
-        tmp_data = (char*)data;
-        while(nb_tx < params->payload_size) {
-            if((ret = write(sd, tmp_data, params->payload_size - nb_tx)) < 0) {
-                if (params->blocking || (!params->blocking && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                    // fatal error: stop sending data to this peer
-                    fprintf(stderr, "send() data failed %s\n", strerror(errno));
-                    return;
-                }
-                continue;
-            }
-            nb_tx     += ret;
-            tmp_data  += ret;
+        if ((ret = send_data(sd, (char*)data, params->payload_size, params)) < (ssize_t)params->payload_size) {
+            goto stop;
         }
-        if(nb_tx != params->payload_size) {
-            fprintf(stderr, "error: sent %lu bytes, but expected were %lu\n", nb_tx, params->payload_size);
-            return;
-        }
+
         // fprintf(stdout, "(%lu) time: %ld", counter, send_time);
 
-        /* Wait for the pong packet size */
-        size_t recv_size;
-        while ((ret = read(sd, &recv_size, sizeof(recv_size))) <= 0) {
-            if (!params->blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // retry
-                continue;
-            }
-            perror("Error receiving TCP packet data");
-            return;   
+        /* Wait for the ping packet size */
+        if ((ret = recv_data(sd, (char*)&recv_size, sizeof(recv_size), params)) < (ssize_t)sizeof(recv_size)) {
+            goto stop;
         }
-
-        if (recv_size != params->payload_size) {
+        if (recv_size != (ssize_t)params->payload_size) {
             fprintf(stderr, "Received packet size does not match the expected size\n");
-            return;
+            goto stop;
         }
-
-        /* Receive the pong packet data */
-        size_t nb_rx = 0;
-        tmp_data = (char*)data;
-        while (nb_rx < recv_size) {            
-            if((ret = read(sd, tmp_data, recv_size - nb_rx)) < 0) {
-                if(params->blocking || (!params->blocking && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                    // Something failed 
-                    fprintf(stderr, "\nrecvfrom() failed: %s\n", strerror(errno));
-                    return;
-                }
-                continue;
-            }
-            nb_rx += ret;
-            tmp_data  += ret;
+        
+        /* Receive the ping packet data */
+        if ((ret = recv_data(sd, (char*)data, recv_size, params)) < recv_size) {
+            goto stop;
         }
 
         /* Compute latency */
@@ -369,14 +336,15 @@ void do_ping(int sd, test_config_t *params) {
         }
     }
 
+stop:
     free(data);
 }
 
 //--------------------------------------------------------------------------------------------------
 void do_pong(int sd, test_config_t *params) {
-    ssize_t          ret;
-    uint64_t         counter = 0;
-    char            *tmp_data;
+    ssize_t  ret;
+    uint64_t counter = 0;
+    ssize_t  recv_size;
 
     if(params->payload_size < sizeof(struct test_data)) {
         fprintf(stderr, "Payload size too small\n");
@@ -391,78 +359,33 @@ void do_pong(int sd, test_config_t *params) {
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
         /* Wait for the ping packet size */
-        size_t recv_size;
-        while ((ret = read(sd, &recv_size, sizeof(recv_size))) <= 0) {
-            if (!params->blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // retry
-                continue;
-            }
-            perror("Error receiving TCP packet size");
-            return;   
+        if ((ret = recv_data(sd, (char*)&recv_size, sizeof(recv_size), params)) < (ssize_t)sizeof(recv_size)) {
+            goto stop;
         }
-
-        if (recv_size != params->payload_size) {
-            fprintf(stderr, "Received packet size does not match the expected size\n");
-            return;
-        }
-
+        
         /* Receive the ping packet data */
-        size_t nb_rx = 0;
-        tmp_data = (char*)data;
-        while (nb_rx < recv_size) {            
-            if((ret = read(sd, tmp_data, recv_size - nb_rx)) < 0) {
-                if(params->blocking || (!params->blocking && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                    // Something failed 
-                    fprintf(stderr, "\nrecvfrom() failed: %s\n", strerror(errno));
-                    return;
-                }
-                continue;
-            }
-            nb_rx += ret;
-            tmp_data  += ret;
+        if ((ret = recv_data(sd, (char*)data, recv_size, params)) < recv_size) {
+            goto stop;
         }
-
-        if (nb_rx != params->payload_size) {
+        if (recv_size != (ssize_t)params->payload_size) {
             fprintf(stderr, "Received packet size does not match the expected size\n");
-            return;
+            goto stop;
         }
 
         ++counter;
+        recv_size = ret;
 
-        /* Send it back. First the size */
-        // fprintf(stdout, "Forwarding sample %lu\n", data->cnt);
-        /* First, send the packet size */
-        while ((ret = write(sd, &params->payload_size, sizeof(params->payload_size)) < 0)) {    
-            if (!params->blocking && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                // retry
-                continue;
-            }
-            perror("Error sending TCP packet size");
-            return;
-        }
+        /* First, send back the packet size */
+        if ((ret = send_data(sd, (char*)&recv_size, sizeof(recv_size), params)) < (ssize_t)sizeof(recv_size)) {
+            goto stop;
+        }        
 
         /* Then, send the actual data */
-        size_t nb_tx = 0;
-        tmp_data = (char*)data;
-        while(nb_tx < params->payload_size) {
-            if((ret = write(sd, tmp_data, params->payload_size - nb_tx)) < 0) {
-                if (params->blocking || (!params->blocking && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                    // fatal error: stop sending data to this peer
-                    fprintf(stderr, "send() data failed %s\n", strerror(errno));
-                    return;
-                }
-                continue;
-            }
-            nb_tx += ret;
-            tmp_data  += ret;
-        }
-
-        if(nb_tx != params->payload_size) {
-            fprintf(stderr, "error: sent %lu bytes, but expected were %lu\n", nb_tx, params->payload_size);
-            return;
+        if ((ret = send_data(sd, (char*)data, recv_size, params)) < recv_size) {
+            goto stop;
         }
     }
-
+stop:
     free(data);
 }
 
