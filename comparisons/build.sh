@@ -1,10 +1,12 @@
 CC=gcc
-CFLAGS="-Wall -Wextra -Werror -std=c11"
+CFLAGS="-Wall -Wextra -Werror -Wno-address-of-packed-member -std=c11"
 LDFLAGS="-lm -ldl -lpthread"
 DEFINES=""
 
 BUILD_TYPE=debug
 PROJECT_NAME=all
+
+DPDK=`pkg-config --cflags --libs libdpdk --static`
 
 if [ $# -eq 1 ]; then
     BUILD_TYPE=$1
@@ -25,5 +27,6 @@ fi
 
 cd build
 $CC $CFLAGS $LDFLAGS ../udpsock_perf.c $DEFINES -o udpsock-perf
+$CC $CFLAGS $LDFLAGS ../udpdpdk_perf.c $DEFINES -o udpdpdk-perf $DPDK
 $CC $CFLAGS $LDFLAGS ../tcpsock_perf.c $DEFINES -o tcpsock-perf
 cd ..
