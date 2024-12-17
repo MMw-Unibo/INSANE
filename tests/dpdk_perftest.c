@@ -29,7 +29,8 @@
     }
 
 #define MSG              "hello, DPDK!"
-#define MAX_PAYLOAD_SIZE 9000
+#define MTU              1500
+#define MAX_PAYLOAD_SIZE 1470
 #define MIN_PAYLOAD_SIZE 16
 
 #define INSANE_PORT    9999
@@ -78,7 +79,7 @@ void handle(int signum) {
 
 //--------------------------------------------------------------------------------------------------
 void usage(int argc, char *argv[]) {
-    printf("Usage: %s [MODE] [OPTIONS]                  \n"
+    printf("Usage: %s [EAL-ARGS] -- [MODE] [OPTIONS]    \n"
            "MODE: source|sink|ping|pong                 \n"
            "OPTIONS:                                    \n"
            "-h: display this message and exit           \n"
@@ -215,11 +216,8 @@ void do_source(struct rte_mempool *mempool, test_config_t *params) {
         }
 
         ret = rte_eth_tx_burst(params->port_id, params->queue_id, mbuf, actual_burst);
+        (void)ret;
         LOG_DEBUG("Sent %d packets", ret);
-    }
-
-    for (uint16_t i = 0; i < params->burst_size; i++) {
-        rte_pktmbuf_free(mbuf[i]);
     }
 }
 
@@ -236,28 +234,26 @@ void do_sink(struct rte_mempool *mempool, test_config_t *params) {
 
         nb_rx = rte_eth_rx_burst(params->port_id, params->queue_id, mbufs, params->burst_size);
 
-        if (nb_rx > 0) {
-            for (uint16_t i = 0; i < nb_rx; i++) {
+        for (uint16_t i = 0; i < nb_rx; i++) {
 
-                // Filter relevant packets: UDP port must be INSANE_PORT
-                struct rte_ipv4_hdr *ip_hdr = rte_pktmbuf_mtod_offset(
-                    mbufs[i], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
-                struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
+            // Filter relevant packets: UDP port must be INSANE_PORT
+            struct rte_ipv4_hdr *ip_hdr  = rte_pktmbuf_mtod_offset(mbufs[i], struct rte_ipv4_hdr *,
+                                                                   sizeof(struct rte_ether_hdr));
+            struct rte_udp_hdr  *udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
 
-                if (ip_hdr->next_proto_id == IPPROTO_UDP &&
-                    rte_be_to_cpu_16(udp_hdr->dst_port) == INSANE_PORT)
-                {
+            if (ip_hdr->next_proto_id == IPPROTO_UDP &&
+                rte_be_to_cpu_16(udp_hdr->dst_port) == INSANE_PORT)
+            {
 
-                    if (counter == 0) {
-                        first_time = get_clock_realtime_ns();
-                    }
-
-                    counter++;
-                    // struct test_data *data = (struct test_data *)buf.data;
-                    // fprintf(stderr, "(%ld) received: %ld, %s)\n", counter, data->cnt, data->msg);
+                if (counter == 0) {
+                    first_time = get_clock_realtime_ns();
                 }
-                rte_pktmbuf_free(mbufs[i]);
+
+                counter++;
+                // struct test_data *data = (struct test_data *)buf.data;
+                // fprintf(stderr, "(%ld) received: %ld, %s)\n", counter, data->cnt, data->msg);
             }
+            rte_pktmbuf_free(mbufs[i]);
         }
     }
     last_time = get_clock_realtime_ns();
@@ -276,7 +272,7 @@ void do_sink(struct rte_mempool *mempool, test_config_t *params) {
     //         "Measured throughput: %.3f Mmsg/s\n"
     //         "Measured banwdidth:  %.3f Mbps  \n\n",
     //         counter, (double)elapsed_time_ns / ((double)1e6), throughput, mbps);
-    fprintf(stdout, "%lu,%lu,%.3f,%.3f,%.3f\n", counter, params->payload_size,
+    fprintf(stdout, "%lu,%u,%.3f,%.3f,%.3f\n", counter, params->payload_size,
             (double)elapsed_time_ns / ((double)1e6), throughput, mbps);
 }
 
@@ -297,7 +293,7 @@ void do_ping(struct rte_mempool *mempool, test_config_t *params) {
     struct rte_mbuf *tx_mbuf = rte_pktmbuf_alloc(mempool);
     pkt_prepare(tx_mbuf, params);
 
-    while (g_running) {
+    while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
         if (params->sleep_time) {
             sleep(params->sleep_time);
@@ -315,7 +311,7 @@ void do_ping(struct rte_mempool *mempool, test_config_t *params) {
         LOG_TRACE("(%d) time: %ld (%ld)", counter, send_time);
 
         pong_received = 0;
-        do {
+        while (!pong_received) {
             // Receive 1, but 8 is the minimum burst size to ensure compatibility
             ret = rte_eth_rx_burst(params->port_id, params->queue_id, rx_mbuf, 8);
             for (uint16_t j = 0; j < ret; j++) {
@@ -331,13 +327,12 @@ void do_ping(struct rte_mempool *mempool, test_config_t *params) {
                     latency       = response_time - send_time;
                     pong_received = 1;
 
-                    fprintf(stdout, "(%ld) RTT: %.3f us\n", counter, (float)latency / 1000.0F);
+                    fprintf(stdout, "%.3f\n", (float)latency / 1000.0F);
                 }
                 rte_pktmbuf_free(rx_mbuf[j]);
             }
-        } while (!pong_received);
+        }
     }
-    rte_pktmbuf_free(tx_mbuf);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -348,10 +343,11 @@ void do_pong(struct rte_mempool *mempool, test_config_t *params) {
     struct rte_ipv4_hdr  *ih;
     uint32_t              ia;
     struct rte_udp_hdr   *uh;
-    uint16_t              nb_rx = 0;
+    uint64_t              counter = 0;
+    uint16_t              nb_rx   = 0;
 
     struct rte_mbuf *mbuf[8];
-    while (g_running) {
+    while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
         nb_rx = rte_eth_rx_burst(params->port_id, params->queue_id, mbuf, 8);
 
@@ -384,6 +380,9 @@ void do_pong(struct rte_mempool *mempool, test_config_t *params) {
 
                 // Send packet back
                 rte_eth_tx_burst(params->port_id, params->queue_id, &mbuf[j], 1);
+                ++counter;
+            } else {
+                // Discard non-relevant packet
                 rte_pktmbuf_free(mbuf[j]);
             }
         }
@@ -453,10 +452,6 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
                 fprintf(stderr, "! Invalid value for --num-msg option: %s\n", argv[i]);
                 return -1;
             }
-            if (config->max_msg < 0) {
-                fprintf(stderr, "! max_msg: %s\n", argv[i]);
-                return -1;
-            }
             continue;
         }
         // Burst size
@@ -483,10 +478,6 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
                 fprintf(stderr, "! Invalid value for sleep-time option: %s\n", argv[i]);
                 return -1;
             }
-            if (config->sleep_time < 0) {
-                fprintf(stderr, "! Invalid value for --size option: %s\n", argv[i]);
-                return -1;
-            }
             continue;
         }
     }
@@ -503,15 +494,16 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
 }
 
 //--------------------------------------------------------------------------------------------------
-static inline int port_init(struct rte_mempool *mempool, uint16_t mtu) {
-    int valid_port = rte_eth_dev_is_valid_port(0);
+static inline int port_init(struct rte_mempool *mempool, uint16_t mtu, test_config_t *params) {
+    int valid_port = rte_eth_dev_is_valid_port(params->port_id);
     if (!valid_port)
         return -1;
 
     struct rte_eth_dev_info dev_info;
-    int                     retval = rte_eth_dev_info_get(0, &dev_info);
+    int                     retval = rte_eth_dev_info_get(params->port_id, &dev_info);
     if (retval != 0) {
-        fprintf(stderr, "[error] cannot get device (port %u) info: %s\n", 0, strerror(-retval));
+        fprintf(stderr, "[error] cannot get device (port %u) info: %s\n", params->port_id,
+                strerror(-retval));
         return retval;
     }
 
@@ -519,7 +511,7 @@ static inline int port_init(struct rte_mempool *mempool, uint16_t mtu) {
     uint16_t actual_mtu = RTE_MIN(mtu, dev_info.max_mtu);
 
     // Configure the device
-    uint16_t            port_id = 0;
+    uint16_t            port_id = params->port_id;
     struct rte_eth_conf port_conf;
     memset(&port_conf, 0, sizeof(port_conf));
     port_conf.rxmode.mtu = actual_mtu;
@@ -604,7 +596,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Port init */
-    ret = port_init(mbuf_pool, 9000);
+    ret = port_init(mbuf_pool, MTU, &params);
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "error with port initialization\n");
     }
@@ -630,6 +622,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Terminate */
+    rte_eth_dev_stop(params.port_id);
     rte_eal_cleanup();
     return 0;
 }
