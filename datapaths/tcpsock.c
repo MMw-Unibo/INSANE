@@ -3,6 +3,7 @@
 #include "../src/nsn_memory.c"
 #include "../src/nsn_os_linux.c"
 #include "../src/nsn_ringbuf.c"
+#include "../src/nsn_config.c"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -345,13 +346,27 @@ NSN_DATAPATH_CONN_MANAGER(tcpsock)
 
 NSN_DATAPATH_INIT(tcpsock)
 {
+    nsn_thread_ctx_t this_thread = nsn_thread_ctx_alloc();
+    this_thread.is_main_thread   = false;
+    nsn_thread_set_ctx(&this_thread);
+
     // Initialize local state 
     n_peers = ctx->n_peers;
     peers = ctx->peers;
-    local_ip = ctx->local_ip;
+
+    // Retrieve the local IP from the list of parameters
+    string_t local_ip_str;
+    local_ip_str.data = (u8*)malloc(16);
+    local_ip_str.len = 0;
+    int ret = nsn_config_get_string_from_list(&ctx->params, str_lit("ip"), &local_ip_str);
+    if (ret < 0) {
+        fprintf(stderr, "[tcpsock] nsn_config_get_string_from_list() failed: no option \"ip\" found\n");
+        return ret;
+    }
+    local_ip = to_cstr(local_ip_str);
+    fprintf(stderr, "[tcpsock] parameter: ip: %s\n", local_ip);
 
     // Setup the connections to the peers
-    int ret = 0;
     ep_initializer_t *ep_in;
     list_for_each_entry(ep_in, endpoint_list, node) {
         ret = tcpsock_datapath_update(ep_in->ep);
@@ -586,7 +601,7 @@ NSN_DATAPATH_DEINIT(tcpsock)
 
     n_peers = 0;
     peers = NULL;
-    local_ip = NULL;
+    free(local_ip);
 
     return res;
 }

@@ -580,6 +580,8 @@ dataplane_thread_proc(void *arg)
 #endif
     u32 state;
 
+    size_t ip_str_size = 16;
+    char string_buf[ip_str_size*4];
     temp_mem_arena_t data_arena = nsn_thread_scratch_begin(NULL, 0);
 
 wait: 
@@ -601,7 +603,7 @@ wait:
     snprintf(datapath_lib, sizeof(datapath_lib), "./datapaths/lib%s.so", to_cstr(datapath_name));
     struct nsn_os_module module = nsn_os_load_library(datapath_lib, NsnOsLibraryFlag_Now);
     if (module.handle == NULL) {
-        log_error("[thread %d] Failed to load library: %s\n", self, datapath_lib);
+        log_error("[thread %d] Failed to load library %s: %s\n", self, datapath_lib, dlerror());
         goto quit;
     }
 
@@ -626,19 +628,13 @@ wait:
     // 1a) Create the plugin context
     nsn_datapath_ctx_t ctx;
     memory_zero_struct(&ctx);
-    size_t ip_str_size = 16;
 
-    // 1b) Retrieve the local IP address from the config file
-    char* string_buf = mem_arena_push_array(data_arena.arena, char, ip_str_size*4);
+    // 1b) Retrieve the parameters passed to the plugin in the config file
     bzero(string_buf, ip_str_size*4);
     sprintf(string_buf, "plugins.%s", to_cstr(datapath_name));
-    string_t local_ip;
-    local_ip.data = (u8*)malloc(ip_str_size);
-    local_ip.len = 0;
-    nsn_config_get_string(config, str_cstr(string_buf), str_lit("ip"), &local_ip);
-    mem_arena_pop(data_arena.arena, ip_str_size*4);
+    ctx.params = list_head_init(ctx.params);
+    nsn_config_get_param_list(config, str_cstr(string_buf), &ctx.params, data_arena.arena);
     
-    ctx.local_ip = to_cstr(local_ip);
     ctx.max_tx_burst = args->max_tx_burst;
     ctx.max_rx_burst = args->max_rx_burst;
 
@@ -773,7 +769,9 @@ wait:
     
     mem_arena_pop(data_arena.arena, sizeof(char)*ip_str_size*ctx.n_peers); // peers' IPs
     mem_arena_pop(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers); // ctx.peers
-    free(ctx.local_ip);
+
+    // Free the param list
+    nsn_config_free_param_list(&ctx.params, data_arena.arena);
 
     state = at_load(&args->state, mo_rlx);
     log_debug("[thread %d] state: %s (%d)\n", self, nsn_dataplane_thread_state_str[state], state);

@@ -140,6 +140,40 @@ nsn_config_get_opt(mem_arena_t *arena, nsn_cfg_t *cfg, string_t sec, string_t ke
     return NULL;
 }
 
+list_head_t *
+nsn_config_get_opt_list(mem_arena_t *arena, nsn_cfg_t *cfg, string_t sec) {
+    string_t delims[]      = { str_lit(".") };
+    string_list_t sections = str_split(arena, sec, delims, array_count(delims));
+    string_t section_name, sub_section_name;
+
+    if (sections.count == 1) {
+        section_name = sections.head->string;
+        nsn_cfg_sec_t *section = NULL;
+        list_for_each_entry(section, &cfg->sections, list) {
+            if (str_eq(section->name, section_name)) {
+                return &section->opts;
+            }
+        }
+    } else if (sections.count == 2) {
+        section_name     = sections.head->string;
+        sub_section_name = sections.head->next->string;
+
+        nsn_cfg_sec_t *section = NULL;
+        list_for_each_entry(section, &cfg->sections, list) {
+            if (str_eq(section->name, section_name)) {
+                nsn_cfg_sec_t *sub_section = NULL;
+                list_for_each_entry(sub_section, &section->sub_sections, list) {
+                    if (str_eq(sub_section->name, sub_section_name)) {
+                        return &sub_section->opts;
+                    }
+                }
+            }
+        }
+    }
+
+    return NULL;    
+}
+
 int 
 nsn_config_get_int(nsn_cfg_t *cfg, string_t sec, string_t key, int *out_value)
 {
@@ -178,6 +212,112 @@ nsn_config_get_string(nsn_cfg_t *cfg, string_t sec, string_t key, string_t* out_
     }
 
     log_debug("found option %.*s.%.*s = %.*s\n", (int)sec.len, sec.data, (int)key.len, key.data, (int)opt->string.len, opt->string.data);
+
+    memcpy(out_value->data, opt->string.data, opt->string.len);
+    out_value->len = opt->string.len;
+
+    nsn_thread_scratch_end(scratch);
+    return 0;
+}
+
+int 
+nsn_config_get_param_list(nsn_cfg_t *cfg, string_t sec, list_head_t* out_value, mem_arena_t* arena)
+{
+    temp_mem_arena_t scratch = nsn_thread_scratch_begin(NULL, 0);
+
+    list_head_t* opt_list = nsn_config_get_opt_list(scratch.arena, cfg, sec);
+    if (!opt_list) {
+        log_warn("invalid option: %s\n", to_cstr(sec));
+        return -1;
+    }
+
+    // Copy each element to the output list
+    nsn_cfg_opt_t *opt = NULL;
+    list_for_each_entry(opt, opt_list, list) {
+        nsn_cfg_opt_t *new_opt = mem_arena_push_struct(arena, nsn_cfg_opt_t);
+        memcpy(new_opt, opt, sizeof(nsn_cfg_opt_t));
+        list_add_tail(out_value, &new_opt->list);
+    }
+
+    return 0;
+}
+
+int
+nsn_config_free_param_list(list_head_t* head, mem_arena_t* arena)
+{
+    list_head_t *element, *tmp;
+    list_for_each_safe(element, tmp, head) {
+        mem_arena_pop(arena, sizeof(nsn_cfg_opt_t));
+        list_del(element);
+    }
+
+    if (!list_empty(head)) {
+        log_warn("failed to free all list elements\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+int 
+nsn_config_get_int_from_list(list_head_t* head, string_t key, int *out_value)
+{  
+    if(list_empty(head)) {
+        log_warn("empty list\n");
+        return -1;
+    }
+
+    temp_mem_arena_t scratch = nsn_thread_scratch_begin(NULL, 0);
+
+    nsn_cfg_opt_t *opt = NULL;
+    list_for_each_entry(opt, head, list) {
+        if (str_eq(opt->key, key)) {
+            break;
+        }
+    }
+
+    if (!opt) {
+        log_warn("invalid option: %s\n", to_cstr(key));
+        return -1;
+    }
+
+    if (opt->type != NsnConfigOptType_Number) {
+        return -1;
+    }
+
+    *out_value = (int)opt->number;
+    nsn_thread_scratch_end(scratch);
+    return 0;
+}
+
+int 
+nsn_config_get_string_from_list(list_head_t* head, string_t key, string_t* out_value) {
+    
+    if(list_empty(head)) {
+        log_warn("empty list\n");
+        return -1;
+    }
+
+    temp_mem_arena_t scratch = nsn_thread_scratch_begin(NULL, 0);
+
+    nsn_cfg_opt_t *opt = NULL;
+    list_for_each_entry(opt, head, list) {
+        if (str_eq(opt->key, key)) {
+            break;
+        }
+    }
+   
+    if (!opt) {
+        log_warn("invalid option: %s\n", to_cstr(key));
+        return -1;
+    }
+
+    log_debug("found option %.*s = %.*s\n", (int)key.len, key.data, (int)opt->string.len, opt->string.data);
+
+    if (opt->type != NsnConfigOptType_String) {
+        log_warn("invalid option type\n");
+        return -1;
+    }
 
     memcpy(out_value->data, opt->string.data, opt->string.len);
     out_value->len = opt->string.len;

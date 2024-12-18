@@ -13,8 +13,9 @@
 typedef struct nsn_datapath_ctx nsn_datapath_ctx_t;
 struct nsn_datapath_ctx
 {
-    // Local IP for this plugin
-    char* local_ip;
+    // List of plugin parameters
+    list_head_t params;
+    
     // Array of peers' IPs
     char** peers;
     u16   n_peers;
