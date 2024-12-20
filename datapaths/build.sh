@@ -18,8 +18,9 @@ else
     echo "Invalid build type: $BUILD_TYPE"
     exit 1
 fi
-# $CC $CFLAGS -c dpdk.c -o dpdk.o
-# $CC $CFLAGS -shared -o libdpdk.so dpdk.o $DPDK 
+
+$CC $CFLAGS -c udpdpdk.c -o udpdpdk.o
+$CC $CFLAGS -shared -o libudpdpdk.so udpdpdk.o $DPDK 
 
 # $CC $CFLAGS -c rdma.c -o rdma.o
 # $CC $CFLAGS -shared -o librdma.so rdma.o -lrdmacm -libverbs

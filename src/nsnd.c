@@ -801,15 +801,24 @@ uint32_t nsn_qos_to_plugin_idx(nsn_options_t qos)
 
     // TODO: We need to list the available plugins. Then implement the
     // algorithm described in the paper to find the plugin to match. If 
-    // it does not exist, just return an error.
+    // it does not exist, fallback to another.
+
+    // Return the index of the selected plugin!
+    if (qos.datapath == NSN_QOS_DATAPATH_FAST) {
+        if (qos.reliability == NSN_QOS_RELIABILITY_RELIABLE) {
+            log_info("QOS: fast, unreliable => selected DPDK UDP plugin\n");
+            return 2;
+        }
+    } 
 
     if (qos.reliability == NSN_QOS_RELIABILITY_RELIABLE) {
-        log_info("QOS: reliable => selected TCP plugin\n");
-        return 1;
-    } else {
-        log_info("QOS: unreliable => selected UDP plugin\n");
-        return 0;
+            log_info("QOS: default, reliable => selected kernel TCP plugin\n");
+            return 1;
+        } else {
+            log_info("QOS: default, unreliable => selected kernel UDP plugin\n");
+            return 0;
     }
+    
 }
 
 // --- Helper Functions ---------------------------------------------------------
@@ -1639,8 +1648,8 @@ main(int argc, char *argv[])
 
     // TODO: Automatically detect which plugins are available and can be used by the daemon.
     // Currently, we only consider 1 as available (make it the "udpsock" plugin).
-    char* plugin_set_names[] = {"udpsock", "tcpsock"};
-    plugin_set.count   = 2;
+    char* plugin_set_names[] = {"udpsock", "tcpsock", "udpdpdk"};
+    plugin_set.count   = 3;
 
     plugin_set.plugins = mem_arena_push_array(arena, nsn_plugin_t, plugin_set.count);
     for (usize i = 0; i < plugin_set.count; i++) {
@@ -1697,7 +1706,7 @@ main(int argc, char *argv[])
     // the name is set when the thread moves to the RUNNING state, as it will try to load the dll.
     // The association is done when a new stream for a new plugin is set, and currently is permanent.
     // Future work will include a way to dynamically attach/detach threads to/from plugins.
-    thread_pool.count = 2;
+    thread_pool.count = plugin_set.count;
     thread_pool.threads = mem_arena_push_array(arena, nsn_os_thread_t, thread_pool.count);
     thread_pool.thread_args = mem_arena_push_array(arena, struct nsn_dataplane_thread_args, 
                                                         thread_pool.count);
