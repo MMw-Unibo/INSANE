@@ -40,9 +40,11 @@ struct nsn_endpoint
     // Ring for the free IO buffers
     nsn_ringbuf_t *free_slots;
     
-    // Pointers to data memory
+    // Pointers to data and metadata memory
     nsn_mm_zone_t *tx_zone;
     nsn_mm_zone_t *tx_meta_zone;
+    // Memory page size (for zero-copy)
+    usize page_size;
     // Data slot size
     usize io_bufs_size;
     

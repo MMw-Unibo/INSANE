@@ -330,7 +330,7 @@ nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size
     }
 
     // round the size to the next multiple of the page size
-    usize page_size = nsn_os_default_page_size();
+    usize page_size = (type == NSN_MM_ZONE_TYPE_IO_BUFFER_POOL? (1ULL << 21) : nsn_os_default_page_size());
     usize zone_size = align_to(size + sizeof(nsn_mm_zone_t), page_size);
 
     // create the zone in the shared memory
@@ -655,12 +655,22 @@ wait:
     plugin->update = ops.update;
 
     // 2) Initialize the plugin
+    int ret;
     list_head(ep_list); 
     nsn_os_mutex_lock(&plugin->streams_lock);
     prepare_ep_list(&ep_list, plugin, &data_arena);
     nsn_os_mutex_unlock(&plugin->streams_lock);
-    ops.init(&ctx, &ep_list);
+    ret = ops.init(&ctx, &ep_list);
     clean_ep_list(&ep_list, &data_arena);
+    if (ret < 0) {
+        log_error("[thread %d] Failed to init plugin %s\n", self, to_cstr(datapath_name));
+        at_store(&args->state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rel);
+        // Signal failure
+        nsn_os_mutex_lock(&args->lock);
+        nsn_os_cnd_signal(&args->cv);
+        nsn_os_mutex_unlock(&args->lock);
+        goto unload_and_clean;
+    }
 
     // Signal that the datapath is ready
     nsn_os_mutex_lock(&args->lock);
@@ -761,6 +771,7 @@ wait:
     }
     clean_ep_list(&ep_list, &data_arena);
 
+unload_and_clean:
     log_debug("[thread %d] unloading library\n", self);
     nsn_os_unload_library(module);
 
@@ -805,7 +816,7 @@ uint32_t nsn_qos_to_plugin_idx(nsn_options_t qos)
 
     // Return the index of the selected plugin!
     if (qos.datapath == NSN_QOS_DATAPATH_FAST) {
-        if (qos.reliability == NSN_QOS_RELIABILITY_RELIABLE) {
+        if (qos.reliability == NSN_QOS_RELIABILITY_UNRELIABLE) {
             log_info("QOS: fast, unreliable => selected DPDK UDP plugin\n");
             return 2;
         }
@@ -1254,7 +1265,8 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
             stream->ep.tx_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME));
             stream->ep.tx_meta_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_META_NAME));
             stream->ep.io_bufs_size = mem_cfg.io_buffer_size;            
-           
+            stream->ep.page_size = (1ULL << 21); //2MB TODO: This must become a nsnd param, used also for alloc.
+            
             // Add the stream to the plugin
             nsn_os_mutex_lock(&plugin->streams_lock);
             list_add_tail(&plugin->streams, &stream->node);

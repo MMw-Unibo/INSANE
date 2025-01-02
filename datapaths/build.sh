@@ -1,6 +1,6 @@
 # compile a shared library from the C source code
 CC=gcc
-CFLAGS="-g -Wall -Wextra -Werror -std=c11 -fPIC -Wno-unused-function -Wno-unused-variable"
+CFLAGS="-g -Wall -Wextra -Werror -std=c11 -fPIC -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations"
 
 DPDK=`pkg-config --cflags --libs libdpdk --static`
 
@@ -19,7 +19,7 @@ else
     exit 1
 fi
 
-$CC $CFLAGS -c udpdpdk.c -o udpdpdk.o
+$CC $CFLAGS -c udpdpdk.c -o udpdpdk.o -mssse3
 $CC $CFLAGS -shared -o libudpdpdk.so udpdpdk.o $DPDK 
 
 # $CC $CFLAGS -c rdma.c -o rdma.o
