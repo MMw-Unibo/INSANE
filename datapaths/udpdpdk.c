@@ -35,6 +35,7 @@
 #define MAX_DEVICE_QUEUES     16    // Must be at least 2
 #define MAX_RX_BURST_ARP      8     // Must be at least 8
 #define MAX_TX_BURST          64    // Must be at least 32
+#define MAX_RX_BURST          64    // Must be at least 32
 
 // Per-endpoint state
 struct udpdpdk_ep {
@@ -293,7 +294,7 @@ static void arp_reply(arp_ipv4_t *req_data) {
     // Send the request
     uint16_t ret = 0;
     while(!ret) {
-        ret = rte_eth_tx_burst(port_id, 0, &rte_mbuf, 1);
+        ret = rte_eth_tx_burst(port_id, tx_queue_id, &rte_mbuf, 1);
     }    
 }
 
@@ -316,14 +317,17 @@ static void arp_receive(struct rte_mbuf *arp_mbuf) {
 
     if (ahdr->arp_data.arp_tip != local_ip_net) {
         // not for us - do not reply
+        fprintf(stderr, "[udpdpdk] ARP reply not for us\n");
         return;
     }
 
     switch (rte_be_to_cpu_16(ahdr->arp_opcode)) {
     case ARP_REQUEST:
+        fprintf(stderr, "[udpdpdk] Reply to ARP request...\n");
         arp_reply(&ahdr->arp_data);
         break;
     default:
+        fprintf(stderr, "[udpdpdk] ARP reply, or opcode not supported\n");
         // Replies or wrong opcodes - no action
         break;
     }
@@ -1021,13 +1025,71 @@ NSN_DATAPATH_TX(udpdpdk)
     return buf_count;
 }
 
-NSN_DATAPATH_RX(dpdk)
+// TODO: The current implementation is not zero-copy. Here we make a copy.
+// We are currently studying how to make it zero-copy:
+//  a) We will instruct the device to receive the payload on external memory...
+//  b) ... so here we can free the header mbuf but not the whole mbuf.
+NSN_DATAPATH_RX(udpdpdk)
 {
-    nsn_unused(bufs);
-    nsn_unused(endpoint);
+    struct udpdpdk_ep *conn = (struct udpdpdk_ep *)endpoint->data;
+    struct rte_mbuf *rx_bufs[MAX_RX_BURST];
+    assert(*buf_count <= MAX_RX_BURST);
 
-    fprintf(stderr, "[udpdpdk] Unimplemented datapath rx\n");
-    return (int)*buf_count;
+    // Receive the packets
+    uint16_t nb_rx = rte_eth_rx_burst(port_id, conn->rx_queue_id, rx_bufs, *buf_count);
+
+    // Deliver only UDP packet payloads
+    usize valid = 0;
+    for(uint16_t i = 0; i < nb_rx; i++) {
+        struct rte_mbuf *mbuf = rx_bufs[i];
+        struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+        struct rte_ipv4_hdr *ih = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+        struct rte_udp_hdr *uh = (struct rte_udp_hdr *)(ih + 1);
+
+        // Check if the packet is UDP
+        if (eth_hdr->ether_type != htons(RTE_ETHER_TYPE_IPV4) || ih->next_proto_id != IP_UDP) {
+            rte_pktmbuf_free(mbuf);
+            continue;
+        }
+
+        // Check if the packet is for this IP
+        if (ih->dst_addr != local_ip_net) {
+            rte_pktmbuf_free(mbuf);
+            continue;
+        }
+        
+        // Check if the packet is for this app
+        if (ntohs(uh->dst_port) != endpoint->app_id) {
+            rte_pktmbuf_free(mbuf);
+            continue;
+        }
+
+        // Get the packet payload
+        char* payload = (char*)(uh + 1);
+        usize payload_size = uh->dgram_len - sizeof(struct rte_udp_hdr); 
+
+        // Get the NSN buffer memory
+        bufs[valid] = conn->pending_rx_buf;
+        char *data  = (char*)(endpoint->tx_zone + 1) + (bufs[valid].index * endpoint->io_bufs_size);    
+        usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[valid].index)->len;
+
+        // Copy the packet payload to the NSN buffer memory        
+        *size = payload_size;        
+        memcpy(data, (char*)(uh + 1), payload_size);
+        *buf_count  = *buf_count - 1;
+        valid++;
+
+        // Release the mbuf
+        rte_pktmbuf_free(mbuf);
+        
+        // Update the pending tx descriptor
+        u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
+        if (np == 0) {
+            printf("[udpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+        }
+    }
+
+    return (int)valid;
 }
 
 NSN_DATAPATH_DEINIT(udpdpdk)

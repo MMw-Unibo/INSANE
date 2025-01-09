@@ -39,7 +39,6 @@
 #define NSN_CFG_DEFAULT_TX_RING_SIZE            4096
 #define NSN_CFG_DEFAULT_RX_RING_SIZE            4096
 #define NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN  2
-#define CONN_MANAGER_TIMEOUT_NS                 1000000000 // 1s
 
 static i64 cpu_hz = -1;
 
@@ -1738,8 +1737,6 @@ main(int argc, char *argv[])
         }
     }
 
-    i64 now, last_time = nsn_os_get_time_ns();
-
     // Control path
     while (g_running) 
     {
@@ -1747,14 +1744,8 @@ main(int argc, char *argv[])
             log_warn("Failed to handle control ipc\n");
         }
 
-        now = nsn_os_get_time_ns();
-        if (now - last_time > CONN_MANAGER_TIMEOUT_NS) {
-            last_time = now;
-            if (main_thread_connection_manager() < 0) {
-                log_warn("Failed to handle connection manager\n");
-            }
-        } else {
-            usleep(1);
+        if (main_thread_connection_manager() < 0) {
+            log_warn("Failed to handle connection manager\n");
         }
     }
 
