@@ -391,8 +391,8 @@ app_pool_init_slot(nsn_app_pool_t *pool, int app_slot, nsn_mem_manager_cfg_t* me
         app->arena->pos,
         app->arena->com_pos);
 
-    char shm_name_app[NSN_MAX_PATH_SIZE];
-    snprintf(shm_name_app, NSN_MAX_PATH_SIZE, "%s_%d", mem_cfg->shm_name.data, app->app_id);
+    char shm_name_app[NSN_SHM_NAME_MAX];
+    snprintf(shm_name_app, NSN_SHM_NAME_MAX, "%s_%d", mem_cfg->shm_name.data, app->app_id);
     mem_cfg->shm_name = str_lit(shm_name_app);
 
     app->mem = nsn_memory_manager_create(app->arena, mem_cfg);
@@ -1151,7 +1151,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
                 nsn_cmsg_connect_t *reply = (nsn_cmsg_connect_t *)(cmsghdr + 1);
                 reply->shm_size           = mem_cfg.shm_size;
                 strcpy(reply->free_slots_ring, NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME);
-                snprintf(reply->shm_name, NSN_MAX_PATH_SIZE, "nsnd_datamem_%d", app_id);
+                snprintf(reply->shm_name, NSN_SHM_NAME_MAX, "nsnd_datamem_%d", app_id);
                 reply->io_buf_size        = mem_cfg.io_buffer_size;
                 
                 reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_connect_t);

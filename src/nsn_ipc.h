@@ -3,6 +3,7 @@
 
 #include "nsn.h"
 #include "nsn_types.h"
+#include "nsn_shm.h"
 
 // TODO: this should be a config file or something
 #define NSNAPP_TO_NSND_IPC    "/tmp/nsnd_control_plane.socket"
@@ -63,8 +64,7 @@ struct nsn_cmsg_hdr
 typedef struct nsn_cmsg_connect nsn_cmsg_connect_t;
 struct nsn_cmsg_connect
 {
-#define NSN_MAX_PATH_SIZE 64
-    char  shm_name[NSN_MAX_PATH_SIZE];
+    char  shm_name[NSN_SHM_NAME_MAX];
     // The size of the shared memory segment in bytes
     usize shm_size;
     // The name of the free_slots ring

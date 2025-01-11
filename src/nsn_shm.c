@@ -81,7 +81,7 @@ nsn_shm_attach(mem_arena_t *arena, const char *name, usize size)
     shm->data = buffer;
     shm->size = size;
     shm->fd   = fd;
-    strncpy(shm->name, name, NSN_SHM_NAME_MAX - 1);
+    strcpy(shm->name, name);
     at_fadd(&shm->ref_count, 1, mo_rlx);
 
 done:
