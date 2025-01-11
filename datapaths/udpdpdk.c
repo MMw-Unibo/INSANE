@@ -1047,7 +1047,7 @@ NSN_DATAPATH_RX(udpdpdk)
         struct rte_udp_hdr *uh = (struct rte_udp_hdr *)(ih + 1);
 
         // Check if the packet is UDP
-        if (eth_hdr->ether_type != htons(RTE_ETHER_TYPE_IPV4) || ih->next_proto_id != IP_UDP) {
+        if (rte_be_to_cpu_16(eth_hdr->ether_type) != RTE_ETHER_TYPE_IPV4 || ih->next_proto_id != IP_UDP) {
             rte_pktmbuf_free(mbuf);
             continue;
         }
@@ -1059,14 +1059,14 @@ NSN_DATAPATH_RX(udpdpdk)
         }
         
         // Check if the packet is for this app
-        if (ntohs(uh->dst_port) != endpoint->app_id) {
+        if (rte_be_to_cpu_16(uh->dst_port) != endpoint->app_id) {
             rte_pktmbuf_free(mbuf);
             continue;
         }
 
         // Get the packet payload
         char* payload = (char*)(uh + 1);
-        usize payload_size = uh->dgram_len - sizeof(struct rte_udp_hdr); 
+        usize payload_size = rte_be_to_cpu_16(uh->dgram_len) - sizeof(struct rte_udp_hdr); 
 
         // Get the NSN buffer memory
         bufs[valid] = conn->pending_rx_buf;
