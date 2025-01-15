@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS="-Wall -Wextra -Werror -std=c11"
+CFLAGS="-Wall -Wextra -Werror -std=c11 -Wno-deprecated-declarations -Wno-address-of-packed-member"
 LDFLAGS="-lm -ldl -lpthread"
 DEFINES=""
 
@@ -23,7 +23,13 @@ else
     exit 1
 fi
 
+
+DPDK=`pkg-config --cflags --libs libdpdk --static`
+
 cd build
 $CC $CFLAGS $LDFLAGS ../ring_tx.c $DEFINES -o ringtx
 $CC $CFLAGS $LDFLAGS ../ring_rx.c $DEFINES -o ringrx
+
+$CC $CFLAGS $LDFLAGS ../dpdk_0cxm.c -mssse3 $DEFINES $DPDK -o dpdk-0cxm
+
 cd ..
