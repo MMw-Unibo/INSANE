@@ -13,6 +13,7 @@
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_flow.h>
+#include <rte_malloc.h>
 
 #include "protocols.h"
 
@@ -40,11 +41,11 @@
 // Per-endpoint state
 struct udpdpdk_ep {
     u16 rx_queue_id;
-    struct rte_mempool *rx_pool;
+    struct rte_mempool *rx_hdr_pool;
+    struct rte_mempool *rx_data_pool;
     struct rte_mempool *tx_hdr_pool;
     struct rte_mempool *tx_data_pool;
     struct rte_flow *app_flow;
-    nsn_buf_t pending_rx_buf;
 };
 
 // Peer descriptor - augmented
@@ -64,10 +65,14 @@ static struct rte_ether_addr local_mac_addr;
 static u16    port_id;
 static u16    tx_queue_id;
 static int    socket_id;
+static u16    nb_rxd;
+static u16    nb_txd;
+static struct rte_eth_dev_info devinfo;
 static nsn_ringbuf_t *free_queue_ids;
 struct rte_mempool *ctrl_pool;
 static temp_mem_arena_t scratch;
-struct rte_flow *rx_arp_flow;
+static struct rte_flow *rx_arp_flow;
+static bool dev_stopped = true;
 
 /* Configuration */
 
@@ -410,45 +415,239 @@ static inline void prepare_headers(struct rte_mbuf *hdr_mbuf, size_t payload_siz
     uh->dgram_len          = htons(payload_size + UDP_HDR_LEN);
     uh->dgram_cksum        = 0;
     // Compute the UDP checksum
-    uh->dgram_cksum = rte_ipv4_udptcp_cksum(ih, uh);
+    // uh->dgram_cksum = rte_ipv4_udptcp_cksum(ih, uh);
 
     // Finally, set the data_len and pkt_len: only headers! The payload size is in another mbuf
     hdr_mbuf->data_len = hdr_mbuf->pkt_len = RTE_ETHER_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN;
 }
 
-// Callback function: return the NSN buffer index to the free pool. Called by the DPDK PMD.
-void free_extbuf_cb(void *addr, void *opaque) {
-    nsn_endpoint_t *ep = (nsn_endpoint_t *)opaque;
-    // Compute the index from the buf address, relative to the start of the zone
-    uint64_t index = ((char*)addr - (char*)(ep->tx_zone + 1)) / ep->io_bufs_size;
-    if(nsn_ringbuf_enqueue_burst(ep->free_slots, &index, sizeof(void*), 1, NULL) < 1) {
-        fprintf(stderr, "[udpsock] Failed to enqueue 1 descriptor\n");
+/** The context to initialize the mbufs with pinned external buffers. */
+struct rte_pktmbuf_extmem_init_ctx {
+	const struct rte_pktmbuf_extmem *ext_mem; /* descriptor array. */
+	unsigned int ext_num; /* number of descriptors in array. */
+	unsigned int ext; /* loop descriptor index. */
+	size_t off; /* loop buffer offset. */
+};
+
+/**
+ * Custom free: free the mbufs, but do NOT re-enqueue EXTERNAL mbufs
+ * in the backend (i.e., here, the INSANE ring). It will be the APP
+ * to do the re-enqueue, when more convenient. Regular mbufs are freed
+ * by the standard DPDK function.
+ */
+static inline void nsn_pktmbuf_free(struct rte_mbuf *m)
+{
+	struct rte_mbuf *m_next, *n;
+
+	if (m != NULL)
+		__rte_mbuf_sanity_check(m, 1);
+
+	while (m != NULL) {
+		m_next = m->next;
+        n = rte_pktmbuf_prefree_seg(m);
+	    if (likely(n != NULL) && !RTE_MBUF_HAS_PINNED_EXTBUF(n)) {
+		    rte_mbuf_raw_free(n);
+        }
+		m = m_next;
+	}
+}
+
+/**
+ * Get a mbuf from an INSANE-backed mempool, with the specific index passed as param.
+ * This call will bypass the call to the DEQUEUE OPS, because we already have the index,
+ * which was obtained by the application.
+ */
+static inline struct rte_mbuf *nsn_pktmbuf_alloc(struct rte_mempool *mp, size_t index)
+{
+    struct rte_mbuf** table = (struct rte_mbuf**)mp->pool_config;
+    struct rte_mbuf *m = table[index];
+    if (m != NULL) {
+        rte_pktmbuf_reset(m);
     }
+	return m;
 }
 
-/* Checks if an mbuf crosses page boundary */
-static inline int mbuf_crosses_page_boundary(struct rte_mbuf *m, size_t pg_sz) {
-    uint64_t start = (uint64_t)m->buf_addr + m->data_off;
-    uint64_t end   = start + m->data_len;
-    return (start / pg_sz) != ((end - 1) / pg_sz);
+/*
+ * The callback routine called when reference counter in shinfo
+ * for mbufs with pinned external buffer reaches zero. It means there is
+ * no more reference to buffer backing mbuf and this one should be freed.
+ * This routine is called for the regular (not with pinned external or
+ * indirect buffer) mbufs on detaching from the mbuf with pinned external
+ * buffer.
+ */
+static void
+rte_pktmbuf_free_pinned_extmem(void *addr, void *opaque)
+{
+	struct rte_mbuf *m = opaque;
+
+	RTE_SET_USED(addr);
+	RTE_ASSERT(RTE_MBUF_HAS_EXTBUF(m));
+	RTE_ASSERT(RTE_MBUF_HAS_PINNED_EXTBUF(m));
+	RTE_ASSERT(m->shinfo->fcb_opaque == m);
+
+	rte_mbuf_ext_refcnt_set(m->shinfo, 1);
+	m->ol_flags = RTE_MBUF_F_EXTERNAL;
+	if (m->next != NULL)
+		m->next = NULL;
+	if (m->nb_segs != 1)
+		m->nb_segs = 1;
+
+	rte_mbuf_raw_free(m);
 }
 
-// This function is similar to the rte_pktmbuf_ext_shinfo_init_helper. However, the "original" one
-// would allocate the rte_mbuf_ext_shared_info structure at the end of the external buffer. We
-// can't, because the buffer is INSANE-managed memory. So this function stores the struct in the area
-// the user passes as first argument. Generally, and specifically for this case, the caller will
-// pass a private area of the mbuf as first argument. DO NOT PASS a NULL callback pointer: it will
-// be called by DPDK causing a segfault. Just pass a function that does nothing, if you do not need
-// this feature.
-static inline void rte_pktmbuf_ext_shinfo_init_helper_custom(
-    struct rte_mbuf_ext_shared_info *ret_shinfo, rte_mbuf_extbuf_free_callback_t free_cb,
-    void *fcb_opaque) {
+/* Helper, modified starting from __rte_pktmbuf_init_extmem. It associates a DPDK mbuf
+   with a chunck of external memory, in this case the NSN memory.
+ */
+static void nsn_pktmbuf_init_extmem(struct rte_mempool *mp,
+			  void *opaque_arg,
+			  void *_m,
+			  __rte_unused unsigned int i)
+{
+	struct rte_mbuf *m = _m;
+	struct rte_pktmbuf_extmem_init_ctx *ctx = opaque_arg;
+	const struct rte_pktmbuf_extmem *ext_mem;
+	uint32_t mbuf_size, buf_len, priv_size;
+	struct rte_mbuf_ext_shared_info *shinfo;
 
-    struct rte_mbuf_ext_shared_info *shinfo = ret_shinfo;
-    shinfo->free_cb                         = free_cb;
-    shinfo->fcb_opaque                      = fcb_opaque;
-    rte_mbuf_ext_refcnt_set(shinfo, 1);
-    return;
+	priv_size = rte_pktmbuf_priv_size(mp);
+	mbuf_size = sizeof(struct rte_mbuf) + priv_size;
+	buf_len = rte_pktmbuf_data_room_size(mp);
+
+	RTE_ASSERT(RTE_ALIGN(priv_size, RTE_MBUF_PRIV_ALIGN) == priv_size);
+	RTE_ASSERT(mp->elt_size >= mbuf_size);
+	RTE_ASSERT(buf_len <= UINT16_MAX);
+
+    // DO NOT zero the mbuf! We are using the priv_mem to hold the buf index!
+	//memset(m, 0, mbuf_size);
+	m->priv_size = priv_size;
+	m->buf_len = (uint16_t)buf_len;
+
+	/* set the data buffer pointers to external memory */
+	ext_mem = ctx->ext_mem + ctx->ext;
+
+	RTE_ASSERT(ctx->ext < ctx->ext_num);
+	RTE_ASSERT(ctx->off + ext_mem->elt_size <= ext_mem->buf_len);
+
+	m->buf_addr = RTE_PTR_ADD(ext_mem->buf_ptr, ctx->off);
+	rte_mbuf_iova_set(m, ext_mem->buf_iova == RTE_BAD_IOVA ? RTE_BAD_IOVA :
+								 (ext_mem->buf_iova + ctx->off));
+
+    // usize index = *(usize*)(m + 1);
+    // printf("MBUF %lu points to %p\n", index, m->buf_addr);
+
+	ctx->off += ext_mem->elt_size;
+	if (ctx->off + ext_mem->elt_size > ext_mem->buf_len) {
+		ctx->off = 0;
+		++ctx->ext;
+	}
+	/* keep some headroom between start of buffer and data */
+	m->data_off = RTE_MIN(RTE_PKTMBUF_HEADROOM, (uint16_t)m->buf_len);
+
+	/* init some constant fields */
+	m->pool = mp;
+	m->nb_segs = 1;
+	m->port = RTE_MBUF_PORT_INVALID;
+	m->ol_flags = RTE_MBUF_F_EXTERNAL;
+	rte_mbuf_refcnt_set(m, 1);
+	m->next = NULL;
+
+	/* init external buffer shared info items */
+	shinfo = RTE_PTR_ADD(m, mbuf_size);
+	m->shinfo = shinfo;
+	shinfo->free_cb = rte_pktmbuf_free_pinned_extmem;
+	shinfo->fcb_opaque = m;
+	rte_mbuf_ext_refcnt_set(shinfo, 1);
+}
+
+/* Helper, modified starting from rte_pktmbuf_pool_create_extbuf */
+static struct rte_mempool* nsn_dpdk_pktmbuf_pool_create_extmem(const char *name, unsigned int n,
+	unsigned int cache_size, uint16_t priv_size,
+	uint16_t data_room_size, int socket_id,
+	const struct rte_pktmbuf_extmem *ext_mem,
+	unsigned int ext_num,
+    nsn_ringbuf_t *free_slots)
+{
+	struct rte_mempool *mp;
+	struct rte_pktmbuf_pool_private mbp_priv;
+	struct rte_pktmbuf_extmem_init_ctx init_ctx;
+	unsigned int elt_size;
+	unsigned int i, n_elts = 0;
+	int ret;
+
+	if (RTE_ALIGN(priv_size, RTE_MBUF_PRIV_ALIGN) != priv_size) {
+		RTE_LOG(ERR, MBUF, "mbuf priv_size=%u is not aligned\n",
+			priv_size);
+		rte_errno = EINVAL;
+		return NULL;
+	}
+	/* Check the external memory descriptors. */
+	for (i = 0; i < ext_num; i++) {
+		const struct rte_pktmbuf_extmem *extm = ext_mem + i;
+
+		if (!extm->elt_size || !extm->buf_len || !extm->buf_ptr) {
+			RTE_LOG(ERR, MBUF, "invalid extmem descriptor\n");
+			rte_errno = EINVAL;
+			return NULL;
+		}
+		if (data_room_size > extm->elt_size) {
+			RTE_LOG(ERR, MBUF, "ext elt_size=%u is too small\n",
+				priv_size);
+			rte_errno = EINVAL;
+			return NULL;
+		}
+		n_elts += extm->buf_len / extm->elt_size;
+	}
+	/* Check whether enough external memory provided. */
+	if (n_elts < n) {
+		RTE_LOG(ERR, MBUF, "not enough extmem\n");
+		rte_errno = ENOMEM;
+		return NULL;
+	}
+	elt_size = sizeof(struct rte_mbuf) +
+		   (unsigned int)priv_size +
+		   sizeof(struct rte_mbuf_ext_shared_info);
+
+	memset(&mbp_priv, 0, sizeof(mbp_priv));
+	mbp_priv.mbuf_data_room_size = data_room_size;
+	mbp_priv.mbuf_priv_size = priv_size;
+	mbp_priv.flags = RTE_PKTMBUF_POOL_F_PINNED_EXT_BUF;
+
+	mp = rte_mempool_create_empty(name, n, elt_size, cache_size,
+		 sizeof(struct rte_pktmbuf_pool_private), socket_id, 0);
+	if (mp == NULL)
+		return NULL;
+
+    /* Set our custom INSANE-based OPS to back the mempool */
+	ret = rte_mempool_set_ops_byname(mp, "nsn_mp_ops", NULL);
+	if (ret != 0) {
+		RTE_LOG(ERR, MBUF, "error setting mempool handler\n");
+		rte_mempool_free(mp);
+		rte_errno = -ret;
+		return NULL;
+	}
+	rte_pktmbuf_pool_init(mp, &mbp_priv);
+
+    /* Set the INSANE ring as the backing ring */
+    mp->pool_data = free_slots;
+
+    /* This calls the POPULATE op, allocating mbufs */
+	ret = rte_mempool_populate_default(mp);
+	if (ret < 0) {
+		rte_mempool_free(mp);
+		rte_errno = -ret;
+		return NULL;
+	}
+
+    /* Associate the mbufs with the external buffers */
+	init_ctx = (struct rte_pktmbuf_extmem_init_ctx){
+		.ext_mem = ext_mem,
+		.ext_num = ext_num,
+		.ext = 0,
+		.off = 0,
+	};
+	rte_mempool_obj_iter(mp, nsn_pktmbuf_init_extmem, &init_ctx);
+
+	return mp;
 }
 
 /* API */
@@ -463,18 +662,17 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
     if(endpoint->data) {
         struct udpdpdk_ep *conn = (struct udpdpdk_ep *)endpoint->data;
         
-        // Return the pending buffer to the free slots
-        nsn_ringbuf_enqueue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
-
         // Destroy the flow
         if (conn->app_flow) {
             rte_flow_destroy(port_id, conn->app_flow, NULL);
         }
 
-        // Stop the device queue
-        int res = rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
-        if (res < 0) {
-            fprintf(stderr, "[udpdpdk] failed to stop the device queue: %s\n", rte_strerror(rte_errno));
+        // If the device is active, just stop this queue, not the entire device
+        if(!dev_stopped) {
+            int res = rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
+            if (res < 0) {
+                fprintf(stderr, "[udpdpdk] failed to stop the device queue: %s\n", rte_strerror(rte_errno));
+            }
         }
 
         // Destroy the tx mempools
@@ -499,7 +697,7 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
         int ret = rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
     } 
     // Case 2. Create endpoint data.
-    else { 
+    else {  
         if (nsn_ringbuf_count(free_queue_ids) == 0) {
             fprintf(stderr, "[udpdpdk] No free queues left for the application\n");
             return -1;
@@ -521,52 +719,6 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
         nsn_ringbuf_dequeue_burst(free_queue_ids, &queue_id, sizeof(void*), 1, NULL);
         conn->rx_queue_id = queue_id;
 
-        // get a descriptor to receive
-        u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
-        if (np == 0) {
-            printf("[udpsock] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
-            goto error_1;
-        }
-
-        // RX mempool: retrieve it from the endpoint (created at queue setup)
-        // TODO: we will need an indirect mempool for the zero-copy receive
-        char pool_name[64];
-        sprintf(pool_name, "rx_pool_%u", conn->rx_queue_id);
-        conn->rx_pool = rte_mempool_lookup(pool_name);
-        if (conn->rx_pool == NULL) {
-            fprintf(stderr, "[udpdpdk] failed to create mempool\n");
-            goto error_2;
-        }
-
-        // TODO: Create the tx direct and indirect mempool, and possibly prepare the headers (at least for the local part)
-
-        /* TX: header mempool */
-        sprintf(pool_name, "tx_hdr_pool_%u", conn->rx_queue_id);
-        conn->tx_hdr_pool = rte_pktmbuf_pool_create(
-            pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
-        if (!conn->tx_hdr_pool) {
-            fprintf(stderr, "[udpdpdk]: failed to create tx hdr pool: %s\n", rte_strerror(rte_errno));
-            goto error_2;
-        }
-
-        /* TX: data mempool.
-            This mempool contains only descriptors, not data: data_room_size is 0.
-            The descriptors will point to the INSANE nbufs, containing the data.
-            This is called "indirect mempool" in DPDK. As required for "indirect" mempools,
-            we need to provide a stucture with additional metadata. The DPDK code suggests to
-            place this area at the end of the user data, but we cannot! So we place that struct
-            in the "private area" of the mbuf, i.e., memory area right after each mbuf descriptor.
-        */
-        size_t private_size    = sizeof(struct rte_mbuf_ext_shared_info);
-        size_t data_room_size  = 0;
-        sprintf(pool_name, "tx_data_pool_%u", conn->rx_queue_id);
-        conn->tx_data_pool = rte_pktmbuf_pool_create(
-            pool_name, 10239, 64, private_size, data_room_size, socket_id);
-        if (!conn->tx_data_pool) {
-            fprintf(stderr, "[udpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
-            goto error_3;
-        }
-
         // Register the application memory with the NIC
         // See the alignment comment in the function.
         void *addr = (void*)((usize)endpoint->tx_zone & 0xFFFFFFFFFFF00000);
@@ -575,10 +727,109 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
         int ret = register_memory_area(addr, len, endpoint->page_size, port_id);
         if (ret < 0) {
             fprintf(stderr, "[udpdpdk] failed to register memory area with DPDK and NIC\n");
+            goto error_1;
+        }
+        
+        // RX: header mempool. Must have 10239 as num_mbufs or it fails
+        char pool_name[64];
+        bzero(pool_name, 64);
+        sprintf(pool_name, "rx_hdr_pool_%u", conn->rx_queue_id);
+        if ((conn->rx_hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
+            fprintf(stderr, "[udpdpdk] failed to create mempool %s\n", pool_name);
+            goto error_2;
+        }
+
+        // RX: data mempool with external memory configuration
+        /* External memory configuration
+            This mempool contains only descriptors, not data: data_room_size is 0.
+            The descriptors will point to the INSANE nbufs, containing the data.
+            This is called "indirect mempool" in DPDK.
+            This mempool is actually a "special" mempool backed by the INSANE ring.
+
+            In INSANE, the data area is not aligned to the page size, so the first page must 
+            be registered with a smaller size than the page size. The rest of the pages will be
+            registered with the full page size. "addr" points to the beginning of the page,
+            and "data_ptr" points to the beginning of the data area on that page.
+        */
+        bzero(pool_name, 64);
+        sprintf(pool_name, "rx_data_pool_%u", conn->rx_queue_id);
+        uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
+        uint32_t n_pages = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
+        char *data_ptr = (char*)(endpoint->tx_zone + 1);
+        // fprintf(stderr, "Memory for data starts at %p [npages = %u, size = %lu]\n", data_ptr, n_pages, endpoint->tx_zone->size);
+        struct rte_pktmbuf_extmem *extmem_pages =
+            malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
+        for (uint32_t i = 0; i < n_pages; i++) {
+            void *ptr                = (i==0)? 
+                                            data_ptr : 
+                                            addr + i * endpoint->page_size;
+            extmem_pages[i].buf_ptr  = ptr; 
+            struct rte_memseg *ms    = rte_mem_virt2memseg(ptr, rte_mem_virt2memseg_list(ptr));
+            extmem_pages[i].buf_iova = ms->iova + ((char *)ptr - (char *)ms->addr);
+            extmem_pages[i].buf_len  = (i==0)? 
+                                            endpoint->page_size - (data_ptr - (char*)addr) : 
+                                            endpoint->page_size;
+            extmem_pages[i].elt_size = endpoint->io_bufs_size;
+        }
+        size_t private_size    = sizeof(size_t);
+        size_t data_room_size  = 0;
+        conn->rx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
+            pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
+        if (!conn->rx_data_pool) {
+            fprintf(stderr, "[udpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
+            goto error_3;
+        }  
+        // This is the HACK that makes the external memory work. The external mempool must be
+        // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
+        // to know the size of the mbufs. So, afer the creation, we set the data room size of the
+        // mbufs to the maximum size of the payload. Apparently this works withouth visible side
+        // effects. TODO: Is there a proper way to do this?
+        struct rte_pktmbuf_pool_private *mbp_priv =
+            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->rx_data_pool);
+        mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
+
+        /* Configure RX split: headers and payloads in their respective mempools */
+        struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
+        // Configure the BUFFER_SPLIT offload behavior for the selected RX queue.
+        uint8_t rx_pkt_nb_segs = 2;
+        struct rte_eth_rxseg_split *rx_seg;
+        union rte_eth_rxseg rx_useg[2] = {};
+        // Segment 0 (header)
+        rx_seg         = &rx_useg[0].split;
+        rx_seg->mp     = conn->rx_hdr_pool;
+        rx_seg->offset = 0;
+        // See docs in rte_ethdev.h. Must be zero if length is used (and vice versa)
+        rx_seg->proto_hdr = 0;
+        // Max bytes to be placed in this segment. Must be zero if proto_hdr is used (and vice versa)
+        rx_seg->length = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
+        // Segment 1 (payload)
+        rx_seg         = &rx_useg[1].split;
+        rx_seg->offset = 0;
+        rx_seg->mp     = conn->rx_data_pool;
+        rx_seg->proto_hdr = 0;
+        rx_seg->length = 2048;
+
+        // Configure the number of segments and the segments themselves
+        rx_conf.rx_nseg     = rx_pkt_nb_segs;
+        rx_conf.rx_seg      = rx_useg;
+        rx_conf.rx_mempools = NULL;
+        rx_conf.rx_nmempool = 0;
+        rx_conf.rx_deferred_start = 1;
+        // Setup the RX queue using the selected configuration
+        if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, &rx_conf, NULL)) != 0) {
+            fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
             goto error_4;
         }
 
-        // Now create the RSS filter on that queue for this endpoint's UDP port
+        // Start the queue
+        ret = rte_eth_dev_rx_queue_start(port_id, conn->rx_queue_id);
+        if (ret < 0) {
+            fprintf(stderr, "[udpdpdk] failed to start queue %u: %s\n", conn->rx_queue_id, strerror(ret));
+            goto error_4;
+        }
+
+        // Now create the RSS filter on that queue for this endpoint's UDP port.
+        // Do this immediately after the queue is started
         struct rte_flow_error flow_error;
         conn->app_flow = configure_udp_rss_flow(port_id, conn->rx_queue_id, endpoint->app_id, &flow_error);
         if (conn->app_flow == NULL) {
@@ -586,23 +837,42 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
             goto error_5;
         }
 
-        // Start the queue
-        ret = rte_eth_dev_rx_queue_start(port_id, conn->rx_queue_id);
-        if (ret < 0) {
-            fprintf(stderr, "[udpdpdk] failed to start queue %u: %s\n", conn->rx_queue_id, strerror(ret));
-            goto error_5;
+        /* TX: header mempool */
+        sprintf(pool_name, "tx_hdr_pool_%u", conn->rx_queue_id);
+        conn->tx_hdr_pool = rte_pktmbuf_pool_create(
+            pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
+        if (!conn->tx_hdr_pool) {
+            fprintf(stderr, "[udpdpdk]: failed to create tx hdr pool: %s\n", rte_strerror(rte_errno));
+            goto error_6;
         }
-    
+
+        /* TX: data mempool. External memory, use the same config as before */
+        private_size    = sizeof(size_t);
+        data_room_size  = 0;
+        sprintf(pool_name, "tx_data_pool_%u", conn->rx_queue_id);
+        conn->tx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
+            pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
+        if (!conn->tx_data_pool) {
+            fprintf(stderr, "[udpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
+            goto error_7;
+        }      
+        mbp_priv =
+            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->tx_data_pool);
+        mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
+
         return 0;
-error_5:
-        rte_flow_destroy(port_id, conn->app_flow, NULL);
-        unregister_memory_area(addr, len, endpoint->page_size, port_id);
-error_4:
-        rte_mempool_free(conn->tx_data_pool);
-error_3:
+error_7:
         rte_mempool_free(conn->tx_hdr_pool);
+error_6:
+        rte_flow_destroy(port_id, conn->app_flow, NULL);
+error_5:
+        rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
+error_4:
+        rte_mempool_free(conn->rx_data_pool);
+error_3:
+        rte_mempool_free(conn->rx_hdr_pool);
 error_2:
-        nsn_ringbuf_enqueue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL); 
+        unregister_memory_area(addr, len, endpoint->page_size, port_id);
 error_1:
         nsn_ringbuf_enqueue_burst(free_queue_ids, &conn->rx_queue_id, sizeof(void*), 1, NULL);
         free(conn);
@@ -733,8 +1003,7 @@ NSN_DATAPATH_INIT(udpdpdk)
     }
 
     // Select the desired device
-    bool                    found = false;
-    struct rte_eth_dev_info devinfo;
+    bool found = false;
     RTE_ETH_FOREACH_DEV(port_id) {
         ret = rte_eth_dev_info_get(port_id, &devinfo);
         if (ret < 0) {
@@ -750,6 +1019,18 @@ NSN_DATAPATH_INIT(udpdpdk)
     }
     if (!found) {
         fprintf(stderr, "[udpdpdk] device %s not found\n", dev_name);
+        goto fail;
+    }
+
+    // Check that the NIC supports all the required offloads
+    if (!(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) ||
+        !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
+        !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) ||
+        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_CHECKSUM) ||
+        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) ||
+        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT))
+    {
+        fprintf(stderr, "[error] NIC does not support one of the required offloads\n");
         goto fail;
     }
 
@@ -774,19 +1055,12 @@ NSN_DATAPATH_INIT(udpdpdk)
         goto fail;
     }
 
-    // Create a mempool to receive "spare" data, i.e., data not associated to any endpoint,
-    // e.g., for ARP and possibly control messages. Used also to tx control msgs.
-    ctrl_pool = rte_pktmbuf_pool_create("ctrl_pool", 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
-    if (ctrl_pool == NULL) {
-        fprintf(stderr, "[udpdpdk] failed to create mempool\n");
-        goto fail;
-    }
-
     // Configure the port
     struct rte_eth_conf port_conf;
     bzero(&port_conf, sizeof(port_conf));
     // port_conf.rxmode.mtu = MTU;
-    port_conf.rxmode.offloads |= (RTE_ETH_RX_OFFLOAD_CHECKSUM | RTE_ETH_RX_OFFLOAD_SCATTER);
+    port_conf.rxmode.offloads |= (RTE_ETH_RX_OFFLOAD_CHECKSUM | RTE_ETH_RX_OFFLOAD_SCATTER
+                                  | RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT);
     port_conf.txmode.mq_mode  = RTE_ETH_MQ_TX_NONE;
     port_conf.txmode.offloads |= (RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_MULTI_SEGS);
     if (devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
@@ -796,8 +1070,8 @@ NSN_DATAPATH_INIT(udpdpdk)
     //     fprintf(stderr, "[udpdpdk] setting mtu failed: %s\n", rte_strerror(rte_errno));
     //     goto fail;
     // }
-    uint16_t nb_rxd = 1024;
-    uint16_t nb_txd = 1024;
+    nb_rxd = 1024;
+    nb_txd = 1024;
     if ((ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &nb_rxd, &nb_txd)) != 0) {
         fprintf(stderr, "[udpdpdk] error setting tx and rx descriptors: %s\n", rte_strerror(rte_errno));
         goto fail;;
@@ -811,7 +1085,7 @@ NSN_DATAPATH_INIT(udpdpdk)
         fprintf(stderr, "[udpdpdk] failed to isolate traffic: %s\n", error.message? error.message : rte_strerror(rte_errno));
         goto fail;
     }
-
+    
     // Configure the queues. We have:
     // - A single tx queue
     // - n_peers rx queues + 1 (queue 0) for control messages.
@@ -838,38 +1112,25 @@ NSN_DATAPATH_INIT(udpdpdk)
     void *ring_memory = mem_arena_push(scratch.arena, sizeof(nsn_ringbuf_t) + (sizeof(void*) * ring_size));
     free_queue_ids = nsn_ringbuf_create(ring_memory, str_lit("free_queue_ids"), ring_size);
 
-    // Configure the rx queues: queue 0 to start immediately
-    if ((ret = rte_eth_rx_queue_setup(port_id, 0, nb_rxd, socket_id, NULL, ctrl_pool)) != 0) {
+    // Create a mempool to receive "spare" data, i.e., data not associated to any endpoint,
+    // e.g., for ARP and possibly control messages. Used also to tx control msgs.
+    ctrl_pool = rte_pktmbuf_pool_create("ctrl_pool", 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
+    if (ctrl_pool == NULL) {
+        fprintf(stderr, "[udpdpdk] failed to create mempool ctrl_pool\n");
+        goto fail;
+    }
+
+    // Configure the rx queue 0 (control traffic) to start immediately
+    // The remaining queues are confgured later, when applications start
+    struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
+    rx_conf.share_group = 0;
+    if ((ret = rte_eth_rx_queue_setup(port_id, 0, nb_rxd, socket_id, &rx_conf, ctrl_pool)) != 0) {
         fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", 0, rte_strerror(rte_errno));
         goto fail;
     }
 
-    // The remaining queues are confgured with "deferred start"
-    // NOTE: mlx5 driver does not support deferred start, so this will have no effect.
-    // But other drivers might support it, so we leave it.
-    struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
-    rx_conf.rx_deferred_start = 1;
-    char pool_name[64];
-    struct rte_mempool *rx_pool;
-    for (uint16_t i = 1; i < rx_queues; i++) {
-        // Create a mempool for the queue (will be retrieved later by the endpoint, using name)
-        // TODO: In the final version, this mempool should ideally be an external mempool,
-        // where each mbuf actually points to a slot in the shared memory of this app.
-        // For the moment, we just create a local mempool and copy the data on receive.
-        bzero(pool_name, 64);
-        sprintf(pool_name, "rx_pool_%u", i);
-        if ((rx_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
-            fprintf(stderr, "[udpdpdk] failed to create mempool\n");
-            goto fail;
-        }
-
-        // Setup the queue using that mempool
-        if ((ret = rte_eth_rx_queue_setup(port_id, i, nb_rxd, socket_id, &rx_conf, rx_pool)) != 0) {
-            fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", i, rte_strerror(rte_errno));
-            goto fail;
-        }
-
-        // Put the queue id in the ring
+    // Prepare the descriptors for the data queues (q > 0)
+    for(int i = 1; i < rx_queues; i++) {
         nsn_ringbuf_enqueue_burst(free_queue_ids, &i, sizeof(void*), 1, NULL);
     }
 
@@ -881,6 +1142,8 @@ NSN_DATAPATH_INIT(udpdpdk)
     if (ret) {
         fprintf(stderr, "[udpdpdk] impossible to start device: %s\n", rte_strerror(rte_errno));
         goto fail;
+    } else {
+        dev_stopped = false;
     }
 
     // ARP packets to be received on queue 0
@@ -888,15 +1151,6 @@ NSN_DATAPATH_INIT(udpdpdk)
     if (rx_arp_flow == NULL) {
         fprintf(stderr, "[udpdpdk] failed to create ARP flow: %s\n", error.message? error.message : rte_strerror(rte_errno));
         goto fail_and_stop;
-    }
-
-    // Stop the queues that are not used. This is necessary because some drivers, such as mlx5,
-    // do not support deferred start, and all queues are started immediately.
-    for (uint16_t i = 1; i < rx_queues; i++) {
-        ret = rte_eth_dev_rx_queue_stop(port_id, i);
-        if (ret < 0) {
-            fprintf(stderr, "[udpdpdk] failed to stop queue %u: %s\n", i, rte_strerror(rte_errno));
-        }
     }
 
     // For each peer, send an ARP request
@@ -959,59 +1213,11 @@ NSN_DATAPATH_TX(udpdpdk)
             // Prepare the header
             prepare_headers(tx_bufs[i], size, endpoint->app_id, p);
             
-            // Prepare the data as external buffer
-            data_mbuf = rte_pktmbuf_alloc(conn->tx_data_pool);
-            struct rte_mbuf_ext_shared_info *ret_shinfo =
-                (struct rte_mbuf_ext_shared_info *)(data_mbuf + 1);
-            rte_pktmbuf_ext_shinfo_init_helper_custom(ret_shinfo, free_extbuf_cb, endpoint);
-
-            // Set IOVA mapping
-            rte_iova_t iova;
-            if (rte_eal_iova_mode() == RTE_IOVA_VA) {
-                iova = (rte_iova_t)data;
-            } else {
-                struct rte_memseg *ms = rte_mem_virt2memseg(data, rte_mem_virt2memseg_list(data));
-                iova = ms->iova + (data - (char *)ms->addr);
-            }
-
-            // Attach the memory buffer to the mbuf
-            rte_pktmbuf_attach_extbuf(data_mbuf, data, iova, size, ret_shinfo);
-            data_mbuf->pkt_len = data_mbuf->data_len = size;
-
-            // For external memory, we must handle the case data crosses a page boundary
-            if (nsn_unlikely(mbuf_crosses_page_boundary(data_mbuf, endpoint->page_size))) {
-                // 1. Get page boundary starting from last_mbuf->buf_addr (+ data_off)
-                uint64_t start         = (uint64_t)data;
-                uint64_t end           = start + data_mbuf->data_len;
-                uint64_t page_boundary = ((start / endpoint->page_size) + 1) * endpoint->page_size;
-                // 2. Compute the length of the ext_mbuf and the second mbuf
-                uint64_t second_len = end - page_boundary;
-                // 3. Allocate a new mbuf for the second part
-                struct rte_mbuf *second_mbuf = rte_pktmbuf_alloc(conn->tx_data_pool);
-                // 4. Attach the second mbuf to the external memory in the second page, with the correct IOVA.
-                rte_iova_t second_iova;
-                if (rte_eal_iova_mode() == RTE_IOVA_VA) {
-                    rte_iova_t second_iova = page_boundary;
-                } else {
-                    struct rte_memseg *ms =
-                        rte_mem_virt2memseg((void*)page_boundary, rte_mem_virt2memseg_list((void*)page_boundary));
-                    second_iova = ms->iova + ((void *)page_boundary - ms->addr);
-                }
-
-                struct rte_mbuf_ext_shared_info *ret_shinfo =
-                    (struct rte_mbuf_ext_shared_info *)(second_mbuf + 1);
-                rte_pktmbuf_ext_shinfo_init_helper_custom(ret_shinfo, free_extbuf_cb, NULL);
-                rte_pktmbuf_attach_extbuf(second_mbuf, (void *)page_boundary, second_iova, second_len,
-                                          ret_shinfo);
-                second_mbuf->data_len = second_len;
-                second_mbuf->data_off = 0;
-
-                // 6. Chain this mbuf to the last one
-                data_mbuf->next = second_mbuf;
-                data_mbuf->data_len -= second_len;
-            }
-            
-            // Put headers and data packets in chain
+            // Prepare the payload - get the corresponding mbuf from the pool
+            data_mbuf = nsn_pktmbuf_alloc(conn->tx_data_pool, bufs[i].index);
+            data_mbuf->data_len = size;
+           
+            // Chain the mbufs
             rte_pktmbuf_chain(tx_bufs[i], data_mbuf);
         }
 
@@ -1064,29 +1270,34 @@ NSN_DATAPATH_RX(udpdpdk)
             continue;
         }
 
-        // Get the packet payload
-        char* payload = (char*)(uh + 1);
-        usize payload_size = rte_be_to_cpu_16(uh->dgram_len) - sizeof(struct rte_udp_hdr); 
+        // fprintf(stderr, "[udpdpdk] received packet on port %u on queue %u with %u segs, total len %u\n",
+        //        port_id, conn->rx_queue_id, mbuf->nb_segs, mbuf->pkt_len);
+        // struct rte_mbuf *cur = mbuf;
+        // for (int k = 0; k < mbuf->nb_segs; k++) {
+        //     printf(" - seg %d len %u from mempool %s\n", k + 1, cur->data_len,
+        //            cur->pool->name);
+        //     cur = cur->next;
+        // }       
 
-        // Get the NSN buffer memory
-        bufs[valid] = conn->pending_rx_buf;
-        char *data  = (char*)(endpoint->tx_zone + 1) + (bufs[valid].index * endpoint->io_bufs_size);    
+        if(mbuf->nb_segs != 2) {
+            fprintf(stderr, "[udpdpdk] received packet with %u segments, expected 2\n", mbuf->nb_segs);
+            rte_pktmbuf_free(mbuf);
+            continue;
+        }
+
+        // Set the index (zero-copy receive)
+        bufs[valid].index = *(usize*)(mbuf->next + 1);
+
+        // Set the size
         usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[valid].index)->len;
-
-        // Copy the packet payload to the NSN buffer memory        
-        *size = payload_size;        
-        memcpy(data, (char*)(uh + 1), payload_size);
+        *size = rte_be_to_cpu_16(uh->dgram_len) - sizeof(struct rte_udp_hdr);
+        
+        // Finalize the rx
         *buf_count  = *buf_count - 1;
         valid++;
 
-        // Release the mbuf
-        rte_pktmbuf_free(mbuf);
-        
-        // Update the pending tx descriptor
-        u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
-        if (np == 0) {
-            printf("[udpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
-        }
+        // Release the mbuf with custom free: DO NOT RE-ENQUEUE the index (the app will do that)
+        nsn_pktmbuf_free(mbuf);
     }
 
     return (int)valid;
@@ -1102,6 +1313,7 @@ NSN_DATAPATH_DEINIT(udpdpdk)
     if (res < 0) {
         fprintf(stderr, "[udpdpdk] failed to stop device: %s\n", rte_strerror(rte_errno));
     }
+    dev_stopped = true;
 
     struct ep_initializer *ep_in;
     list_for_each_entry(ep_in, endpoint_list, node) {
@@ -1121,3 +1333,176 @@ NSN_DATAPATH_DEINIT(udpdpdk)
 
     return 0;
 }
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// MEMPOOL HANDLERS and helper functions
+
+static int check_obj_bounds(char *obj, size_t pg_sz, size_t elt_sz)
+{
+	if (pg_sz == 0)
+		return 0;
+	if (elt_sz > pg_sz)
+		return 0;
+	if (RTE_PTR_ALIGN(obj, pg_sz) != RTE_PTR_ALIGN(obj + elt_sz - 1, pg_sz))
+		return -1;
+	return 0;
+}
+
+// OPS for mempool handers
+static int nsn_mp_alloc(struct rte_mempool *mp) {
+    
+    // Here is the trick: instead of CREATING the ring here, we pass an existing ring!
+    // Actually, to enable that, we expect the user to already set the mp->pool to a ring.
+    // And so here we just verify it exists!
+    if(mp->pool_data == NULL) {
+        // fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: deferring init...\n", mp->name);
+    } else {
+        nsn_ringbuf_t *ring = (nsn_ringbuf_t *)mp->pool_data;
+        fprintf(stderr, "[udpdpdk] mempool %s backed by ring %s at %p\n", mp->name, ring->name, ring);
+    }
+
+    // Create the array to keep the mbufs
+    mp->pool_config = rte_zmalloc_socket(mp->name, sizeof(struct rte_mbuf *) * mp->size, 0, mp->socket_id);
+    return 0;
+}
+
+static void nsn_mp_free(struct rte_mempool *mp) {
+    // Free the array of mbufs  
+    rte_free(mp->pool_config);
+
+    return;
+} 
+
+static int nsn_mp_enqueue(struct rte_mempool *mp, void * const *obj_table, unsigned n) {
+    if (!mp->pool_data ) {
+        // fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: cannot enqueue yet\n", mp->name);
+        return 0;
+    }
+    size_t index;
+    for (unsigned i = 0; i < n; i++) {
+        // 1. Get the index of the element
+        index = *(size_t*)((struct rte_mbuf *)obj_table[i] + 1);
+        // printf("Enqueueing mbuf %p with index %lu\n", obj_table[i], index);
+        // 2. Enqueue the element index in the ring
+        nsn_ringbuf_enqueue_burst((nsn_ringbuf_t *)mp->pool_data, &index, sizeof(void*), n, NULL);
+    }
+    return n;
+}
+
+static int nsn_mp_dequeue(struct rte_mempool *mp, void **obj_table, unsigned n) {
+    if (!mp->pool_data) {
+        // fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: cannot dequeue yet\n", mp->name);
+        return 0;
+    }
+    size_t index;
+    unsigned i;
+    struct rte_mbuf **mbuf_table = (struct rte_mbuf **)mp->pool_config;
+    for (i = 0; i < n; i++) {
+        // 1. Dequeue the index of the element
+        if (nsn_ringbuf_dequeue_burst((nsn_ringbuf_t *)mp->pool_data, &index, sizeof(void*), 1, NULL) == 0) {
+            break;
+        }
+        // 2. Get the element at that index
+        obj_table[i] = mbuf_table[index];
+        // printf("(%u) Dequeueing index %lu\n", i, index);
+    }
+    
+    return i;
+}
+
+static unsigned
+nsn_mp_get_count(const struct rte_mempool *mp)
+{
+    if (!mp->pool_data ) {
+        fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: cannot use it yet\n", mp->name);
+        return 0;
+    }
+	return nsn_ringbuf_count((nsn_ringbuf_t *)mp->pool_data);
+}
+
+// Copied from rte_mempool_op_populate_helper, with the exception that I put those
+// objects in the array of mbufs, instead of in the ring.
+static int nsn_mp_populate(struct rte_mempool *mp, unsigned int max_objs,
+	      void *vaddr, rte_iova_t iova, size_t len,
+	      rte_mempool_populate_obj_cb_t *obj_cb, void *obj_cb_arg) {
+    
+    char *va = vaddr;
+	size_t total_elt_sz, pg_sz;
+	size_t off;
+	unsigned int i;
+	void *obj;
+	int ret;
+    int flags = 0;
+
+	ret = rte_mempool_get_page_size(mp, &pg_sz);
+	if (ret < 0) {
+		return ret;
+    }
+	total_elt_sz = mp->header_size + mp->elt_size + mp->trailer_size;
+
+	if (flags & RTE_MEMPOOL_POPULATE_F_ALIGN_OBJ) {
+		off = total_elt_sz - (((uintptr_t)(va - 1) % total_elt_sz) + 1);
+    } else {
+		off = 0;
+    }
+
+    // Find the first free slot in the ring
+    uint64_t index = 0;
+    nsn_ringbuf_t **mbuf_table = (nsn_ringbuf_t **)mp->pool_config;
+    for (uint32_t j = 0; j < mp->size; j++) {
+        if (!mbuf_table[j]) {
+            index = j;
+            break;
+        }
+    }
+    if (index >= mp->size) {
+        fprintf(stderr, "Required index %lu exceeds mempool %s's capacity\n", index, mp->name);
+        return -EINVAL;
+    }
+
+	for (i = 0; i < max_objs; i++) {
+		/* avoid objects to cross page boundaries */
+		if (check_obj_bounds(va + off, pg_sz, total_elt_sz) < 0) {
+			off += RTE_PTR_ALIGN_CEIL(va + off, pg_sz) - (va + off);
+			if (flags & RTE_MEMPOOL_POPULATE_F_ALIGN_OBJ)
+				off += total_elt_sz -
+					(((uintptr_t)(va + off - 1) %
+						total_elt_sz) + 1);
+		}
+
+		if (off + total_elt_sz > len) {
+			break;
+        }
+
+		off += mp->header_size;
+		obj = va + off;
+		obj_cb(mp, obj_cb_arg, obj,
+		       (iova == RTE_BAD_IOVA) ? RTE_BAD_IOVA : (iova + off));
+
+        // Place the object in the array, and set the object's right index in priv_mem
+        mbuf_table[index] = obj;
+        *(size_t*)((struct rte_mbuf *)obj + 1) = index;
+        ++index;
+		
+        off += mp->elt_size + mp->trailer_size;
+	}
+
+	return i;
+}
+
+
+// We can now set the OPS for the mempool. AFAIK, this has effect only on the mempools
+// created with the "rte_pktmbuf_pool_create_extbuf" function and should not affect the
+// "regular" mempools.
+// This is achieved by adding a new mempool ops code, and using the RTE_MEMPOOL_REGISTER_OPS macro.
+static const struct rte_mempool_ops nsn_mp_ops = {
+	.name      = "nsn_mp_ops",
+	.alloc     = nsn_mp_alloc,
+	.free      = nsn_mp_free,
+	.enqueue   = nsn_mp_enqueue,
+	.dequeue   = nsn_mp_dequeue,
+	.get_count = nsn_mp_get_count,
+	.populate  = nsn_mp_populate,
+};
+
+RTE_MEMPOOL_REGISTER_OPS(nsn_mp_ops);

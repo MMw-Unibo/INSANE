@@ -1264,6 +1264,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
             stream->ep.tx_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME));
             stream->ep.tx_meta_zone = nsn_find_zone_by_name(app_pool.apps[app_idx].mem->zones, str_lit(NSN_CFG_DEFAULT_TX_META_NAME));
             stream->ep.io_bufs_size = mem_cfg.io_buffer_size;            
+            stream->ep.io_bufs_count = mem_cfg.io_buffer_pool_size;
             stream->ep.page_size = (1ULL << 21); //2MB TODO: This must become a nsnd param, used also for alloc.
             
             // Add the stream to the plugin

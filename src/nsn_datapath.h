@@ -47,6 +47,8 @@ struct nsn_endpoint
     usize page_size;
     // Data slot size
     usize io_bufs_size;
+    // Data slot count
+    usize io_bufs_count;
     
     // Plugin-specific data to store the endpoint state
     void* data;

@@ -415,7 +415,7 @@ static inline void nsn_pktmbuf_free(struct rte_mbuf *m)
  * This call will bypass the call to the DEQUEUE OPS, because we already have the index,
  * which was obtained by the application.
  */
-static inline struct rte_mbuf *rte_pktmbuf_alloc(struct rte_mempool *mp, size_t index)
+static inline struct rte_mbuf *nsn_pktmbuf_alloc(struct rte_mempool *mp, size_t index)
 {
     struct rte_mbuf** table = (struct rte_mbuf**)mp->pool_config;
     struct rte_mbuf *m = table[index];
