@@ -41,3 +41,12 @@ Then, invoke the the daemon executable (`nsnd`).
 ### Running the demo application
 
 Once the daemon is running on a machine, you can run multiple INSANE-based applications on that machine. To start the demo application, you can invoke `nsn-app`.
+
+
+## Plugins
+
+### DPDK plugins
+
+To fully support a DPDK-based plugin and still guarantee the flexibility of INSANE, we had to modify a few lines of the driver of the Mellanox card (mlx5). Hence, we provide a [diff file](dpdk_22_11_mods.diff) that contains the changes we made to the driver source code. You can apply this patch to the DPDK source code before building it.
+
+Furthermore, if you are using a Mellanox card for the DPDK plugin, you need to explicitly disable the use of vectorial instructions, as it conflicts with the features we use in the DPDK plugin. To do so, add the following parameter to the DPDK configuration (i.e., the `eal_args` string) in the INSANE daemon configuration file: `-a <pcie_addr>,rx_vec_en=0`, where `<pcie_addr>` is the PCI address of the Mellanox card (e.g., `0000:05:00.0`).
