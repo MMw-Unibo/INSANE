@@ -314,7 +314,7 @@ static void arp_receive(struct rte_mbuf *arp_mbuf) {
 
             char mac_str[32];
             rte_ether_format_addr(mac_str, 32, &peers[i].mac_addr);
-            fprintf(stderr, "[udpdpdk] ARP reply from %s: %s\n", peers[i].ip_str, mac_str);
+            fprintf(stderr, "[udpdpdk] ARP reply from %s is %s\n", peers[i].ip_str, mac_str);
 
             break;
         }
@@ -322,17 +322,15 @@ static void arp_receive(struct rte_mbuf *arp_mbuf) {
 
     if (ahdr->arp_data.arp_tip != local_ip_net) {
         // not for us - do not reply
-        fprintf(stderr, "[udpdpdk] ARP reply not for us\n");
         return;
     }
 
     switch (rte_be_to_cpu_16(ahdr->arp_opcode)) {
     case ARP_REQUEST:
-        fprintf(stderr, "[udpdpdk] Reply to ARP request...\n");
+        fprintf(stderr, "[udpdpdk] Reply to ARP request\n");
         arp_reply(&ahdr->arp_data);
         break;
     default:
-        fprintf(stderr, "[udpdpdk] ARP reply, or opcode not supported\n");
         // Replies or wrong opcodes - no action
         break;
     }
@@ -693,8 +691,6 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
         endpoint->data = NULL;
         endpoint->data_size = 0;
 
-        // Stop the rx queue
-        int ret = rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
     } 
     // Case 2. Create endpoint data.
     else {  

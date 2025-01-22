@@ -1,16 +1,15 @@
-diff --git a/drivers/common/mlx5/mlx5_common_defs.h b/drivers/common/mlx5/mlx5_common_defs.h
-index 68b700dc0b..0e7cbf086f 100644
---- a/drivers/common/mlx5/mlx5_common_defs.h
-+++ b/drivers/common/mlx5/mlx5_common_defs.h
-@@ -12,7 +12,7 @@
- #define MLX5_MR_CACHE_N 8
- 
- /* Size of MR cache table for binary search. */
--#define MLX5_MR_BTREE_CACHE_N 256
-+#define MLX5_MR_BTREE_CACHE_N 16384  // 256
- 
- /*
-  * Defines the amount of retries to allocate the first UAR in the page.
+diff --git a/drivers/net/mlx5/mlx5_ethdev.c b/drivers/net/mlx5/mlx5_ethdev.c
+index 4a85415ff3..f43b3b2759 100644
+--- a/drivers/net/mlx5/mlx5_ethdev.c
++++ b/drivers/net/mlx5/mlx5_ethdev.c
+@@ -337,6 +337,7 @@ mlx5_dev_infos_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *info)
+ 				 info->rx_queue_offload_capa);
+ 	info->tx_offload_capa = mlx5_get_tx_port_offloads(dev);
+ 	info->dev_capa = RTE_ETH_DEV_CAPA_FLOW_SHARED_OBJECT_KEEP;
++	info->dev_capa |= RTE_ETH_DEV_CAPA_RUNTIME_RX_QUEUE_SETUP;
+ 	info->if_index = mlx5_ifindex(dev);
+ 	info->reta_size = priv->reta_idx_n ?
+ 		priv->reta_idx_n : priv->sh->dev_cap.ind_table_max_size;
 diff --git a/drivers/net/mlx5/mlx5_rxq.c b/drivers/net/mlx5/mlx5_rxq.c
 index 81aa3f074a..132c5658b1 100644
 --- a/drivers/net/mlx5/mlx5_rxq.c
@@ -125,35 +124,3 @@ index 81aa3f074a..132c5658b1 100644
  	rte_io_wmb();
  	*rxq_data->cq_db = rte_cpu_to_be_32(rxq_data->cq_ci);
  	rte_io_wmb();
-diff --git a/lib/eal/linux/eal_vfio.c b/lib/eal/linux/eal_vfio.c
-index 549b86ae1d..8c5b7c5d28 100644
---- a/lib/eal/linux/eal_vfio.c
-+++ b/lib/eal/linux/eal_vfio.c
-@@ -27,7 +27,7 @@
-  * was registered by the user themselves, so we need to store the user mappings
-  * somewhere, to recreate them later.
-  */
--#define VFIO_MAX_USER_MEM_MAPS 256
-+#define VFIO_MAX_USER_MEM_MAPS 1024
- struct user_mem_map {
- 	uint64_t addr;  /**< start VA */
- 	uint64_t iova;  /**< start IOVA */
-diff --git a/lib/ethdev/rte_ethdev.c b/lib/ethdev/rte_ethdev.c
-index 5d5e18db1e..4f25733bcf 100644
---- a/lib/ethdev/rte_ethdev.c
-+++ b/lib/ethdev/rte_ethdev.c
-@@ -1969,10 +1969,10 @@ rte_eth_rx_queue_setup(uint16_t port_id, uint16_t rx_queue_id,
- 		return -EINVAL;
- 	}
- 
--	if (dev->data->dev_started &&
--		!(dev_info.dev_capa &
--			RTE_ETH_DEV_CAPA_RUNTIME_RX_QUEUE_SETUP))
--		return -EBUSY;
-+	// if (dev->data->dev_started &&
-+	// 	!(dev_info.dev_capa &
-+	// 		RTE_ETH_DEV_CAPA_RUNTIME_RX_QUEUE_SETUP))
-+	// 	return -EBUSY;
- 
- 	if (dev->data->dev_started &&
- 		(dev->data->rx_queue_state[rx_queue_id] !=
