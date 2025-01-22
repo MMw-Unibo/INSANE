@@ -259,6 +259,45 @@ nsn_config_free_param_list(list_head_t* head, mem_arena_t* arena)
     return 0;
 }
 
+// Get all the options with a certain name in all the subsections of a given section
+int 
+nsn_config_get_string_list_from_subsections(mem_arena_t* arena, nsn_cfg_t *cfg, string_t sec, string_t key, list_head_t* out_value) {
+    temp_mem_arena_t scratch = nsn_thread_scratch_begin(NULL, 0);
+    nsn_cfg_sec_t *section = NULL;
+    nsn_cfg_sec_t *sub_section = NULL;
+    u16 sec_count = 0;
+    char sec_name[256];
+    
+    // For each section we have in the config
+    list_for_each_entry(section, &cfg->sections, list) {
+        if (str_eq(sec, section->name) && section->list.next != NULL) {
+            bzero(sec_name, 256);
+            sub_section = list_first_entry(&section->sub_sections, nsn_cfg_sec_t, list);           
+            sprintf(sec_name, "%.*s.%.*s", (int)section->name.len, section->name.data, 
+                                            (int)sub_section->name.len, sub_section->name.data);
+            nsn_cfg_opt_t *cur_opt = nsn_config_get_opt(scratch.arena, cfg, str_cstr(sec_name), key);
+            if (!cur_opt) {
+                log_warn("invalid option: %s for section %s\n", to_cstr(key), sec_name);
+                continue;
+            }
+            if (cur_opt->type != NsnConfigOptType_String) {
+               log_warn("invalid option type\n");
+               continue;
+            }
+
+            // Allocate a new option from the caller's arena
+            nsn_cfg_opt_t *new_opt = mem_arena_push_struct(arena, nsn_cfg_opt_t);
+            memcpy(new_opt, cur_opt, sizeof(nsn_cfg_opt_t));
+            list_add_tail(out_value, &new_opt->list);
+        
+            sec_count++;
+        }
+    }
+
+    nsn_thread_scratch_end(scratch);
+    return sec_count;
+}
+
 int 
 nsn_config_get_int_from_list(list_head_t* head, string_t key, int *out_value)
 {  

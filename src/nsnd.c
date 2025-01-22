@@ -368,7 +368,7 @@ struct nsn_app_pool
     mem_arena_t *arena;
     nsn_app_t   *apps;
     bool        *free_apps_slots;
-    usize        count;
+    usize        count; // MAX apps handled by the daemon
     usize        used;
 };
 
@@ -542,6 +542,34 @@ nsn_cfg_t *config      = NULL;
 ////////
 
 // --- Datapath helpers -----------------------------------------------------
+
+// From the config, retrieve the IP addresses of the peers for the plugin "datapath_name", 
+// returning their number and the list of IPs in the "peer_list" buffer.
+static u16 get_peers_ip_list(nsn_cfg_t *config, char *datapath_ip_key, char **peer_list, u16 max_peers, temp_mem_arena_t* arena) {
+    list_head(options);
+    int n = nsn_config_get_string_list_from_subsections(arena->arena, config, str_lit("peers"), str_cstr(datapath_ip_key), &options);
+    if (n < 0) {
+        log_warn("No peers found for plugin %s\n", datapath_ip_key);
+        return 0;
+    }
+
+    // Copy the options (strings) into the provided array
+    nsn_cfg_opt_t *cur_opt = NULL;
+    u16 i = 0;
+    list_for_each_entry(cur_opt, &options, list) {
+        if (i >= max_peers) {
+            break;
+        }
+        strncpy(peer_list[i], (char*)cur_opt->string.data, cur_opt->string.len);
+        peer_list[i][cur_opt->string.len] = '\0';
+        log_debug("detected IP %s for option %s\n", peer_list[i], datapath_ip_key);
+        i++;
+    }
+    nsn_config_free_param_list(&options, arena->arena);
+
+    return (u16)n;
+}
+
 // When calling this function, we must hold the lock on the streams list
 static void prepare_ep_list(list_head_t* ep_list, nsn_plugin_t *plugin, temp_mem_arena_t* data_arena) {
     nsn_inner_stream_t *stream;
@@ -637,17 +665,15 @@ wait:
     ctx.max_tx_burst = args->max_tx_burst;
     ctx.max_rx_burst = args->max_rx_burst;
 
-    // 1c) TODO: Retrieve the list of peer's IPs from the config file
-    ctx.n_peers = 1;
-    char* config_file[] = {"192.168.56.212"};
-
-    ctx.peers = mem_arena_push(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers);
-    bzero(ctx.peers, sizeof(ctx.peers) * ctx.n_peers);
-    for (u32 i = 0; i < ctx.n_peers; i++) {
-        ctx.peers[i] = mem_arena_push_array(data_arena.arena, char, ip_str_size);
-        bzero(ctx.peers[i], ip_str_size);
-        strcpy(ctx.peers[i], config_file[i]);
+    // 1c) Retrieve the list of peer's IPs for this plugin from the config file
+    bzero(string_buf, ip_str_size*4);
+    sprintf(string_buf, "%s_ip", to_cstr(datapath_name));
+    char** peer_list = mem_arena_push(data_arena.arena, sizeof(char*) * app_pool.count);
+    for(u32 i = 0; i < app_pool.count; i++) {
+        peer_list[i] = mem_arena_push(data_arena.arena, ip_str_size);
     }
+    ctx.n_peers = get_peers_ip_list(config, string_buf, peer_list, app_pool.count, &data_arena);
+    ctx.peers = peer_list;
 
     // Save a pointer to the CP functions in the plugin descriptor
     plugin->conn_manager = ops.conn_manager;
@@ -777,8 +803,8 @@ unload_and_clean:
     plugin->update = NULL;
     plugin->conn_manager = NULL;
     
-    mem_arena_pop(data_arena.arena, sizeof(char)*ip_str_size*ctx.n_peers); // peers' IPs
-    mem_arena_pop(data_arena.arena, sizeof(ctx.peers) * ctx.n_peers); // ctx.peers
+    mem_arena_pop(data_arena.arena, ip_str_size*app_pool.count); // peers' IPs
+    mem_arena_pop(data_arena.arena, sizeof(peer_list) * app_pool.count); // array of peers' IPs
 
     // Free the param list
     nsn_config_free_param_list(&ctx.params, data_arena.arena);

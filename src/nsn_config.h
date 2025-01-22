@@ -53,11 +53,15 @@ nsn_config_get_int(nsn_cfg_t *config, string_t section, string_t key, int *out_v
 int 
 nsn_config_get_string(nsn_cfg_t *cfg, string_t sec, string_t key, string_t* out_value);
 
-// Get list of options from the config
+// Get list of all the options in a section from the config
 int 
 nsn_config_get_param_list(nsn_cfg_t *cfg, string_t sec, list_head_t* out_value, mem_arena_t* arena);
 int
 nsn_config_free_param_list(list_head_t* head, mem_arena_t* arena);
+
+// Get all the options with a certain name in all the subsections of a given section
+int 
+nsn_config_get_string_list_from_subsections(mem_arena_t* arena, nsn_cfg_t *cfg, string_t sec, string_t key, list_head_t* out_value);
 
 // Get single options from the list
 int 
