@@ -7,6 +7,7 @@ BUILD_TYPE=debug
 PROJECT_NAME=all
 
 DPDK=`pkg-config --cflags --libs libdpdk --static`
+TLDK="-I ../../deps/tldk/include -L ../../deps/tldk/lib -ltle_dring -ltle_l4p -ltle_memtank -ltle_timer"
 
 if [ $# -eq 1 ]; then
     BUILD_TYPE=$1
@@ -29,4 +30,5 @@ cd build
 $CC $CFLAGS $LDFLAGS ../udpsock_perf.c $DEFINES -o udpsock-perf
 $CC $CFLAGS $LDFLAGS ../udpdpdk_perf.c $DEFINES -o udpdpdk-perf $DPDK
 $CC $CFLAGS $LDFLAGS ../tcpsock_perf.c $DEFINES -o tcpsock-perf
+$CC $CFLAGS $LDFLAGS ../tcpdpdk_perf.c $DEFINES -o tcpdpdk-perf $DPDK $TLDK
 cd ..
