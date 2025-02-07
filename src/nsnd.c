@@ -562,7 +562,7 @@ static u16 get_peers_ip_list(nsn_cfg_t *config, char *datapath_ip_key, char **pe
         }
         strncpy(peer_list[i], (char*)cur_opt->string.data, cur_opt->string.len);
         peer_list[i][cur_opt->string.len] = '\0';
-        log_debug("detected IP %s for option %s\n", peer_list[i], datapath_ip_key);
+        log_debug("detected peer with IP %s\n", peer_list[i], datapath_ip_key);
         i++;
     }
     nsn_config_free_param_list(&options, arena->arena);
@@ -609,7 +609,6 @@ dataplane_thread_proc(void *arg)
 
     size_t ip_str_size = 16;
     char string_buf[ip_str_size*4];
-    temp_mem_arena_t data_arena = nsn_thread_scratch_begin(NULL, 0);
 
 wait: 
     log_debug("[thread %d] waiting for a message\n", self);
@@ -621,6 +620,9 @@ wait:
         log_debug("[thread %d] stopping\n", self);
         return NULL;
     }
+
+    // Init temp arena
+    temp_mem_arena_t data_arena = nsn_thread_scratch_begin(NULL, 0);
 
     // Load the datapath plugin
     string_t datapath_name = args->datapath_name;
@@ -809,6 +811,9 @@ unload_and_clean:
     // Free the param list
     nsn_config_free_param_list(&ctx.params, data_arena.arena);
 
+    // Clean arena
+    nsn_thread_scratch_end(data_arena);
+
     state = at_load(&args->state, mo_rlx);
     log_debug("[thread %d] state: %s (%d)\n", self, nsn_dataplane_thread_state_str[state], state);
 
@@ -824,7 +829,6 @@ unload_and_clean:
     }
 
 quit:
-    nsn_thread_scratch_end(data_arena);
     log_info("[thread %d] done\n", self);
     return NULL;
 }
