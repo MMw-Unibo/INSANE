@@ -115,10 +115,6 @@ struct tldk_stream_handle {
 
 static struct tldk_ep tldk_ctx;
 
-// Necessary for BE-FE coordination; must become atomics if used
-static uint64_t submitted_pkts;
-static uint64_t sent_pkts;
-
 //--------------------------------------------------------------------------------------------------
 void handle(int signum) {
     (void)(signum);
@@ -335,8 +331,8 @@ static struct tldk_stream_handle create_tldk_stream(uint16_t socket_id) {
     return (struct tldk_stream_handle){stream, ereq, rxeq, txeq};
 }
 
-/* Function executed by the backend thread */
-static int backend_thread(void *arg) {
+/* (Logical) backend thread. */
+static int be_tcp() {
     uint16_t         nb_rx, nb_valid, nb_tx, nb_arp, nb_tx_tcp, nb_tx_actual;
     struct rte_mbuf *rx_pkt[MAX_PKT_BURST];
     struct rte_mbuf *rp[MAX_PKT_BURST];
@@ -344,93 +340,81 @@ static int backend_thread(void *arg) {
     struct rte_mbuf *tx_pkt[MAX_PKT_BURST];
     int              ret;
 
-    (void)(arg);
     (void)(nb_arp);
 
     tldk_ctx.port.lcore_id = rte_lcore_id();
     struct tle_dev *dev     = tldk_ctx.dev;
 
-    // b. Loop forever
-    while (g_running) {
-        // 1. Receive
-        nb_arp = 0;
-        nb_rx  = rte_eth_rx_burst(tldk_ctx.port.id, 0, rx_pkt, MAX_PKT_BURST);
-        if (nb_rx) {
-            // TODO: Here we must check the packet type. Here we just assume they are TCP.
-            // If they are TCP packets, set the l2, l3, l4 len accordingly and meet the
-            // pre-conditions of tle_tcp_rx_bulk. Otherwise, drop the packet or handle it
-            // differently (e.g., if it is ARP)
-            for (int i = 0; i < nb_rx; i++) {
-                struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(rx_pkt[i], struct rte_ether_hdr *);
-                // Check ethernet type
-                if (rte_be_to_cpu_16(eth_hdr->ether_type) != RTE_ETHER_TYPE_IPV4) {
-
-                    // WE DO NOT HANDLE ARP HERE
-                    // if (rte_be_to_cpu_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_ARP) {
-                    //     // Prepare ARP reply
-                    //     arp_reply(tldk_ctx.port->id, rx_pkt[i]);
-                    //     // Append the mbuf to the TX queue
-                    //     tx_pkt[nb_arp] = rx_pkt[i];
-                    //     nb_arp++;
-                    // }
-
-                    // Continue: this will go without l2, l3, l4 len set to the TCP processing,
-                    // hence discarded.
-                    continue;
-                }
-                // Check IP protocol
-                struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
-                if (ip_hdr->next_proto_id != IPPROTO_TCP) {
-                    // printf("IP Packet type not TCP: %d\n", ip_hdr->next_proto_id);
-                    continue;
-                }
-
-                // Check TCP flags (prereq of tle_tcp_rx_bulk)
-                if ((rx_pkt[i]->packet_type & (RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L3_IPV6)) == 0) {
-                    printf("Packet type L3: %d (must be != 0)\n",
-                           rx_pkt[i]->packet_type & (RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L3_IPV6));
-                    continue;
-                }
-                if ((rx_pkt[i]->packet_type & (RTE_PTYPE_L4_TCP)) == 0) {
-                    printf("Packet type L4: %d (must be != 0)\n",
-                           rx_pkt[i]->packet_type & (RTE_PTYPE_L4_TCP));
-                    continue;
-                }
-
-                // Compute l2, l3 len (prereq of tle_tcp_rx_bulk)
-                rx_pkt[i]->l2_len = RTE_ETHER_HDR_LEN;
-                rx_pkt[i]->l3_len = sizeof(struct rte_ipv4_hdr);
-                // Get the TCP header to compute the l4 len
-                struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)(ip_hdr + 1);
-                /* Data Off specifies the size of the TCP header in 32-bit words. Note that the
-                 * actual field only occupies the 4 most significant bits */
-                rx_pkt[i]->l4_len = (uint16_t)(tcp_hdr->data_off >> 4) * 4;
+    // 1. Receive
+    nb_arp = 0;
+    nb_rx  = rte_eth_rx_burst(tldk_ctx.port.id, 0, rx_pkt, MAX_PKT_BURST);
+    if (nb_rx) {
+        // If they are TCP packets, set the l2, l3, l4 len accordingly and meet the
+        // pre-conditions of tle_tcp_rx_bulk. Otherwise, drop the packet; if ARP, 
+        // handle the request before discarding the packet.
+        for (int i = 0; i < nb_rx; i++) {
+            struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(rx_pkt[i], struct rte_ether_hdr *);
+            // Check ethernet type
+            if (rte_be_to_cpu_16(eth_hdr->ether_type) != RTE_ETHER_TYPE_IPV4) {
+                // if (rte_be_to_cpu_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_ARP) {
+                //     // Prepare ARP reply
+                //     arp_reply(tldk_ctx.port->id, rx_pkt[i]);
+                //     // Append the mbuf to the TX queue
+                //     tx_pkt[nb_arp] = rx_pkt[i];
+                //     nb_arp++;
+                // }
+                continue;
+            }
+            // Check IP protocol
+            struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+            if (ip_hdr->next_proto_id != IPPROTO_TCP) {
+                printf("IP Packet type not TCP: %d\n", ip_hdr->next_proto_id);
+                continue;
             }
 
-            // TCP processing
-            nb_valid = tle_tcp_rx_bulk(dev, rx_pkt, rp, rc, nb_rx);
-
-            // Drop packets that are not valid or not to be delivered
-            for (int j = 0; j < (nb_rx - nb_valid); j++) {
-                rte_pktmbuf_free(rp[j]);
+            // Check TCP flags (prereq of tle_tcp_rx_bulk)
+            if ((rx_pkt[i]->packet_type & (RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L3_IPV6)) == 0) {
+                printf("Packet type L3: %d (must be != 0)\n",
+                       rx_pkt[i]->packet_type & (RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L3_IPV6));
+                continue;
             }
+            if ((rx_pkt[i]->packet_type & (RTE_PTYPE_L4_TCP)) == 0) {
+                printf("Packet type L4: %d (must be != 0)\n",
+                       rx_pkt[i]->packet_type & (RTE_PTYPE_L4_TCP));
+                continue;
+            }
+
+            // Compute l2, l3 len (prereq of tle_tcp_rx_bulk)
+            rx_pkt[i]->l2_len = RTE_ETHER_HDR_LEN;
+            rx_pkt[i]->l3_len = sizeof(struct rte_ipv4_hdr);
+            // Get the TCP header to compute the l4 len
+            struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)(ip_hdr + 1);
+            /* Data Off specifies the size of the TCP header in 32-bit words. Note that the
+             * actual field only occupies the 4 most significant bits */
+            rx_pkt[i]->l4_len = (uint16_t)(tcp_hdr->data_off >> 4) * 4;
         }
 
-        // 2. Progress the TCP state machine
-        ret = tle_tcp_process(tldk_ctx.ctx, MAX_STREAMS);
-        if (ret < 0) {
-            printf("Error processing TCP state machine: %s\n", strerror(ret));
-            return ret;
-        }
+        // TCP processing
+        nb_valid = tle_tcp_rx_bulk(dev, rx_pkt, rp, rc, nb_rx);
 
-        // 3. Transmit
-        nb_tx_tcp = tle_tcp_tx_bulk(dev, tx_pkt + nb_arp, MAX_PKT_BURST - nb_arp);
-        nb_tx = nb_arp + nb_tx_tcp;
-        nb_tx_actual = 0;
-        while (nb_tx_actual < nb_tx) {
-            nb_tx_actual += rte_eth_tx_burst(tldk_ctx.port.id, 0, tx_pkt, nb_tx);
+        // Drop packets that are not valid or not to be delivered
+        for (int j = 0; j < (nb_rx - nb_valid); j++) {
+            rte_pktmbuf_free(rp[j]);
         }
-        sent_pkts += nb_tx_tcp;
+    }
+    
+    // 2. Progress the TCP state machine
+    ret = tle_tcp_process(tldk_ctx.ctx, MAX_STREAMS);
+    if (ret < 0) {
+        printf("Error processing TCP state machine: %s\n", strerror(ret));
+    }
+    
+    // 3. Transmit
+    nb_tx_tcp = tle_tcp_tx_bulk(dev, tx_pkt + nb_arp, MAX_PKT_BURST - nb_arp);
+    nb_tx = nb_arp + nb_tx_tcp;
+    nb_tx_actual = 0;
+    while (nb_tx_actual < nb_tx) {
+        nb_tx_actual += rte_eth_tx_burst(tldk_ctx.port.id, 0, tx_pkt, nb_tx);
     }
 
     return 0;
@@ -461,6 +445,7 @@ void do_source(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, t
     uint32_t ne_tx, ne_err, np_tx;
     char     *evdata[32];
     do {
+        be_tcp();
         ne_tx  = tle_evq_get(str_hdl.txeq, (const void**)evdata, MAX_PKT_BURST);
         ne_err = tle_evq_get(str_hdl.ereq, (const void**)evdata, MAX_PKT_BURST);
     } while (!ne_tx && !ne_err);
@@ -472,7 +457,6 @@ void do_source(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, t
 
     fprintf(stderr, "\nClient connected!\n");
     sleep(1);
-
 
     // Pre-allocate the mbufs, populate them, and prepare headers
     struct rte_mbuf *mbuf[params->burst_size];
@@ -503,21 +487,26 @@ void do_source(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, t
 
         /* Send the packet(s) to the TLDK stack */
         np_tx = 0;
-        while((np_tx += tle_tcp_stream_send(str_hdl.stream, mbuf + np_tx, actual_burst - np_tx)) < actual_burst);
-        // if (np_tx != actual_burst) {
-        //     printf("Error sending packet(s): %s\n", rte_strerror(rte_errno));
-        //     return;
-        // }
-        submitted_pkts += np_tx;
+        do {
+            np_tx += tle_tcp_stream_send(str_hdl.stream, mbuf + np_tx, actual_burst - np_tx);
+            be_tcp();
+        } while(np_tx < actual_burst);
     }
 
-    while(submitted_pkts > sent_pkts);
+    
+    while(tle_tcp_stream_tx_pending(str_hdl.stream)) {
+        be_tcp();
+    }
+    
     fprintf(stderr, "Sent %lu packets\n", counter);
 
     ret = tle_tcp_stream_close(str_hdl.stream);
     if (ret != 0) {
         printf("Close: %s\n", strerror(ret));
     }
+
+    // Transmit the remaining packets
+    be_tcp();
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -543,6 +532,7 @@ void do_sink(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
 
     /* look for syn events */
     do {
+        be_tcp();
         nb_syn = tle_evq_get(str_hdl.rxeq, (const void**)data, MAX_PKT_BURST);
         nb_err = tle_evq_get(str_hdl.ereq, (const void**)data, MAX_PKT_BURST);
     } while (!nb_syn && !nb_err);
@@ -588,10 +578,13 @@ void do_sink(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
     //        inet_ntoa(client_addr->sin_addr));
     printf("Accepted connection!\n");
 
+    rx_size = 0;
     counter = 0;
     first_time = 0;
     last_time = 0;
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
+
+        be_tcp();
 
         // Check for errors
         if ((ne_err = tle_evq_get(str_hdl.ereq, (const void**)data, 1)) > 0 && ((uint64_t)data[0]) == 1) {
@@ -632,6 +625,8 @@ void do_sink(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
     if (ret != 0) {
         printf("Close: %s\n", strerror(ret));
     }
+
+    be_tcp();
 
     /* Compute results */
     uint64_t elapsed_time_ns = last_time - first_time;
@@ -678,6 +673,7 @@ void do_ping(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
     uint32_t ne_tx, ne_err, np_tx;
     char     *evdata[MAX_PKT_BURST];
     do {
+        be_tcp();
         ne_tx  = tle_evq_get(str_hdl.txeq, (const void**)evdata, MAX_PKT_BURST);
         ne_err = tle_evq_get(str_hdl.ereq, (const void**)evdata, MAX_PKT_BURST);
     } while (!ne_tx && !ne_err);
@@ -721,9 +717,12 @@ void do_ping(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
             printf("Error sending packet(s): %s\n", strerror(np_tx));
             return;
         }
+        be_tcp();
 
         pong_received = 0;
         while (!pong_received) {
+            be_tcp();
+            
             // Receive 1, but 8 is the minimum burst size to ensure compatibility
             nb_rx = tle_tcp_stream_recv(str_hdl.stream, &rx_mbuf, 1);
 
@@ -768,6 +767,7 @@ void do_pong(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
 
     /* look for syn events */
     do {
+        be_tcp();
         nb_syn = tle_evq_get(str_hdl.rxeq, (const void**)data, MAX_PKT_BURST);
         nb_err = tle_evq_get(str_hdl.ereq, (const void**)data, MAX_PKT_BURST);
     } while (!nb_syn && !nb_err);
@@ -824,6 +824,7 @@ void do_pong(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
         }
 
         // Receive
+        be_tcp();
         nb_rx = tle_tcp_stream_recv(client_stream, &rx_buf, 1);
 
         if(nb_rx > 0) {              
@@ -834,11 +835,9 @@ void do_pong(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
                 return;
             }
             counter++;
-            submitted_pkts += np_tx;
+            be_tcp();
         }
     }
-
-    while (submitted_pkts > sent_pkts);
 
     // Close the stream
     ret = tle_tcp_stream_close(client_stream);
@@ -850,6 +849,8 @@ void do_pong(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
     if (ret != 0) {
         printf("Close: %s\n", strerror(ret));
     }
+
+    be_tcp();
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -1074,11 +1075,11 @@ int main(int argc, char *argv[]) {
     struct tldk_stream_handle stream = create_tldk_stream(socket_id);
 
     // 3. Create the TLDK background thread, which handles the raw data packets
-    uint32_t lcore_id = 1;
-    if (rte_eal_remote_launch(backend_thread, NULL, lcore_id) != 0) {
-        printf("Error creating thread\n");
-        rte_exit(EXIT_FAILURE, "Error creating thread\n");
-    }    
+    // uint32_t lcore_id = 1;
+    // if (rte_eal_remote_launch(backend_thread, NULL, lcore_id) != 0) {
+    //     printf("Error creating thread\n");
+    //     rte_exit(EXIT_FAILURE, "Error creating thread\n");
+    // }    
 
     /*************************************************************************/
 
@@ -1098,7 +1099,8 @@ int main(int argc, char *argv[]) {
 
     /* Terminate */
     g_running = false;
-    sleep(1);
+
+    be_tcp();
     rte_eth_dev_stop(params.port_id);
     rte_eal_cleanup();
     return 0;
