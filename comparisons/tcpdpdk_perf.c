@@ -569,14 +569,11 @@ void do_sink(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
         exit(1);
     }
 
-    // TODO: It looks like this feature is not well implemented...
-    // struct tle_tcp_stream_addr addr;
-    // tle_tcp_stream_get_addr(stream, &addr);
-    // struct sockaddr_in *client_addr = (struct sockaddr_in *)&addr.local;
-    // struct sockaddr_in *server_addr = (struct sockaddr_in *)&addr.remote;
-    // printf("Accepted connection from %s to %s\n", inet_ntoa(server_addr->sin_addr),
-    //        inet_ntoa(client_addr->sin_addr));
-    printf("Accepted connection!\n");
+    struct tle_tcp_stream_addr addr;
+    tle_tcp_stream_get_addr(client_stream, &addr);
+    // struct sockaddr_in *server_addr = (struct sockaddr_in *)&addr.local;
+    struct sockaddr_in *client_addr = (struct sockaddr_in *)&addr.remote;
+    printf("Accepted connection from %s\n", inet_ntoa(client_addr->sin_addr));
 
     rx_size = 0;
     counter = 0;
