@@ -2,6 +2,7 @@
 # Xmake cache
 .xmake/
 build/
+deps/
 
 # MacOS Cache
 .DS_Store
