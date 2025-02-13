@@ -1,9 +1,10 @@
 #ifndef NSN_SHARED_MEMORY_H
 #define NSN_SHARED_MEMORY_H
 
-#include "nsn_log.h"
 #include "nsn_memory.h"
 #include "nsn_types.h"
+
+#include "common/nsn_log.h"
 
 #define NSN_SHM_NAME_MAX 32
 

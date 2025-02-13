@@ -1,20 +1,33 @@
-// --- include files -----------------------------------------------------------
-#include "nsn_types.h"
-#include "nsn.h"
-#include "nsn_os.h"
-#include "nsn_os_inc.h"
-#include "nsn_string.h"
+// // --- include files -----------------------------------------------------------
+// #include "nsn_types.h"
+// #include "nsn.h"
+// #include "nsn_os.h"
+// #include "nsn_os_inc.h"
+// #include "nsn_string.h"
 
-// --- c files -----------------------------------------------------------------
-#include "nsn.c"
-#include "nsn_memory.c"
-#include "nsn_os_inc.c"
-#include "nsn_shm.c"
-#include "nsn_string.c"
-#include "nsn_ringbuf.c"
+// // --- c files -----------------------------------------------------------------
+// #include "nsn.c"
+// #include "nsn_memory.c"
+// #include "nsn_os_inc.c"
+// #include "nsn_shm.c"
+// #include "nsn_string.c"
+// #include "nsn_ringbuf.c"
 
-#define NSN_LOG_IMPLEMENTATION_H
-#include "nsn_log.h"
+// #define NSN_LOG_IMPLEMENTATION_H
+// #include "nsn_log.h"
+
+#define _GNU_SOURCE
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <nsn/nsn.h>
+
+#define nsn_unused(x) ((void)(x))
 
 // A simple macro used to check if there are enough command line args
 #define ENSURE_ONE_MORE_ARGUMENT(argc, argv, i, argName)                                           \
@@ -202,7 +215,7 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
 
         buf_send  = nsn_get_buffer(params->payload_size, NSN_BLOCKING);
         send_time = get_clock_realtime_ns();
-        if (nsn_unlikely(!nsn_buffer_is_valid(&buf_send))) {
+        if (!nsn_buffer_is_valid(&buf_send)) {
             fprintf(stderr, "Failed to get buffer\n");
             continue;
         }
@@ -237,7 +250,7 @@ void do_pong(nsn_stream_t *stream, test_config_t *params) {
     nsn_buffer_t buf;
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
         buf = nsn_consume_data(sink, NSN_BLOCKING);
-        if (nsn_unlikely(!nsn_buffer_is_valid(&buf))) {
+        if (!nsn_buffer_is_valid(&buf)) {
             fprintf(stderr, "Failing to receive. Continuing...\n");
             continue;
         }

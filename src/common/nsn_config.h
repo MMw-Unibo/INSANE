@@ -1,9 +1,10 @@
 #ifndef NSN_CONFIG_H
 #define NSN_CONFIG_H
 
-#include "nsn_types.h"
-#include "nsn_string.h"
-#include "nsn_os.h"
+#include "base/nsn_os.h"
+#include "base/nsn_string.h"
+#include "base/nsn_thread_ctx.h"
+#include "base/nsn_types.h"
 
 enum nsn_config_opt_type {
     NsnConfigOptType_String,

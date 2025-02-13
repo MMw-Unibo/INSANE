@@ -1,4 +1,4 @@
-#include "nsn_ringbuf.h"
+#include "common/nsn_ringbuf.h"
 
 static inline nsn_ringbuf_t *
 nsn_ringbuf_create_elem(void *memory, string_t name, usize esize, u32 count)

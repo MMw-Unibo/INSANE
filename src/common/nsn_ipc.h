@@ -1,9 +1,10 @@
 #ifndef NSN_IPC_H
 #define NSN_IPC_H
 
-#include "nsn.h"
-#include "nsn_types.h"
-#include "nsn_shm.h"
+#include "base/nsn_types.h"
+#include "base/nsn_shm.h"
+
+#include "nsn/nsn.h"
 
 // TODO: this should be a config file or something
 #define NSNAPP_TO_NSND_IPC    "/tmp/nsnd_control_plane.socket"

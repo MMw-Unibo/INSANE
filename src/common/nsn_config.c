@@ -1,4 +1,4 @@
-#include "nsn_config.h"
+#include "common/nsn_config.h"
 
 nsn_cfg_t *
 nsn_load_config(mem_arena_t *arena, string_t path)

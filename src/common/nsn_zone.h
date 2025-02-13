@@ -1,9 +1,9 @@
 #ifndef NSN_ZONE_H
 #define NSN_ZONE_H
 
-#include "nsn_string.h"
+#include "base/nsn_string.h"
 
-// --- Named Memory Zone -------------------------------------------------------------
+// --- Named Memory Zone -------------------------------------------------------
 enum nsn_mm_zone_type
 {
     NSN_MM_ZONE_TYPE_IO_BUFFER_POOL,

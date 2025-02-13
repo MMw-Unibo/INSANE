@@ -18,11 +18,13 @@ fi
 if [ $BUILD_TYPE = "debug" ] || [ $BUILD_TYPE = "0" ]; then
     CFLAGS="$CFLAGS -g"
     DEFINES="$DEFINES -DDEBUG -DNSN_ENABLE_LOGGER"
+    POSTFIX="-dgb"
 elif [ $BUILD_TYPE = "release" ] || [ $BUILD_TYPE = "1" ]; then
     # Maybe remove the NSN_ENABLE_LOGGER define in release builds
     DEFINES="$DEFINES -DNSN_ENABLE_LOGGER"
     CFLAGS="$CFLAGS -O3 -march=native -mavx2"
     BUILD_TYPE_STR=release
+    POSTFIX=""
 else
     echo "Invalid build type: $BUILD_TYPE"
     exit 1
@@ -31,9 +33,17 @@ fi
 echo "Compiling in '${BUILD_TYPE_STR}' mode"
 cd build
 set -x
-$CC $CFLAGS ../src/nsnd.c 	  $LDFLAGS $DEFINES -o nsnd
-$CC $CFLAGS ../src/nsn_app_tx.c   $LDFLAGS $DEFINES -o nsn-app-tx
-$CC $CFLAGS ../src/nsn_app_rx.c   $LDFLAGS $DEFINES -o nsn-app-rx
-$CC $CFLAGS ../src/nsn_app_perf.c $LDFLAGS $DEFINES -o nsn-perf
+$CC $CFLAGS ../src/nsnd/nsnd.c  -I../src -I../include/  $LDFLAGS $DEFINES -o nsnd${POSTFIX}
+
+# Build the libnsn.a and libnsn.so libraries
+gcc -fPIC ../src/libnsn/libnsn.c -I../src -I../include/ -shared -o libnsn.so
+gcc -fPIC ../src/libnsn/libnsn.c -I../src -I../include/ -c -o libnsn.o
+ar rcs libnsn.a libnsn.o
+
+# Build the Applications
+$CC $CFLAGS ../apps/nsn_app_tx.c    -I../include $LDFLAGS -L. -l:libnsn.a $DEFINES -o nsn-app-tx
+# $CC $CFLAGS ../apps/nsn_app_rx.c    -I../include $LDFLAGS -lnsn $DEFINES -o nsn-app-rx
+$CC $CFLAGS ../apps/nsn_app_perf.c  -I../include $LDFLAGS -L. -l:libnsn.a $DEFINES -o nsn-perf
+
 set +x
 cd ..

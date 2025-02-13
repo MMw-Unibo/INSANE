@@ -1,13 +1,24 @@
-#include "nsn_types.h"
+#include "base/nsn_memory.h"
+#include "base/nsn_os.h"
+#include "base/nsn_shm.h"
+#include "base/nsn_thread_ctx.h"
+#include "base/nsn_types.h"
 
-#include "nsn.h"
-#include "nsn_ipc.h"
-#include "nsn_memory.h"
-#include "nsn_os.h"
-#include "nsn_shm.h"
-#include "nsn_zone.h"
+#include "common/nsn_config.h"
+#include "common/nsn_ipc.h"
+#include "common/nsn_ringbuf.h"
+#include "common/nsn_zone.h"
+#include "common/nsn_temp.h"
 
-#include "nsn_config.c"
+// #include <nsn/nsn.h>
+
+#include "base/nsn_memory.c"
+#include "base/nsn_os_inc.c"
+#include "base/nsn_shm.c"
+#include "base/nsn_string.c"
+
+#include "common/nsn_config.c"
+#include "common/nsn_ringbuf.c"
 
 // internals
 #define NSN_MAX_STREAMS 8

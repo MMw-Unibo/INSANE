@@ -19,14 +19,14 @@ else
     exit 1
 fi
 
-$CC $CFLAGS -c udpdpdk.c -o udpdpdk.o -mssse3
+$CC $CFLAGS -c udpdpdk.c -I../src -o udpdpdk.o -mssse3
 $CC $CFLAGS -shared -o libudpdpdk.so udpdpdk.o $DPDK 
 
 # $CC $CFLAGS -c rdma.c -o rdma.o
 # $CC $CFLAGS -shared -o librdma.so rdma.o -lrdmacm -libverbs
 
-$CC $CFLAGS -c udpsock.c -o udpsock.o
+$CC $CFLAGS -c udpsock.c -I../src -o udpsock.o
 $CC $CFLAGS -shared -o libudpsock.so udpsock.o
 
-$CC $CFLAGS -c tcpsock.c -o tcpsock.o
+$CC $CFLAGS -c tcpsock.c -I../src -o tcpsock.o
 $CC $CFLAGS -shared -o libtcpsock.so tcpsock.o

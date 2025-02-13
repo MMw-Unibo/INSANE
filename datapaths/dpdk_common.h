@@ -14,10 +14,13 @@
 #include <rte_malloc.h>
 
 #include "../src/nsn_datapath.h"
-#include "../src/nsn_config.c"
-#include "../src/nsn_string.c"
-#include "../src/nsn_memory.c"
-#include "../src/nsn_ringbuf.c"
+#include "../src/base/nsn_thread_ctx.h"
+#include "../src/base/nsn_string.c"
+#include "../src/base/nsn_memory.c"
+
+#include "../src/common/nsn_temp.h"
+#include "../src/common/nsn_config.c"
+#include "../src/common/nsn_ringbuf.c"
 
 // --------------------------------------------------------------------------------------------
 // Memory configuration

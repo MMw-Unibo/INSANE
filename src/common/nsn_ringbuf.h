@@ -1,8 +1,8 @@
 #ifndef NSN_RINGBUF_H
 #define NSN_RINGBUF_H
 
-#include "nsn_types.h"
-#include "nsn_string.h"
+#include "base/nsn_string.h"
+#include "base/nsn_types.h"
 
 struct nsn_ring_headtail
 {

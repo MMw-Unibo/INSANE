@@ -1,9 +1,12 @@
 #include "../src/nsn_datapath.h"
-#include "../src/nsn_string.c"
-#include "../src/nsn_memory.c"
-#include "../src/nsn_os_linux.c"
-#include "../src/nsn_ringbuf.c"
-#include "../src/nsn_config.c"
+
+#include "../src/base/nsn_string.c"
+#include "../src/base/nsn_memory.c"
+#include "../src/base/nsn_os_linux.c"
+
+#include "../src/common/nsn_temp.h"
+#include "../src/common/nsn_ringbuf.c"
+#include "../src/common/nsn_config.c"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>

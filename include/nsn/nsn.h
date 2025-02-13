@@ -5,14 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <limits.h>
-#include "nsn_ringbuf.h"
-#include "nsn_zone.h"
-#include "nsn_config.h"
-#include "nsn_thread_ctx.h"
 
-typedef struct nsn_hdr {
-    u32 channel_id;
-} nsn_hdr_t;
+typedef struct nsn_hdr nsn_hdr_t;
+struct nsn_hdr { uint32_t channel_id; };
 #define INSANE_HEADER_LEN sizeof(nsn_hdr_t)
 
 #define NSN_APP_DEFAULT_CONFIG_FILE     "nsn-app.cfg"
@@ -24,11 +19,13 @@ typedef struct nsn_hdr {
 //--------------------------------------------------------------------------------------------------
 // INSANE Buffer
 //--------------------------------------------------------------------------------------------------
-typedef struct nsn_buffer {
-    usize    index;
+typedef struct nsn_buffer nsn_buffer_t;
+struct nsn_buffer 
+{
+    size_t   index;
     uint8_t *data;
-    usize    len;
-} nsn_buffer_t;
+    size_t   len;
+};
 
 //--------------------------------------------------------------------------------------------------
 
@@ -38,12 +35,14 @@ static inline int nsn_buffer_is_valid(nsn_buffer_t *buf) { return buf->len != 0;
 // QoS options
 //--------------------------------------------------------------------------------------------------
 
-typedef struct nsn_options {
+typedef struct nsn_options nsn_options_t;
+struct nsn_options
+{
     int datapath;
     int consumption;
     int determinism;
     int reliability;
-} nsn_options_t;
+};
 
 #define NSN_QOS_DATAPATH_DEFAULT 0x0
 #define NSN_QOS_DATAPATH_FAST    0x1
@@ -75,34 +74,6 @@ typedef void *handle_data_cb;
 // Flags for the nsn_emit_data function
 #define NSN_BLOCKING     0x1
 #define NSN_NONBLOCKING  0x2
-
-//--------------------------------------------------------------------------------------------------
-// Definitions
-// TODO: These are duplicates of the nsnd.h/.c definitions. 
-// Consider passing these names from the daemon to the app via IPC instead,
-// and/or defining the structs in a common file
-#define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME         "tx_io_buffer_pool"
-#define NSN_CFG_DEFAULT_TX_META_NAME            "tx_io_meta_pool"
-#define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
-#define NSN_CFG_DEFAULT_RINGS_ZONE_NAME         "rings_zone"
-#define NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME    "free_slots"
-
-typedef struct nsn_ringbuf_pool nsn_ringbuf_pool_t;
-struct nsn_ringbuf_pool
-{
-    nsn_mm_zone_t *zone;
-    char           name[32];            // the name of the pool
-    usize          count;               // the number of ring buffers in the pool
-    usize          esize;               // the size of the elements in each ring buffer
-    usize          ecount;              // the number of elements in the ring buffer    
-    usize          free_slots_count;
-} nsn_cache_aligned;
-
-typedef struct nsn_meta nsn_meta_t;
-struct nsn_meta
-{
-    usize len;
-};
 
 //--------------------------------------------------------------------------------------------------
 // INSANE API

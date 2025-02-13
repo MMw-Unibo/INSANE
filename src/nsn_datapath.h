@@ -1,13 +1,14 @@
 #ifndef NSN_DATAPATH_H
 #define NSN_DATAPATH_H
 
-#include "nsn_types.h"
-#include "nsn.h"
-#include "nsn_log.h"
-#include "nsn_zone.h"
-#include "nsn_memory.h"
-#include "nsn_string.h"
-#include "nsn_ringbuf.h"
+#include "base/nsn_memory.h"
+#include "base/nsn_string.h"
+#include "base/nsn_types.h"
+
+#include "common/nsn_log.h"
+#include "common/nsn_ringbuf.h"
+#include "common/nsn_zone.h"
+
 
 // Argument for the plugin
 typedef struct nsn_datapath_ctx nsn_datapath_ctx_t;

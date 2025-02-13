@@ -1,25 +1,29 @@
 // --- gax: Includes -----------------------------------------------------------
-#include "nsn_memory.h"
-#include "nsn_config.h"
-#include "nsn_datapath.h"
-#include "nsn_ipc.h"
-#include "nsn_ringbuf.h"
-#include "nsn_shm.h"
-#include "nsn_string.h"
-#include "nsn_thread_ctx.h"
-#include "nsn_types.h"
-#include "nsn_zone.h"
+#include "base/nsn_memory.h"
+#include "base/nsn_shm.h"
+#include "base/nsn_string.h"
+#include "base/nsn_thread_ctx.h"
+#include "base/nsn_types.h"
 
+#include "nsn_datapath.h"
+
+#include "common/nsn_config.h"
+#include "common/nsn_ipc.h"
+#include "common/nsn_ringbuf.h"
+#include "common/nsn_zone.h"
 #define NSN_LOG_IMPLEMENTATION_H
-#include "nsn_log.h"
+#include "common/nsn_log.h"
+
+#include "common/nsn_temp.h"
 
 // --- gax: c files ------------------------------------------------------------
-#include "nsn_config.c"
-#include "nsn_memory.c"
-#include "nsn_os_inc.c"
-#include "nsn_ringbuf.c"
-#include "nsn_shm.c"
-#include "nsn_string.c"
+#include "base/nsn_memory.c"
+#include "base/nsn_os_inc.c"
+#include "base/nsn_shm.c"
+#include "base/nsn_string.c"
+
+#include "common/nsn_config.c"
+#include "common/nsn_ringbuf.c"
 
 // --- gax: deps ---------------------------------------------------------------
 

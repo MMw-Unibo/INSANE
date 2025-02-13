@@ -3,7 +3,9 @@
 #include "dpdk_common.h"
 #include "protocols.h"
 
-#include "../src/nsn_os_linux.c"
+#include "../src/common/nsn_temp.h"
+
+#include "../src/base/nsn_os_linux.c"
 
 // This DPDK plugin assumes we are working with NICs that use the mlx5 driver.
 // We need RSS filtering to enable the zero-copy receive, because we can associate
