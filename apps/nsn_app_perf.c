@@ -13,7 +13,7 @@
 // #include "nsn_string.c"
 // #include "nsn_ringbuf.c"
 
-// #define NSN_LOG_IMPLEMENTATION_H
+// #define NSN_LOG_IMPLEMENTATION
 // #include "nsn_log.h"
 
 #define _GNU_SOURCE
@@ -105,10 +105,10 @@ static inline uint64_t get_clock_realtime_ns() {
 
 //--------------------------------------------------------------------------------------------------
 // source
-void do_source(nsn_stream_t *stream, test_config_t *params) {
+void do_source(nsn_stream_t stream, test_config_t *params) {
     // char             *msg     = MSG;
     uint64_t          counter = 0;
-    nsn_buffer_t      buf;
+    nsn_buffer_t      *buf;
     struct test_data *data;
     int               ret;
 
@@ -124,13 +124,13 @@ void do_source(nsn_stream_t *stream, test_config_t *params) {
         tx_time = get_clock_realtime_ns();
         buf     = nsn_get_buffer(params->payload_size, 0);
 
-        if (nsn_buffer_is_valid(&buf)) {
-            data = (struct test_data *)buf.data;
+        if (nsn_buffer_is_valid(buf)) {
+            data = (struct test_data *)buf->data;
             data->tx_time = tx_time;
             data->cnt     = counter++;
             // strncpy(data->msg, msg, strlen(msg) + 1);
 
-            buf.len = params->payload_size;
+            buf->len = params->payload_size;
 
             ret = nsn_emit_data(source, buf);
             // Check the outcome
@@ -146,7 +146,7 @@ void do_source(nsn_stream_t *stream, test_config_t *params) {
 
 //--------------------------------------------------------------------------------------------------
 // sink
-void do_sink(nsn_stream_t *stream, test_config_t *params) {
+void do_sink(nsn_stream_t stream, test_config_t *params) {
 
     nsn_sink_t sink = nsn_create_sink(stream, params->app_source_id, NULL);
     uint64_t   first_time = 0, last_time = 0;
@@ -155,7 +155,7 @@ void do_sink(nsn_stream_t *stream, test_config_t *params) {
     uint64_t counter = 0;
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
-        nsn_buffer_t buf = nsn_consume_data(sink, NSN_BLOCKING);
+        nsn_buffer_t *buf = nsn_consume_data(sink, NSN_BLOCKING);
 
         if (counter == 0) {
             first_time = get_clock_realtime_ns();
@@ -190,7 +190,7 @@ void do_sink(nsn_stream_t *stream, test_config_t *params) {
 
 //--------------------------------------------------------------------------------------------------
 // ping
-void do_ping(nsn_stream_t *stream, test_config_t *params) {
+void do_ping(nsn_stream_t stream, test_config_t *params) {
     nsn_sink_t   sink   = nsn_create_sink(stream, params->app_source_id, NULL);
     nsn_source_t source = nsn_create_source(stream, params->app_source_id);
 
@@ -199,7 +199,7 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
 
     uint64_t          counter = 0;
     struct test_data *data;
-    nsn_buffer_t      buf_recv, buf_send;
+    nsn_buffer_t      *buf_recv, *buf_send;
     uint64_t          send_time, response_time, latency;
 
     if(params->payload_size < sizeof(struct test_data)) {
@@ -215,15 +215,15 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
 
         buf_send  = nsn_get_buffer(params->payload_size, NSN_BLOCKING);
         send_time = get_clock_realtime_ns();
-        if (!nsn_buffer_is_valid(&buf_send)) {
+        if (!nsn_buffer_is_valid(buf_send)) {
             fprintf(stderr, "Failed to get buffer\n");
             continue;
         }
         
-        data          = (struct test_data *)buf_send.data;
+        data          = (struct test_data *)buf_send->data;
         data->cnt     = counter++;
         data->tx_time = send_time;
-        buf_send.len  = params->payload_size;
+        buf_send->len  = params->payload_size;
         // strncpy(data->msg, msg, msg_len);
         nsn_emit_data(source, buf_send);
 
@@ -241,16 +241,16 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
 
 //--------------------------------------------------------------------------------------------------
 // pong
-void do_pong(nsn_stream_t *stream, test_config_t *params) {
+void do_pong(nsn_stream_t stream, test_config_t *params) {
     uint64_t counter = 0;
 
     nsn_sink_t   sink   = nsn_create_sink(stream, params->app_source_id, NULL);
     nsn_source_t source = nsn_create_source(stream, params->app_source_id);
 
-    nsn_buffer_t buf;
+    nsn_buffer_t *buf;
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
         buf = nsn_consume_data(sink, NSN_BLOCKING);
-        if (!nsn_buffer_is_valid(&buf)) {
+        if (!nsn_buffer_is_valid(buf)) {
             fprintf(stderr, "Failing to receive. Continuing...\n");
             continue;
         }
@@ -418,13 +418,13 @@ int main(int argc, char *argv[]) {
 
     /* Do test */
     if (params.role == role_sink) {
-        do_sink(&stream, &params);
+        do_sink(stream, &params);
     } else if (params.role == role_source) {
-        do_source(&stream, &params);
+        do_source(stream, &params);
     } else if (params.role == role_ping) {
-        do_ping(&stream, &params);
+        do_ping(stream, &params);
     } else if (params.role == role_pong) {
-        do_pong(&stream, &params);
+        do_pong(stream, &params);
     } else {
         fprintf(stderr, "Test not supported\n");
         return -1;

@@ -5,7 +5,9 @@
 
 #if NSN_OS_LINUX
 // # define __USE_MISC
-# define _GNU_SOURCE
+# ifndef _GNU_SOURCE
+#  define _GNU_SOURCE
+# endif
 # include <dlfcn.h>
 # include <fcntl.h>
 # include <pthread.h>

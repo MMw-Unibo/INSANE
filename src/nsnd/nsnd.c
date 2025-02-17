@@ -11,7 +11,7 @@
 #include "common/nsn_ipc.h"
 #include "common/nsn_ringbuf.h"
 #include "common/nsn_zone.h"
-#define NSN_LOG_IMPLEMENTATION_H
+#define NSN_LOG_IMPLEMENTATION
 #include "common/nsn_log.h"
 
 #include "common/nsn_temp.h"

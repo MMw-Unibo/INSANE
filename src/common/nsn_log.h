@@ -72,7 +72,7 @@ void logger_enable_timestamp(int enable);
 
 #endif // NSN_LOG_H
 
-#ifdef NSN_LOG_IMPLEMENTATION_H
+#ifdef NSN_LOG_IMPLEMENTATION
 
 struct logger        s_logger;
 struct logger_config s_config = {
@@ -229,4 +229,4 @@ logger_log(int level, const char *fmt, ...)
     va_end(args);
 }
 
-#endif // NSN_LOG_IMPLEMENTATION_H
+#endif // NSN_LOG_IMPLEMENTATION

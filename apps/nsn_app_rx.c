@@ -13,7 +13,7 @@
 #include "nsn_string.c"
 #include "nsn_ringbuf.c"
 
-#define NSN_LOG_IMPLEMENTATION_H
+#define NSN_LOG_IMPLEMENTATION
 #include "nsn_log.h"
 
 int 

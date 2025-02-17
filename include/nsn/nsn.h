@@ -10,8 +10,6 @@ typedef struct nsn_hdr nsn_hdr_t;
 struct nsn_hdr { uint32_t channel_id; };
 #define INSANE_HEADER_LEN sizeof(nsn_hdr_t)
 
-#define NSN_APP_DEFAULT_CONFIG_FILE     "nsn-app.cfg"
-
 // --- Error Codes ----------------------------------------------------------------
 #define NSN_ERROR_ALREADY_INITIALIZED   1
 #define NSN_ERROR_NOT_INITIALIZED       2
@@ -106,7 +104,7 @@ int nsn_destroy_stream(nsn_stream_t stream);
                         source on the specified stream
  * @returns  The handler to the created source
  */
-nsn_source_t nsn_create_source(nsn_stream_t *stream, uint32_t source_id);
+nsn_source_t nsn_create_source(nsn_stream_t stream, uint32_t source_id);
 
 /**
  * @brief    Close an INSANE source
@@ -122,7 +120,7 @@ int nsn_destroy_source(nsn_source_t source);
  *                  (e.g., NSN_NONBLOCKING, NSN_BLOCKING)
  * @returns  A buffer slot ready to be written by the application
  */
-nsn_buffer_t nsn_get_buffer(size_t size, int flags);
+nsn_buffer_t *nsn_get_buffer(size_t size, int flags);
 
 /**
  * @brief    Ask INSANE to send a buffer slot out to the network
@@ -130,7 +128,7 @@ nsn_buffer_t nsn_get_buffer(size_t size, int flags);
  * @param    buf    The buffer slot contaning the message to be sent
  * @returns  A token to asynchronously retrieve the outcome of the operation
  */
-int nsn_emit_data(nsn_source_t source, nsn_buffer_t buf);
+int nsn_emit_data(nsn_source_t source, nsn_buffer_t *buf);
 
 /**
  * @brief    Retrieve the outcome of a write operation
@@ -149,7 +147,7 @@ int nsn_check_emit_outcome(nsn_source_t source, int id);
                         every new message  for this sink
  * @returns  The handler to the created sink
  */
-nsn_sink_t nsn_create_sink(nsn_stream_t *stream, uint32_t sink_id, handle_data_cb cb);
+nsn_sink_t nsn_create_sink(nsn_stream_t stream, uint32_t sink_id, handle_data_cb cb);
 
 /**
  * @brief    Close an INSANE sink
@@ -174,7 +172,7 @@ int nsn_data_available(nsn_sink_t sink, int flags);
  * @returns  A buffer slot containing the outcome of the operation and, if
              successful, the read data
  */
-nsn_buffer_t nsn_consume_data(nsn_sink_t sink, int flags);
+nsn_buffer_t *nsn_consume_data(nsn_sink_t sink, int flags);
 
 /**
  * @brief    Release a buffer slot to INSANE
@@ -182,6 +180,6 @@ nsn_buffer_t nsn_consume_data(nsn_sink_t sink, int flags);
                     used by the application
  * @returns  The outcome of the operation (number of buffers released)
  */
-int nsn_release_data(nsn_buffer_t buf);
+int nsn_release_data(nsn_buffer_t *buf);
 
 #endif // NSN_H
