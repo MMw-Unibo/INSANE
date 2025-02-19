@@ -3,6 +3,7 @@ CC=gcc
 CFLAGS="-g -Wall -Wextra -Werror -std=c11 -fPIC -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations"
 
 DPDK=`pkg-config --cflags --libs libdpdk --static`
+TLDK="-I ../deps/tldk/include -L ../deps/tldk/lib -ltle_dring -ltle_l4p -ltle_memtank -ltle_timer"
 
 BUILD_TYPE=debug
 
@@ -21,6 +22,9 @@ fi
 
 $CC $CFLAGS -c udpdpdk.c -I../src -o udpdpdk.o -mssse3
 $CC $CFLAGS -shared -o libudpdpdk.so udpdpdk.o $DPDK 
+
+$CC $CFLAGS -c tcpdpdk.c -I../src -o tcpdpdk.o -mssse3 $TLDK 
+$CC $CFLAGS -shared -o libtcpdpdk.so tcpdpdk.o $DPDK $TLDK 
 
 # $CC $CFLAGS -c rdma.c -o rdma.o
 # $CC $CFLAGS -shared -o librdma.so rdma.o -lrdmacm -libverbs

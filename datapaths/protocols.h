@@ -133,7 +133,7 @@ void arp_update_cache(struct rte_mbuf* arp_mbuf, struct arp_peer *peers, int n_p
             // Print the MAC address - to acknowledge the ARP reply to the user
             char mac_str[32];
             rte_ether_format_addr(mac_str, 32, &peers[i].mac_addr);
-            fprintf(stderr, "[udpdpdk] ARP reply from %s is %s\n", peers[i].ip_str, mac_str);
+            fprintf(stderr, "[arp] ARP reply from %s is %s\n", peers[i].ip_str, mac_str);
 
             break;
         }
@@ -156,7 +156,7 @@ void arp_receive(uint16_t port_id, uint16_t tx_queue_id,
 
     switch (rte_be_to_cpu_16(ahdr->arp_opcode)) {
     case ARP_REQUEST:
-        fprintf(stderr, "[udpdpdk] Reply to ARP request\n");
+        fprintf(stderr, "[arp] Reply to ARP request\n");
         arp_reply(port_id, tx_queue_id, local_ip_net, arp_mbuf);
         break;
     default:
@@ -175,7 +175,7 @@ int32_t arp_request(uint16_t port_id, uint16_t tx_queue_id,
     // 0. Allocate an mbuf
     struct rte_mbuf *rte_mbuf = rte_pktmbuf_alloc(arp_pool);
     if (!rte_mbuf) {
-        fprintf(stderr, "[udpdpdk] failed to allocate mbuf for ARP request: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[arp] failed to allocate mbuf for ARP request: %s\n", rte_strerror(rte_errno));
         return -rte_errno;
     }
 
@@ -207,7 +207,7 @@ int32_t arp_request(uint16_t port_id, uint16_t tx_queue_id,
     rte_mbuf->pkt_len = rte_mbuf->data_len = RTE_ETHER_HDR_LEN + sizeof(arp_hdr_t);
     
 
-    fprintf(stderr, "[udpdpdk] sending ARP request\n");
+    fprintf(stderr, "[arp] sending ARP request\n");
     uint16_t ret = 0;
     while(!ret) {
         ret += rte_eth_tx_burst(port_id, tx_queue_id, &rte_mbuf, 1);

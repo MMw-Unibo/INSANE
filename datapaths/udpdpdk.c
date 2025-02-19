@@ -4,7 +4,6 @@
 #include "protocols.h"
 
 #include "../src/common/nsn_temp.h"
-
 #include "../src/base/nsn_os_linux.c"
 
 // This DPDK plugin assumes we are working with NICs that use the mlx5 driver.
