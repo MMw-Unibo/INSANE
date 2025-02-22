@@ -1693,7 +1693,6 @@ main(int argc, char *argv[])
     for (usize i = 0; i < app_pool.count; i++)    app_pool.free_apps_slots[i] = true;
 
     // TODO: Automatically detect which plugins are available and can be used by the daemon.
-    // Currently, we only consider 1 as available (make it the "udpsock" plugin).
     char* plugin_set_names[] = {"udpsock", "tcpsock", "udpdpdk"};
     plugin_set.count   = 3;
 
