@@ -1,4 +1,5 @@
-// --- gax: Includes -----------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+// @Includes 
 #include "base/nsn_memory.h"
 #include "base/nsn_shm.h"
 #include "base/nsn_string.h"
@@ -10,13 +11,18 @@
 #include "common/nsn_config.h"
 #include "common/nsn_ipc.h"
 #include "common/nsn_ringbuf.h"
+#include "common/nsn_temp.h"
 #include "common/nsn_zone.h"
+
+// Daemon specific includes
+#include "nsn_app_inner.h"
+#include "nsn_mm.h"
+
 #define NSN_LOG_IMPLEMENTATION
 #include "common/nsn_log.h"
 
-#include "common/nsn_temp.h"
-
-// --- gax: c files ------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+// @CFiles 
 #include "base/nsn_memory.c"
 #include "base/nsn_os_inc.c"
 #include "base/nsn_shm.c"
@@ -25,411 +31,30 @@
 #include "common/nsn_config.c"
 #include "common/nsn_ringbuf.c"
 
-// --- gax: deps ---------------------------------------------------------------
+// Daemon specific implementations
+#include "nsn_app_inner.c"
+#include "nsn_mm.c"
 
+////////////////////////////////////////////////////////////////////////////////
+// @Defines 
 #define NSN_DEFAULT_CONFIG_FILE     "nsnd.cfg"
 
-#define NSN_CFG_DEFAULT_SECTION                 "global"
-#define NSN_CFG_DEFAULT_SHM_NAME                "nsnd_datamem"
-#define NSN_CFG_DEFAULT_IO_BUFS_NUM             1024
-#define NSN_CFG_DEFAULT_IO_BUFS_SIZE            2048
-#define NSN_CFG_DEFAULT_SHM_SIZE                64      // in MB
-#define NSN_CFG_DEFAULT_MAX_TX_BURST            32
-#define NSN_CFG_DEFAULT_MAX_RX_BURST            32
-#define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME         "tx_io_buffer_pool"
-#define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
-#define NSN_CFG_DEFAULT_RINGS_ZONE_NAME         "rings_zone"
-#define NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME    "free_slots"
-#define NSN_CFG_DEFAULT_TX_RING_SIZE            4096
-#define NSN_CFG_DEFAULT_RX_RING_SIZE            4096
-#define NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN  2
-
-static i64 cpu_hz = -1;
-
-static volatile bool g_running = true;
-
-void 
-signal_handler(int signum)
-{
-    if (signum == SIGINT || signum == SIGTERM) {
-        g_running = false;
-    }
-}
-
-struct datapath_ops
-{
-    nsn_datapath_init         *init;
-    nsn_datapath_conn_manager *conn_manager;
-    nsn_datapath_update       *update;
-    nsn_datapath_tx           *tx;
-    nsn_datapath_rx           *rx;
-    nsn_datapath_deinit       *deinit;
-};
-
-// --- Memory Manager --------------------------------------------------
-
-typedef struct nsn_mem_manager_cfg nsn_mem_manager_cfg_t;
-struct nsn_mem_manager_cfg
-{
-    string_t     shm_name;
-    usize        shm_size;
-    usize        io_buffer_pool_size;
-    usize        io_buffer_size;
-};
+#define NSN_CFG_DEFAULT_SECTION                     "global"
+#define NSN_CFG_DEFAULT_SHM_NAME                    "nsnd_datamem"
+#define NSN_CFG_DEFAULT_IO_BUFS_NUM                 1024
+#define NSN_CFG_DEFAULT_IO_BUFS_SIZE                2048
+#define NSN_CFG_DEFAULT_SHM_SIZE                    64      // in MB
+#define NSN_CFG_DEFAULT_MAX_TX_BURST                32
+#define NSN_CFG_DEFAULT_MAX_RX_BURST                32
+#define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME             "tx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME             "rx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_RINGS_ZONE_NAME             "rings_zone"
+#define NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME        "free_slots"
+#define NSN_CFG_DEFAULT_TX_RING_SIZE                4096
+#define NSN_CFG_DEFAULT_RX_RING_SIZE                4096
+#define NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN      2
 
 
-// --- Memory Manager ---------------------------------------------------------
-//  The memory manager is responsible for creating and managing the shared memory.
-//  It uses a Page Allocator to allocate memory from the shared memory.
-//  In particular, the managed memory is used to store:
-//   - The io buffer pools: used to store the packets received and transmitted 
-//     from and to the data plane and the applications
-//   - The ring buffers: use to exchange the pointers to the io buffers between 
-//     the data plane and the applications
-typedef struct nsn_mem_manager nsn_mem_manager_t;
-struct nsn_mem_manager
-{
-    nsn_shm_t           *shm;
-    fixed_mem_arena_t   *shm_arena;
-    // The list of zones is the first block of the shared memory
-    nsn_mm_zone_list_t  *zones;
-};
-
-nsn_mm_zone_t *nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size, usize type);
-
-nsn_ringbuf_pool_t *
-nsn_memory_manager_create_ringbuf_pool(nsn_mem_manager_t *mem, string_t name, usize count, usize esize, usize ecount)
-{
-    usize zone_size = sizeof(nsn_ringbuf_pool_t)           // the size of the pool header
-                    + (count * sizeof(bool))               // keeps track of the free slots
-                    + sizeof(nsn_ringbuf_t) * count        // the number of ring buffers
-                    + (esize * ecount) * count;            // the size of the elements in the ring buffers
-
-    nsn_mm_zone_t *zone = nsn_memory_manager_create_zone(mem, name, zone_size, NSN_MM_ZONE_TYPE_RINGS);
-    if (!zone) {
-        log_error("Failed to create zone for ring buffer pool\n");
-        return NULL;
-    }
-
-    nsn_ringbuf_pool_t *pool = (nsn_ringbuf_pool_t *)nsn_mm_zone_get_ptr(mem->shm_arena->base, zone);
-    pool->zone              = zone;
-    pool->count             = count;
-    pool->esize             = esize;
-    pool->ecount            = ecount;
-    pool->free_slots_count  = count;
-    strncpy(pool->name, to_cstr(name), sizeof(pool->name) - 1);
-
-    return pool;
-}
-
-nsn_ringbuf_pool_t* nsn_memory_manager_get_ringbuf_pool(nsn_mem_manager_t* mem) {
-    nsn_mm_zone_t* zone = nsn_find_zone_by_name(mem->zones, str_lit("rings_zone"));
-    if (!zone) {
-        log_error("Zone \"rings_zone\" not found\n");
-        return NULL;
-    }
-
-    return (nsn_ringbuf_pool_t*)nsn_mm_zone_get_ptr(mem->shm_arena->base, zone);
-}
-
-// @param pool: the pool of ring buffers
-// @param ring_name: the name of the ring buffer
-// @return: a pointer to the ring buffer
-// The size of each ring is fixed and set at pool creation
-nsn_ringbuf_t * 
-nsn_memory_manager_create_ringbuf(nsn_ringbuf_pool_t* pool, string_t ring_name) {
-
-    if(pool->free_slots_count == 0) {
-        log_error("No more free slots in the ring buffer pool\n");
-        return NULL;
-    }
-
-    // check which slots are free
-    bool* ring_tracker = (bool*)(pool + 1);
-
-    // find a free slot
-    int slot = -1;
-    for (usize i = 0; i < pool->count; ++i) {
-        if (ring_tracker[i] == false) {
-            ring_tracker[i] = true;
-            slot = i;
-            break;
-        }
-    }
-
-    // create the ring buffer in the shared memory
-    char* ring_data = (char*)(ring_tracker + pool->count);  
-    usize ring_size = sizeof(nsn_ringbuf_t) + (pool->ecount * pool->esize);
-    nsn_ringbuf_t* ring = nsn_ringbuf_create(&ring_data[slot*ring_size], ring_name, pool->ecount);
-
-    // fill in the descriptorsfor this ring in the pool    
-    pool->free_slots_count--;
-
-    log_debug("Ring buffer %.*s created at %p\n", str_varg(ring_name), ring);
-    return ring;
-}
-
-// @param mem: the memory manager
-// @param ring_name: the name of the ring buffer to retrieve
-// @return: a pointer to the ring buffer, NULL if the ring buffer was not found
-nsn_ringbuf_t *
-nsn_memory_manager_lookup_ringbuf(nsn_mem_manager_t* mem, string_t ring_name) {
-    nsn_ringbuf_pool_t* pool = nsn_memory_manager_get_ringbuf_pool(mem);
-    if (!pool) {
-        log_error("Failed to get the ring buffer pool\n");
-        return NULL;
-    }
-    
-    // check which slots are free
-    bool* ring_tracker = (bool*)(pool + 1);
-    char* ring_data = (char*)(ring_tracker + pool->count);  
-    usize ring_size = sizeof(nsn_ringbuf_t) + (pool->ecount * pool->esize);
-
-    // find the ring buffer to destroy
-    nsn_ringbuf_t* ring = 0;
-    for (usize i = 0; i < pool->count; i++) {
-        if (ring_tracker[i] == true) {
-            ring = (nsn_ringbuf_t*)(&ring_data[i*ring_size]);
-            if (strcmp(ring->name, to_cstr(ring_name)) == 0) {
-                break;
-            } else {
-                ring = NULL;
-            }
-        }
-    }
-
-    if (!ring) {
-        log_error("Lookup: Ring buffer %.*s not found\n", str_varg(ring_name));
-        return NULL;
-    }
-
-    return ring;
-}
-
-// @param pool: the pool of ring buffers
-// @param ring_name: the name of the ring buffer to destroy
-// @return: 0 if the ring buffer was destroyed, <0 otherwise (errno value)
-int 
-nsn_memory_manager_destroy_ringbuf(nsn_ringbuf_pool_t* pool, string_t ring_name) {
-    if (!pool) {
-        log_error("Invalid ring buffer pool\n");
-        return -1;
-    }
-
-    // check which slots are free
-    bool* ring_tracker = (bool*)(pool + 1);
-    char* ring_data = (char*)(ring_tracker + pool->count);  
-    usize ring_size = sizeof(nsn_ringbuf_t) + (pool->ecount * pool->esize);
-
-    // find the ring buffer to destroy
-    nsn_ringbuf_t* ring = 0;
-    for (usize i = 0; i < pool->count; i++) {
-        if (ring_tracker[i] == true) {
-            ring = (nsn_ringbuf_t*)(&ring_data[i*ring_size]);
-            if (strcmp(ring->name, to_cstr(ring_name)) == 0) {
-                break;
-            } else {
-                ring = NULL;
-            }
-        }
-    }
-
-    if (!ring) {
-        log_error("Lookup: Ring buffer %.*s not found\n", str_varg(ring_name));
-        return -1;
-    }
-
-    // destroy the ring buffer
-    int error = nsn_ringbuf_destroy(ring);
-    if (!error) {
-        pool->free_slots_count++;
-    }
-
-    return -error;
-}
-
-nsn_mem_manager_t *
-nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
-{
-    // TODO(garbu): create a shared memory for the data plane using the config 
-    //              to determine the size of the shared memory. 
-    //              In the shared memory, we have both the memory buffer and the
-    //              ring buffers used for the receive and transmit queues.
-    nsn_shm_t *shm = nsn_shm_alloc(arena, to_cstr(cfg->shm_name), cfg->shm_size);
-    if (!shm) {
-        log_error("Failed to create shared memory\n");
-        return NULL;
-    }
-
-    // Create the memory manager
-    nsn_mem_manager_t *mem = mem_arena_push_struct(arena, nsn_mem_manager_t);
-    mem->shm       = shm;
-    mem->shm_arena = fixed_mem_arena_alloc(nsn_shm_rawdata(shm), nsn_shm_size(shm));
-    mem->zones     = fixed_mem_arena_push_struct(mem->shm_arena, nsn_mm_zone_list_t);
-    
-    // The data in the shared memory will be allocated using a list of zones
-    // each zone will have a header with the size of the zone, the name of the zone, the type of the zone, 
-    // the pointer to the next zone, the pointer to the previous zone, and the pointer to the first block of the zone.
-
-    usize total_zone_size = cfg->io_buffer_pool_size * cfg->io_buffer_size;
-    nsn_mm_zone_t *tx_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
-    if (!tx_zone) {
-        log_error("failed to create the tx_zone\n");
-        return NULL;
-    }
-    // nsn_mm_zone_t *rx_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
-    // if (!rx_zone) {
-    //     log_error("failed to create the rx_zone\n");
-    //     return NULL;
-    // }
-
-    // The metadata associated with the actual data slots (e.g., pkt len) is kept in a separate zone
-    total_zone_size = cfg->io_buffer_pool_size * sizeof(nsn_meta_t);
-    nsn_mm_zone_t *tx_meta_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_META_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
-    if (!tx_meta_zone) {
-        log_error("failed to create the tx_meta_zone\n");
-        return NULL;
-    }
-
-    // Create a pool of ring buffers inside the ring zone. In the current design, all the rings have the same size.
-    // TODO: The free_slots can be split into a tx/rx couple of rings, if we decide to keep both the tx and rx memory areas separated. Now we keep 1 zone for slots (tx_zone) and 1 ring for its indexing (NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME).
-    usize max_rings = 8;
-    usize total_free_slots = /*2 * */cfg->io_buffer_pool_size;
-    nsn_ringbuf_pool_t *ring_pool = nsn_memory_manager_create_ringbuf_pool(mem, str_lit(NSN_CFG_DEFAULT_RINGS_ZONE_NAME), max_rings, sizeof(usize), total_free_slots);
-
-    // Create the ring that keeps the free slot descriptors.
-    nsn_ringbuf_t *free_slots_ring = nsn_memory_manager_create_ringbuf(ring_pool, str_lit(NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME));
-    if (!free_slots_ring) {
-        log_error("Failed to create the free_slots ring\n");
-        // TODO: Should we clean the things we created so far? E.g., zones etc?
-        return NULL;
-    }
-    log_trace("Successfully created the free_slots ring at %p with name %s\n", free_slots_ring, free_slots_ring->name);
-    
-    // Fill the ring buffer with the index of the tx slots 
-    for (usize i = 0; i < total_free_slots - 1; ++i) {
-        nsn_ringbuf_enqueue_burst(free_slots_ring, &i, sizeof(i), 1, NULL);
-    } 
-
-    return mem;
-}
-
-void
-nsn_memory_manager_destroy(nsn_mem_manager_t *mem)
-{
-    at_fadd(&mem->shm->ref_count, -1, mo_rlx);
-    nsn_shm_release(mem->shm);
-}
-
-// The zone is created in the shared memory and the pointer to the zone is returned.
-// The shared memory works as a linear memory, so the zone is created at the end of the memory, after the last zone.
-// Zone are rounded to the next multiple of the page size.
-nsn_mm_zone_t *
-nsn_memory_manager_create_zone(nsn_mem_manager_t *mem, string_t name, usize size, usize type)
-{
-    if (nsn_zone_exists(mem->zones, name)) {
-        log_warn("zone with name " str_fmt " already exists\n", str_varg(name));
-        return NULL; 
-    }
-
-    // round the size to the next multiple of the page size
-    usize page_size = (type == NSN_MM_ZONE_TYPE_IO_BUFFER_POOL? (1ULL << 21) : nsn_os_default_page_size());
-    usize zone_size = align_to(size + sizeof(nsn_mm_zone_t), page_size);
-
-    // create the zone in the shared memory
-    usize base_offset   = mem->shm_arena->pos;
-    nsn_mm_zone_t *zone = fixed_mem_arena_push(mem->shm_arena, zone_size);
-    if (!zone) {
-        return NULL;
-    }
-
-    // initialize the zone
-
-    zone->base_offset        = base_offset;
-    zone->total_size         = zone_size;
-    zone->size               = zone->total_size - sizeof(nsn_mm_zone_t);
-    zone->type               = type;
-    zone->first_block_offset = base_offset + sizeof(nsn_mm_zone_t);
-    strncpy(zone->name, to_cstr(name), sizeof(zone->name) - 1);
-
-    // add the zone to the list of zones
-    nsn_zone_list_add_tail(mem->zones, zone);
-
-    return zone;
-}
-
-typedef struct nsn_app nsn_app_t;
-struct nsn_app
-{
-    int app_id;
-    mem_arena_t *arena;
-    nsn_mem_manager_t* mem;
-};
-
-typedef struct nsn_app_pool nsn_app_pool_t;
-struct nsn_app_pool
-{
-    mem_arena_t *arena;
-    nsn_app_t   *apps;
-    bool        *free_apps_slots;
-    usize        count; // MAX apps handled by the daemon
-    usize        used;
-};
-
-bool 
-app_pool_init_slot(nsn_app_pool_t *pool, int app_slot, nsn_mem_manager_cfg_t* mem_cfg)
-{
-    if (app_slot < 0) {
-        return false;
-    }
-    // TODO: maybe restrict the access permissions to those two processes with mprotect?)
-    nsn_app_t *app = &pool->apps[app_slot];
-    app->arena = mem_arena_alloc(megabytes(500));
-    if (!app->arena) {
-        log_error("Failed to create memory arena for app %d\n", app->app_id);
-        return false;
-    }
-
-    log_debug("Created memory arena for app %d at %p\n base %u (%p)\n pos %u\n com_pos %u\n", app->app_id, app->arena, 
-        app->arena->base, (char*)app->arena->base,
-        app->arena->pos,
-        app->arena->com_pos);
-
-    char shm_name_app[NSN_SHM_NAME_MAX];
-    snprintf(shm_name_app, NSN_SHM_NAME_MAX, "%s_%d", mem_cfg->shm_name.data, app->app_id);
-    mem_cfg->shm_name = str_lit(shm_name_app);
-
-    app->mem = nsn_memory_manager_create(app->arena, mem_cfg);
-    if (!app->mem) {
-        log_error("Failed to create shared memory for app \n");
-        return false;
-    }
-    return true;
-}
-
-int 
-app_pool_try_alloc_slot(nsn_app_pool_t *pool, int app_id)
-{
-    for (usize i = 0; i < pool->count; i++) {
-        if (pool->free_apps_slots[i]) {
-            pool->free_apps_slots[i]  = false;
-            pool->apps[i].app_id      = app_id;
-            pool->used               += 1;
-            return (int)i;
-        }
-    }
-    return -1;
-}
-
-bool 
-app_pool_try_alloc_and_init_slot(nsn_app_pool_t *pool, int app_id, nsn_mem_manager_cfg_t mem_cfg)
-{
-    int slot = app_pool_try_alloc_slot(pool, app_id);
-    if (slot < 0) {
-        return false;
-    }
-    return app_pool_init_slot(pool, slot, &mem_cfg);
-}
 
 // --- Plugin, Streams, Endpoints, Sinks -------------------------------------------------
 
@@ -496,7 +121,19 @@ struct nsn_plugin_set
     usize         count;
 };
 
-// --- Thread Pool ------------------------------------------------------------
+
+struct datapath_ops
+{
+    nsn_datapath_init         *init;
+    nsn_datapath_conn_manager *conn_manager;
+    nsn_datapath_update       *update;
+    nsn_datapath_tx           *tx;
+    nsn_datapath_rx           *rx;
+    nsn_datapath_deinit       *deinit;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// Thread Pool
 
 enum nsn_dataplane_thread_state
 {
@@ -532,24 +169,39 @@ struct nsn_thread_pool
     usize            count;
 };
 
-////////
-// --- INSANE daemon state ----------------------------------------------------
 
-int instance_id          = 0;
-mem_arena_t *state_arena = NULL;
-nsn_app_pool_t app_pool  = {0};
-nsn_plugin_set_t plugin_set = {0};
+////////////////////////////////////////////////////////////////////////////////
+// @Globals
+static i64 cpu_hz = -1;
+
+int instance_id               = 0;
+mem_arena_t *state_arena      = NULL;
+nsn_app_pool_t app_pool       = {0};
+nsn_plugin_set_t plugin_set   = {0};
 nsn_thread_pool_t thread_pool = {0};
 
 string_list_t arg_list = {0};
 nsn_cfg_t *config      = NULL;
-////////
+
+static volatile bool g_running = true;
+
+void 
+signal_handler(int signum)
+{
+    if (signum == SIGINT || signum == SIGTERM) {
+        g_running = false;
+    }
+}
 
 // --- Datapath helpers -----------------------------------------------------
 
 // From the config, retrieve the IP addresses of the peers for the plugin "datapath_name", 
 // returning their number and the list of IPs in the "peer_list" buffer.
-static u16 get_peers_ip_list(nsn_cfg_t *config, char *datapath_ip_key, char **peer_list, u16 max_peers, temp_mem_arena_t* arena) {
+static u16 
+get_peers_ip_list(
+    nsn_cfg_t *config, char *datapath_ip_key, char **peer_list, 
+    u16 max_peers, temp_mem_arena_t* arena
+) {
     list_head(options);
     int n = nsn_config_get_string_list_from_subsections(arena->arena, config, str_lit("peers"), str_cstr(datapath_ip_key), &options);
     if (n < 0) {
@@ -575,21 +227,25 @@ static u16 get_peers_ip_list(nsn_cfg_t *config, char *datapath_ip_key, char **pe
 }
 
 // When calling this function, we must hold the lock on the streams list
-static void prepare_ep_list(list_head_t* ep_list, nsn_plugin_t *plugin, temp_mem_arena_t* data_arena) {
-    nsn_inner_stream_t *stream;
-    ep_initializer_t *ep_el;
+static void 
+prepare_ep_list(list_head_t* ep_list, nsn_plugin_t *plugin, temp_mem_arena_t* data_arena) 
+{
+    nsn_inner_stream_t *stream = NULL;
+    ep_initializer_t *ep_el    = NULL;
     list_for_each_entry(stream, &plugin->streams, node) {
-        ep_el = mem_arena_push(data_arena->arena, sizeof(ep_initializer_t));
+        ep_el     = mem_arena_push(data_arena->arena, sizeof(ep_initializer_t));
         ep_el->ep = &stream->ep;
         list_add_tail(ep_list, &ep_el->node);
     }
 }
 
 // When calling this function, we must hold the lock on the streams list
-static void clean_ep_list(list_head_t *ep_list, temp_mem_arena_t* data_arena) {
-    ep_initializer_t *ep_el;
+static void 
+clean_ep_list(list_head_t *ep_list, temp_mem_arena_t* data_arena) 
+{
+    ep_initializer_t *ep_el = NULL;
     while(!list_empty(ep_list)) {
-        ep_el = list_last_entry(ep_list, ep_initializer_t, node);
+        ep_el                  = list_last_entry(ep_list, ep_initializer_t, node);
         ep_el->node.prev->next = ep_el->node.next;
         list_del(&ep_el->node);
         mem_arena_pop(data_arena->arena, sizeof(ep_initializer_t));
@@ -606,14 +262,13 @@ dataplane_thread_proc(void *arg)
     this_thread.is_main_thread   = false;
     nsn_thread_set_ctx(&this_thread);
 
-#ifdef NSN_ENABLE_LOGGER
     int self = nsn_os_current_thread_id();
-#endif
-    u32 state;
+    nsn_unused(self);
 
     size_t ip_str_size = 16;
     char string_buf[ip_str_size*4];
-
+    
+    u32 state = NSN_DATAPLANE_THREAD_STATE_WAIT;
 wait: 
     log_debug("[thread %d] waiting for a message\n", self);
     while ((state = at_load(&args->state, mo_rlx)) == NSN_DATAPLANE_THREAD_STATE_WAIT) {
@@ -629,9 +284,11 @@ wait:
     temp_mem_arena_t data_arena = nsn_thread_scratch_begin(NULL, 0);
 
     // Load the datapath plugin
+    log_debug("[thread %d] dataplane thread started for datapath: " str_fmt "\n", 
+              self, str_varg(args->datapath_name));                 
+
     string_t datapath_name = args->datapath_name;
-    nsn_plugin_t *plugin = args->plugin_data;
-    log_debug("[thread %d] dataplane thread started for datapath: " str_fmt "\n", self, str_varg(datapath_name));                 
+    nsn_plugin_t *plugin   = args->plugin_data;
     char datapath_lib[256];
     snprintf(datapath_lib, sizeof(datapath_lib), "./datapaths/lib%s.so", to_cstr(datapath_name));
     struct nsn_os_module module = nsn_os_load_library(datapath_lib, NsnOsLibraryFlag_Now);
@@ -1139,8 +796,8 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     return 0;
 }
 
-// --- IPC thread -------------------------------------------------------------
-
+////////////////////////////////////////////////////////////////////////////////
+// IPC thread
 int 
 main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
 {
@@ -1160,7 +817,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
         }
         else {
             // TODO: handle error
-            printf("error: %s\n", strerror(errno));
+            log_debug("error: %s\n", strerror(errno));
             res = -1;
             goto clean_and_next;
         }
@@ -1187,9 +844,9 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
                 cmsghdr->type             = NSN_CMSG_TYPE_CONNECTED;
                 nsn_cmsg_connect_t *reply = (nsn_cmsg_connect_t *)(cmsghdr + 1);
                 reply->shm_size           = mem_cfg.shm_size;
+                reply->io_buf_size        = mem_cfg.io_buffer_size;
                 strcpy(reply->free_slots_ring, NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME);
                 snprintf(reply->shm_name, NSN_SHM_NAME_MAX, "nsnd_datamem_%d", app_id);
-                reply->io_buf_size        = mem_cfg.io_buffer_size;
                 
                 reply_len = sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_connect_t);
             } else {
@@ -1546,25 +1203,32 @@ clean_and_next:
 // -- Connection manager thread ------------------------------------------------
 
 int
-main_thread_connection_manager() {
-    
+main_thread_connection_manager() 
+{   
     temp_mem_arena_t data_arena = nsn_thread_scratch_begin(NULL, 0);
 
-    for (usize i = 0; i < plugin_set.count; i++) {
+    for (usize i = 0; i < plugin_set.count; i++) 
+    {
         nsn_plugin_t *plugin = &plugin_set.plugins[i];
-        if(plugin->conn_manager) {
+        if(plugin->conn_manager) 
+        {
             list_head(ep_list); 
             nsn_os_mutex_lock(&plugin->streams_lock);
-            // we might have waited on the lock, so we need to check again
-            if(!plugin->conn_manager) {
-                nsn_os_mutex_unlock(&plugin->streams_lock);
-                continue;
+            {
+                // we might have waited on the lock, so we need to check again
+                if(!plugin->conn_manager) {
+                    nsn_os_mutex_unlock(&plugin->streams_lock);
+                    continue;
+                }
+                
+                prepare_ep_list(&ep_list, plugin, &data_arena);
             }
-            prepare_ep_list(&ep_list, plugin, &data_arena);
             nsn_os_mutex_unlock(&plugin->streams_lock);
+
             if(!list_empty(&ep_list)) {
                 plugin->conn_manager(&ep_list);
             }
+
             clean_ep_list(&ep_list, &data_arena);
         }
     }
@@ -1617,7 +1281,8 @@ os_init(void)
     cpu_hz = (i64)(cpu_mhz * 1000000);
 }
 
-// --- Main -------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+// @EntryPoint
 int 
 main(int argc, char *argv[])
 {
@@ -1628,8 +1293,8 @@ main(int argc, char *argv[])
     main_thread.is_main_thread   = true;
     nsn_thread_set_ctx(&main_thread);
 
-    instance_id   = nsn_os_get_process_id();
-    state_arena   = mem_arena_alloc(megabytes(1));
+    instance_id = nsn_os_get_process_id();
+    state_arena = mem_arena_alloc(megabytes(1));
     for (int i = 0; i < argc; i++)
         str_list_push(state_arena, &arg_list, str_cstr(argv[i]));
 
@@ -1644,33 +1309,20 @@ main(int argc, char *argv[])
 
     config = nsn_load_config(state_arena, config_filename);
     if (!config) {
-        fprintf(stderr, "Failed to load config file: " str_fmt "\n", str_varg(config_filename));
+        log_error("Failed to load config file: " str_fmt "\n", str_varg(config_filename));
         exit(1);
     }
  
  #ifdef NSN_ENABLE_LOGGER
     // Set the log level according to the config file
     logger_init(NULL);
-    char* log_levels[] = {"error", "warn", "info", "debug", "trace"};
-    char  config_log_level[32];
-    bzero(config_log_level, 32);
-    string_t cfg_ll = str_cstr(config_log_level);
+    char config_log_level[32] = {0};
+    string_t cfg_ll           = str_cstr(config_log_level);
     nsn_config_get_string(config, str_lit("global"), str_lit("log_level"), &cfg_ll);
-    for (usize i = 0; i < array_count(log_levels); i++) {
-        if (!strcmp(log_levels[i], to_cstr(cfg_ll))) {
-            logger_set_level(i);
-            break;    
-        }
-    }
+    logger_set_level_by_name(to_cstr(cfg_ll));
 #endif
 
     os_init();
-    printf("### INSANE stats:\n"
-           "  - CPU frequency: %ld\n"
-           "  - sizeof(nsn_zone): %ld\n"
-           "  - sizeof(nsn_ringbuf): %ld\n"
-           "  - sizeof(nsn_ringbuf_pool): %ld\n",
-           cpu_hz, sizeof(nsn_mm_zone_t), sizeof(nsn_ringbuf_t), sizeof(nsn_ringbuf_pool_t));
 
     int app_num      = 64;
     int io_bufs_num  = NSN_CFG_DEFAULT_IO_BUFS_NUM;
@@ -1697,35 +1349,28 @@ main(int argc, char *argv[])
 
     // TODO: Automatically detect which plugins are available and can be used by the daemon.
     char* plugin_set_names[] = {"udpsock", "tcpsock", "udpdpdk", "tcpdpdk"};
-    plugin_set.count   = 4;
+    plugin_set.count         = array_count(plugin_set_names);
+    plugin_set.plugins       = mem_arena_push_array(arena, nsn_plugin_t, plugin_set.count);
 
-    plugin_set.plugins = mem_arena_push_array(arena, nsn_plugin_t, plugin_set.count);
     for (usize i = 0; i < plugin_set.count; i++) {
-        nsn_plugin_t *plugin = &plugin_set.plugins[i];
-        plugin->name = str_lit(plugin_set_names[i]);
-        plugin->thread_count = 0;
-        plugin->threads = mem_arena_push_array(arena, nsn_os_thread_t,
-                                        NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN);
+        nsn_plugin_t *plugin    = &plugin_set.plugins[i];
+        plugin->name            = str_lit(plugin_set_names[i]);
+        plugin->thread_count    = 0;
+        plugin->threads         = mem_arena_push_array(arena, nsn_os_thread_t, NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN);
         plugin->active_channels = 0;
-        plugin->streams = list_head_init(plugin->streams);
+        plugin->streams         = list_head_init(plugin->streams);
+        plugin->stream_id_cnt   = 0;
         nsn_os_mutex_init(&plugin->streams_lock);
-        plugin->stream_id_cnt = 0;
     }
 
     // init SIG_INT handler
-    struct sigaction sa;
-    memory_zero_struct(&sa);
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-
-    // create the shared memory
-    nsn_mem_manager_cfg_t mem_cfg = {
-        .shm_name            = str_lit(NSN_CFG_DEFAULT_SHM_NAME),
-        .shm_size            = megabytes(shm_size),
-        .io_buffer_pool_size = (usize)io_bufs_num,
-        .io_buffer_size      = (usize)io_bufs_size,
-    };
+    {
+        struct sigaction sa;
+        memory_zero_struct(&sa);
+        sa.sa_handler = signal_handler;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+    }
 
     // create the control socket
     int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -1754,52 +1399,61 @@ main(int argc, char *argv[])
     // the name is set when the thread moves to the RUNNING state, as it will try to load the dll.
     // The association is done when a new stream for a new plugin is set, and currently is permanent.
     // Future work will include a way to dynamically attach/detach threads to/from plugins.
-    thread_pool.count = plugin_set.count;
-    thread_pool.threads = mem_arena_push_array(arena, nsn_os_thread_t, thread_pool.count);
+    thread_pool.count       = plugin_set.count;
+    thread_pool.threads     = mem_arena_push_array(arena, nsn_os_thread_t, thread_pool.count);
     thread_pool.thread_args = mem_arena_push_array(arena, struct nsn_dataplane_thread_args, 
                                                         thread_pool.count);
     for (usize i = 0; i < thread_pool.count; i++) {
         log_trace("creating thread %d\n", i);
-        thread_pool.thread_args[i] = 
-            (struct nsn_dataplane_thread_args){ .state = NSN_DATAPLANE_THREAD_STATE_WAIT,
-                                                .dp_ready = false,
-                                                .max_tx_burst = max_tx_burst,
-                                                .max_rx_burst = max_rx_burst };
+        thread_pool.thread_args[i] = (struct nsn_dataplane_thread_args){ 
+            .state = NSN_DATAPLANE_THREAD_STATE_WAIT,
+            .dp_ready = false,
+            .max_tx_burst = max_tx_burst,
+            .max_rx_burst = max_rx_burst 
+        };
+
         nsn_os_mutex_init(&thread_pool.thread_args[i].lock);
         nsn_os_cnd_init(&thread_pool.thread_args[i].cv);
         thread_pool.threads[i] = nsn_os_thread_create(dataplane_thread_proc, &thread_pool.thread_args[i]);
+
         if (thread_pool.threads[i].handle == 0) {
             log_error("Failed to create thread %d\n", i);
             goto clear_and_quit;
         }
     }
 
-    // Control path
-    while (g_running) 
+    // Create the shared memory and start the Control Path loop
     {
-        if (main_thread_control_ipc(sockfd, mem_cfg) < 0) {
-            log_warn("Failed to handle control ipc\n");
-        }
-
-        if (main_thread_connection_manager() < 0) {
-            log_warn("Failed to handle connection manager\n");
+        nsn_mem_manager_cfg_t mem_cfg = {
+            .shm_name            = str_lit(NSN_CFG_DEFAULT_SHM_NAME),
+            .shm_size            = megabytes(shm_size),
+            .io_buffer_pool_size = (usize)io_bufs_num,
+            .io_buffer_size      = (usize)io_bufs_size,
+        };
+        
+        // Control path
+        while (g_running) {
+            if (main_thread_control_ipc(sockfd, mem_cfg) < 0)   log_warn("Failed to handle control ipc\n");
+            if (main_thread_connection_manager() < 0)           log_warn("Failed to handle connection manager\n");
         }
     }
-
+        
     // Stop the threads in the thread pool
-    for (usize i = 0; i < thread_pool.count; i++) {
-        at_store(&thread_pool.thread_args[i].state, NSN_DATAPLANE_THREAD_STATE_STOP, mo_rlx);
-    }
-
-    for (usize i = 0; i < thread_pool.count; i++) {
-        nsn_os_thread_join(thread_pool.threads[i]);
+    {
+        for (usize i = 0; i < thread_pool.count; i++) {
+            at_store(&thread_pool.thread_args[i].state, NSN_DATAPLANE_THREAD_STATE_STOP, mo_rlx);
+        }
+        
+        for (usize i = 0; i < thread_pool.count; i++) {
+            nsn_os_thread_join(thread_pool.threads[i]);
+        }
     }
 
     // cleanup
 clear_and_quit:
     if (sockfd != -1) close(sockfd);
+
     unlink(NSNAPP_TO_NSND_IPC);
-// quit:
     mem_arena_release(state_arena);
     mem_arena_release(arena);
 

@@ -198,21 +198,14 @@ nsn_init()
     nsn_cfg_t *config = nsn_load_config(arena, str_lit(NSN_APP_DEFAULT_CONFIG_FILE));
     nsn_config_get_int(config, str_lit("app"), str_lit("l4_port"), &app_id);
 
- #ifdef NSN_ENABLE_LOGGER
+//  #ifdef NSN_ENABLE_LOGGER
     // Set the log level according to the config file
     logger_init(NULL);
-    logger_set_level(LOGGER_LEVEL_DEBUG);
-    // char* log_levels[] = {"error", "warn", "info", "debug", "trace"};
-    // char  config_log_level[32];
-    // string_t cfg_ll = str_cstr(config_log_level);
-    // nsn_config_get_string(config, str_lit("app"), str_lit("log_level"), &cfg_ll);
-    // for (usize i = 0; i < array_count(log_levels); i++) {
-    //     if (!strcmp(log_levels[i], to_cstr(cfg_ll))) {
-    //         logger_set_level(i);
-    //         break;    
-    //     }
-    // }
-#endif
+    char config_log_level[32] = {0};
+    string_t cfg_ll           = str_cstr(config_log_level);
+    nsn_config_get_string(config, str_lit("app"), str_lit("log_level"), &cfg_ll);
+    logger_set_level_by_name(to_cstr(cfg_ll));
+// #endif
 
     temp_mem_arena_t temp = temp_mem_arena_begin(arena);
 
@@ -841,10 +834,8 @@ nsn_buffer_t *nsn_get_buffer(size_t size, int flags) {
 
     uint8_t *data = (uint8_t*)(tx_bufs + 1) + (tmp_buf.index * tx_buf_size); 
     log_trace("Got iobuf #%lu, data %p, len %lu\n", tmp_buf.index, data, tx_buf_size);
-    tmp_buf.data      = data + INSANE_HEADER_LEN;
-    tmp_buf.len       = tx_buf_size - INSANE_HEADER_LEN;
-
-    log_error("buffer stats: %p, %lu\n", tmp_buf.data, tmp_buf.len);
+    tmp_buf.data = data + INSANE_HEADER_LEN;
+    tmp_buf.len  = tx_buf_size - INSANE_HEADER_LEN;
 
     return &tmp_buf;
 }

@@ -34,9 +34,9 @@ cd dpdk
 git checkout v22.11
 
 # Build and install
-meson --buildtype=release --default_library=shared --prefix=$INSTALL_DIR build
+meson setup --buildtype=release --prefix=$INSTALL_DIR build
 cd build
-ninja build
+ninja
 sudo ninja install
 sudo ldconfig
 

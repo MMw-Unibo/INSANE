@@ -1,6 +1,6 @@
 # compile a shared library from the C source code
 CC=gcc
-CFLAGS="-g -Wall -Wextra -Werror -std=c11 -fPIC -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations"
+CFLAGS="-Wall -Wextra -Werror -std=c11 -fPIC -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations"
 
 DPDK=`pkg-config --cflags --libs libdpdk --static`
 TLDK="-I ../deps/tldk/include -L ../deps/tldk/lib -ltle_dring -ltle_l4p -ltle_memtank -ltle_timer"
@@ -12,9 +12,10 @@ if [ $# -eq 1 ]; then
 fi
 
 if [ $BUILD_TYPE = "debug" ]; then
+    CFLAGS="-g $CFLAGS" 
     DEFINES="$DEFINES -DDEBUG -DNSN_ENABLE_LOGGER"
 elif [ $BUILD_TYPE = "release" ]; then
-    CFLAGS="$CFLAGS -O3"
+    CFLAGS="-O3 $CFLAGS"
 else
     echo "Invalid build type: $BUILD_TYPE"
     exit 1

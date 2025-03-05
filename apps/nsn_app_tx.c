@@ -37,7 +37,7 @@ main(void)
 
     // Set the desired QoS
     nsn_options_t opts;
-    opts.consumption =  NSN_QOS_CONSUMPTION_POLL;
+    opts.consumption =  NSN_QOS_CONSUMPTION_LOW;
     opts.datapath    =  NSN_QOS_DATAPATH_DEFAULT;
     opts.determinism =  NSN_QOS_DETERMINISM_DEFAULT;
     opts.reliability =  NSN_QOS_RELIABILITY_UNRELIABLE;
@@ -57,14 +57,14 @@ main(void)
     }
 
     // Get buffer and write there
-    nsn_buffer_t out_buf = nsn_get_buffer(buf_size, NSN_BLOCKING);
-    if(!out_buf.len) {
+    nsn_buffer_t* out_buf = nsn_get_buffer(buf_size, NSN_BLOCKING);
+    if(!out_buf->len) {
         printf("nsn_get_buffer() failed\n");
         res = -1;
         goto cleanup_w_src;
     }
-    strcpy((char *)out_buf.data, "Hello, World!");
-    out_buf.len = strlen("Hello, World!") + 1;
+    strcpy((char *)out_buf->data, "Hello, World!");
+    out_buf->len = strlen("Hello, World!") + 1;
 
     // Emit data
     int ok_buf = nsn_emit_data(src, out_buf);

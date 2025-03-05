@@ -66,16 +66,20 @@ struct arp_peer {
 /* UDP */
 #define MAX_UDP_PAYLOAD_SIZE 1434
 
-
-/** Prepare the ARP reply in-place.
-* @param arp_pkt: ARP packet to be replied  
-* @param local_ip_net: local IP addr in network byte order
-*/
-void arp_reply_prepare(struct rte_mbuf* arp_pkt, uint32_t local_ip_net, struct rte_ether_addr *local_mac_addr) {
-
-    struct rte_ether_hdr *eth_hdr  = rte_pktmbuf_mtod(arp_pkt, struct rte_ether_hdr *);
-    struct arp_hdr       *arp_hdr  = (struct arp_hdr*)(eth_hdr + 1);
-    struct arp_ipv4      *req_data = &arp_hdr->arp_data;
+/** 
+ * @brief Prepare the ARP reply in-place.
+ * 
+ * @param arp_pkt     ARP packet to be replied  
+ * @param local_ipv4  Local IP addr in network byte order
+ */
+void 
+arp_reply_prepare(
+    struct rte_mbuf* arp_pkt, uint32_t local_ipv4,
+    struct rte_ether_addr *local_mac_addr
+){
+    struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(arp_pkt, struct rte_ether_hdr *);
+    struct arp_hdr *arp_hdr       = (struct arp_hdr*)(eth_hdr + 1);
+    struct arp_ipv4 *req_data     = &arp_hdr->arp_data;
 
     struct rte_ether_addr remote_mac_addr;
     memcpy(&remote_mac_addr, &eth_hdr->src_addr, RTE_ETHER_ADDR_LEN);
@@ -86,10 +90,10 @@ void arp_reply_prepare(struct rte_mbuf* arp_pkt, uint32_t local_ip_net, struct r
     eth_hdr->ether_type = rte_cpu_to_be_16(ETHERNET_P_ARP);
 
     // 2. ARP Data
-    memcpy(&req_data->arp_sha, local_mac_addr, RTE_ETHER_ADDR_LEN);
-    memcpy(&req_data->arp_tha, &remote_mac_addr, RTE_ETHER_ADDR_LEN);
+    memcpy(req_data->arp_sha, local_mac_addr->addr_bytes, RTE_ETHER_ADDR_LEN);
+    memcpy(req_data->arp_tha, remote_mac_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
     req_data->arp_tip = req_data->arp_sip;
-    req_data->arp_sip = local_ip_net;
+    req_data->arp_sip = local_ipv4;
 
     arp_hdr->arp_opcode = rte_cpu_to_be_16(ARP_REPLY);
     arp_hdr->arp_htype  = rte_cpu_to_be_16(ARP_ETHERNET);
@@ -110,105 +114,128 @@ void arp_reply_prepare(struct rte_mbuf* arp_pkt, uint32_t local_ip_net, struct r
 * @param local_ip_net: local IP addr in network byte order
 * @param arp_pkt: ARP packet to be replied
 */
-void arp_reply(uint16_t port_id, uint16_t tx_queue_id, struct rte_ether_addr* local_mac_addr, uint32_t local_ip_net, struct rte_mbuf* arp_pkt) {
-
-    // Prepare the ARP reply in-place
+void 
+arp_reply(
+    uint16_t port_id, uint16_t tx_queue_id, 
+    struct rte_ether_addr* local_mac_addr, uint32_t local_ip_net, 
+    struct rte_mbuf* arp_pkt
+) {
     arp_reply_prepare(arp_pkt, local_ip_net, local_mac_addr);
 
-    // Send the mbuf to the network 
     uint16_t ret = 0;
     while(!ret) {
         ret = rte_eth_tx_burst(port_id, tx_queue_id, &arp_pkt, 1);
     }    
 }
 
-void arp_update_cache(struct rte_mbuf* arp_mbuf, struct arp_peer *peers, int n_peers) {
-    arp_hdr_t *ahdr = rte_pktmbuf_mtod_offset(arp_mbuf, arp_hdr_t *, RTE_ETHER_HDR_LEN);
-    
+void 
+arp_update_cache(struct arp_hdr *arp_hdr, struct arp_peer *peers, int n_peers)
+{
     // Update the ARP cache
-    for(int i = 0; i < n_peers; i++) {
-        if (peers[i].ip_net == ahdr->arp_data.arp_sip) {
-            memcpy(&peers[i].mac_addr, &ahdr->arp_data.arp_sha, RTE_ETHER_ADDR_LEN);
-            peers[i].mac_set = true;
-            
-            // Print the MAC address - to acknowledge the ARP reply to the user
-            char mac_str[32];
-            rte_ether_format_addr(mac_str, 32, &peers[i].mac_addr);
-            fprintf(stderr, "[arp] ARP from %s is %s\n", peers[i].ip_str, mac_str);
-
+    for (int i = 0; i < n_peers; i++) {
+        if (peers[i].ip_net == arp_hdr->arp_data.arp_sip) {
+            memcpy(&peers[i].mac_addr, &arp_hdr->arp_data.arp_sha, RTE_ETHER_ADDR_LEN);
+            peers[i].mac_set = true;            
             break;
         }
     }
-
 }
 
-// local_ip is the local IP address in network byte order
-void arp_receive(uint16_t port_id, uint16_t tx_queue_id, struct rte_ether_addr *local_mac_addr,
-                 uint32_t local_ip_net, struct rte_mbuf *arp_mbuf,
-                 struct arp_peer *peers, int n_peers) 
-{   
-    arp_update_cache(arp_mbuf, peers, n_peers);
-    
-    arp_hdr_t *ahdr = rte_pktmbuf_mtod_offset(arp_mbuf, arp_hdr_t *, RTE_ETHER_HDR_LEN);
-    if (ahdr->arp_data.arp_tip != local_ip_net) {
-        // not for us - do not reply
-        return;
-    }
+void
+arp_receive(
+    uint16_t port_id, uint16_t tx_queue_id, 
+    struct rte_ether_addr *local_mac_addr, uint32_t local_ip_net, 
+    struct rte_mbuf *arp_mbuf, struct arp_peer *peers, int n_peers
+) {   
+    struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(arp_mbuf, struct rte_ether_hdr *);
+    struct arp_hdr *arp_hdr       = (struct arp_hdr*)(eth_hdr + 1);
 
-    switch (rte_be_to_cpu_16(ahdr->arp_opcode)) {
-    case ARP_REQUEST:
-        fprintf(stderr, "[arp] Reply to ARP request\n");
-        arp_reply(port_id, tx_queue_id, local_mac_addr, local_ip_net, arp_mbuf);
-        break;
-    default:
-        // Replies or wrong opcodes - no action
-        break;
+    char mac_str[32];
+    struct rte_ether_addr mac_addr;
+    memcpy(mac_addr.addr_bytes, arp_hdr->arp_data.arp_sha, RTE_ETHER_ADDR_LEN);
+    rte_ether_format_addr(mac_str, sizeof(mac_str), &mac_addr);
+    char peer_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &arp_hdr->arp_data.arp_sip, peer_ip, INET_ADDRSTRLEN);
+
+    fprintf(stderr, "[arp] received an ARP packet from %s with MAC %s\n", peer_ip, mac_str);
+
+    arp_update_cache(arp_hdr, peers, n_peers);
+
+    // Check if the ARP packet is for this IP
+    if (arp_hdr->arp_data.arp_tip != local_ip_net)
+        return;
+
+    switch (rte_be_to_cpu_16(arp_hdr->arp_opcode)) {
+        case ARP_REQUEST: 
+            arp_reply(port_id, tx_queue_id, local_mac_addr, local_ip_net, arp_mbuf);
+            break;
+        default:
+            // Replies or wrong opcodes - no action
+            break;
     }
 }
 
 // l_ipv4_net: local IP in network byte order
 // d_ipv4_net: destination IP in network byte order
-int32_t arp_request(uint16_t port_id, uint16_t tx_queue_id,
-                           struct rte_ether_addr *local_mac_addr, uint32_t l_ipv4_net, uint32_t d_ipv4_net,
-                            struct rte_mempool *arp_pool) 
-{
-
-    // 0. Allocate an mbuf
+int32_t 
+arp_request(
+    uint16_t port_id, uint16_t tx_queue_id,
+    struct rte_ether_addr *local_haddr, uint32_t local_ipv4, 
+    uint32_t peer_ipv4, struct rte_mempool *arp_pool
+) {
     struct rte_mbuf *rte_mbuf = rte_pktmbuf_alloc(arp_pool);
     if (!rte_mbuf) {
-        fprintf(stderr, "[arp] failed to allocate mbuf for ARP request: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[arp] failed to allocate mbuf for ARP request: %s\n", 
+                rte_strerror(rte_errno));
         return -rte_errno;
     }
 
-    // 1. Ethernet Header
-    struct rte_ether_addr broadcast_hw = {{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}};
-    struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(rte_mbuf, struct rte_ether_hdr *);
-    memcpy(&eth_hdr->src_addr, local_mac_addr, RTE_ETHER_ADDR_LEN);
-    memcpy(&eth_hdr->dst_addr, &broadcast_hw, RTE_ETHER_ADDR_LEN);
-    eth_hdr->ether_type = rte_cpu_to_be_16(ETHERNET_P_ARP);
+    struct rte_ether_hdr *eth_hdr;
+    struct rte_ether_addr broadcast_hw = {
+        .addr_bytes = ETHERNET_BROADCAST_ADDR,
+    };
 
-    // 2. ARP data
-    arp_hdr_t  *ahdr  = (arp_hdr_t *)(eth_hdr + 1);
-    arp_ipv4_t *adata = (arp_ipv4_t *)(&ahdr->arp_data);
+    // Ethernet
+    {
+        eth_hdr = rte_pktmbuf_mtod(rte_mbuf, struct rte_ether_hdr *);
+        eth_hdr->ether_type = rte_cpu_to_be_16(ETHERNET_P_ARP);
+        memcpy(&eth_hdr->src_addr, local_haddr, RTE_ETHER_ADDR_LEN);
+        memcpy(&eth_hdr->dst_addr, &broadcast_hw, RTE_ETHER_ADDR_LEN);
+    }
 
-    memcpy(adata->arp_sha, local_mac_addr, RTE_ETHER_ADDR_LEN);
-    memcpy(adata->arp_tha, &broadcast_hw, RTE_ETHER_ADDR_LEN);
-    adata->arp_sip = l_ipv4_net;
-    adata->arp_tip = d_ipv4_net;
+    // ARP data
+    {
+        arp_hdr_t *ahdr = (arp_hdr_t *)(eth_hdr + 1);
+        ahdr->arp_opcode = rte_cpu_to_be_16(ARP_REQUEST);
+        ahdr->arp_htype  = rte_cpu_to_be_16(ARP_ETHERNET);
+        ahdr->arp_ptype  = rte_cpu_to_be_16(ETHERNET_P_IP);
+        ahdr->arp_hlen   = RTE_ETHER_ADDR_LEN;
+        ahdr->arp_plen   = 4;
+        
+        arp_ipv4_t *adata = (arp_ipv4_t *)(&ahdr->arp_data);
+        adata->arp_sip = local_ipv4;
+        adata->arp_tip = peer_ipv4;
+        memcpy(adata->arp_sha, local_haddr->addr_bytes, RTE_ETHER_ADDR_LEN);
+        memcpy(adata->arp_tha, broadcast_hw.addr_bytes, RTE_ETHER_ADDR_LEN);
+    }
 
-    ahdr->arp_opcode = rte_cpu_to_be_16(ARP_REQUEST);
-    ahdr->arp_htype  = rte_cpu_to_be_16(ARP_ETHERNET);
-    ahdr->arp_ptype  = rte_cpu_to_be_16(ETHERNET_P_IP);
-    ahdr->arp_hlen   = RTE_ETHER_ADDR_LEN;
-    ahdr->arp_plen   = 4;
+    // Append the fragment to the transmission queue of the control DP
+    {
+        rte_mbuf->next    = NULL;
+        rte_mbuf->nb_segs = 1;
+        rte_mbuf->pkt_len = rte_mbuf->data_len = RTE_ETHER_HDR_LEN + sizeof(arp_hdr_t);
+    }
 
-    // 3. Append the fragment to the transmission queue of the control DP
-    rte_mbuf->next    = NULL;
-    rte_mbuf->nb_segs = 1;
-    rte_mbuf->pkt_len = rte_mbuf->data_len = RTE_ETHER_HDR_LEN + sizeof(arp_hdr_t);
-    
+    char local_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local_ipv4, local_ip, INET_ADDRSTRLEN);
+    char peer_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &peer_ipv4, peer_ip, INET_ADDRSTRLEN);
+    char local_mac[32];
+    rte_ether_format_addr(local_mac, sizeof(local_mac), local_haddr);
 
-    fprintf(stderr, "[arp] sending ARP request\n");
+    fprintf(stderr, "[arp] sending ARP request: local IP %s, local MAC %s, peer IP %s\n", 
+            local_ip, local_mac, peer_ip);
+        
     uint16_t ret = 0;
     while(!ret) {
         ret += rte_eth_tx_burst(port_id, tx_queue_id, &rte_mbuf, 1);

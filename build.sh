@@ -30,10 +30,14 @@ else
     exit 1
 fi
 
+if [ ! -d build ]; then
+    mkdir build
+fi
+
 echo "Compiling in '${BUILD_TYPE_STR}' mode"
 cd build
 set -x
-$CC $CFLAGS ../src/nsnd/nsnd.c  -I../src -I../include/  $LDFLAGS $DEFINES -o nsnd${POSTFIX}
+$CC $CFLAGS ../src/nsnd/nsnd.c  -I../src -I../include/ -I../include/nsnd  $LDFLAGS $DEFINES -o nsnd${POSTFIX}
 
 # Build the libnsn.a and libnsn.so libraries
 gcc $CFLAGS -fPIC ../src/libnsn/libnsn.c -I../src -I../include/ $DEFINES -shared -o libnsn.so
@@ -42,7 +46,7 @@ ar rcs libnsn.a libnsn.o
 cp libnsn.so ../bindings/libnsn.so
 
 # Build the Applications
-# $CC $CFLAGS ../apps/nsn_app_tx.c    -I../include $DEFINES $LDFLAGS -L. -l:libnsn.a -o nsn-app-tx
+$CC $CFLAGS ../apps/nsn_app_tx.c    -I../include $DEFINES $LDFLAGS -L. -l:libnsn.a -o nsn-app-tx
 # $CC $CFLAGS ../apps/nsn_app_rx.c    -I../include $LDFLAGS -lnsn $DEFINES -o nsn-app-rx
 $CC $CFLAGS ../apps/nsn_app_perf.c  -I../include $DEFINES $LDFLAGS -L. -l:libnsn.a -o nsn-perf
 

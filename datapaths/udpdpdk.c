@@ -56,45 +56,54 @@ static struct rte_flow *rx_arp_flow;
 static bool dev_stopped = true;
 
 /* Protocols */
-static inline void prepare_headers(struct rte_mbuf *hdr_mbuf, size_t payload_size, uint16_t udp_port, int peer_idx) {
+static inline void 
+prepare_headers(
+    struct rte_mbuf *hdr_mbuf, size_t payload_size, 
+    uint16_t udp_port, int peer_idx
+) {
 
-    /* Ethernet */
-    struct rte_ether_hdr *ehdr = rte_pktmbuf_mtod(hdr_mbuf, struct rte_ether_hdr*);
-    memcpy(&ehdr->src_addr, &local_mac_addr, RTE_ETHER_ADDR_LEN);
-    memcpy(&ehdr->dst_addr, &peers[peer_idx].mac_addr, RTE_ETHER_ADDR_LEN);
-    ehdr->ether_type = htons(RTE_ETHER_TYPE_IPV4);
+    struct rte_ether_hdr *ehdr;
+    struct rte_ipv4_hdr *ih;
+    struct rte_udp_hdr *uh;
 
-    /* IP */
-    struct rte_ipv4_hdr *ih = (struct rte_ipv4_hdr *)(ehdr + 1);
-    ih->src_addr        = local_ip_net;
-    ih->dst_addr        = peers[peer_idx].ip_net;
-    ih->version         = IPV4;
-    ih->ihl             = 0x05;
-    ih->type_of_service = 0;
-    ih->total_length    = htons(payload_size + IP_HDR_LEN + UDP_HDR_LEN);
-    ih->packet_id       = 0;
-    ih->fragment_offset = 0;
-    ih->time_to_live    = 64;
-    ih->next_proto_id   = IP_UDP;
-    ih->hdr_checksum    = 0;
-    // Compute the IP checksum
-    ih->hdr_checksum = rte_ipv4_cksum(ih);
+    // Ethernet
+    {
+        ehdr = rte_pktmbuf_mtod(hdr_mbuf, struct rte_ether_hdr*);
+        memcpy(&ehdr->src_addr, local_mac_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+        memcpy(&ehdr->dst_addr, &peers[peer_idx].mac_addr, RTE_ETHER_ADDR_LEN);
+        ehdr->ether_type = htons(RTE_ETHER_TYPE_IPV4);
+    }
 
-    /* UDP */
-    struct rte_udp_hdr *uh = (struct rte_udp_hdr *)(ih + 1);
-    uh->dst_port           = htons(udp_port);
-    uh->src_port           = htons(udp_port);
-    uh->dgram_len          = htons(payload_size + UDP_HDR_LEN);
-    uh->dgram_cksum        = 0;
-    // Compute the UDP checksum
-    // uh->dgram_cksum = rte_ipv4_udptcp_cksum(ih, uh);
+    // IP
+    {
+        ih = (struct rte_ipv4_hdr *)(ehdr + 1);
+        memory_zero_struct(ih);
+        ih->src_addr        = local_ip_net;
+        ih->dst_addr        = peers[peer_idx].ip_net;
+        ih->version         = IPV4;
+        ih->ihl             = 0x05;
+        ih->total_length    = htons(payload_size + IP_HDR_LEN + UDP_HDR_LEN);
+        ih->time_to_live    = 64;
+        ih->next_proto_id   = IP_UDP;
+        ih->hdr_checksum    = rte_ipv4_cksum(ih);
+    }
+
+    // UDP
+    {
+        uh = (struct rte_udp_hdr *)(ih + 1);
+        memory_zero_struct(uh);
+        uh->dst_port    = htons(udp_port);
+        uh->src_port    = htons(udp_port);
+        uh->dgram_len   = htons(payload_size + UDP_HDR_LEN);
+    }
 
     // Finally, set the data_len and pkt_len: only headers! The payload size is in another mbuf
     hdr_mbuf->data_len = hdr_mbuf->pkt_len = RTE_ETHER_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN;
 }
 
 /* API */
-NSN_DATAPATH_UPDATE(udpdpdk) {
+NSN_DATAPATH_UPDATE(udpdpdk)
+{
     if (endpoint == NULL) {
         fprintf(stderr, "[udpdpdk] invalid endpoint\n");
         return -1;
@@ -193,32 +202,37 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
         */
         bzero(pool_name, 64);
         sprintf(pool_name, "rx_data_pool_%u", conn->rx_queue_id);
+
         uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
-        uint32_t n_pages = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
-        char *data_ptr = (char*)(endpoint->tx_zone + 1);
-        // fprintf(stderr, "Memory for data starts at %p [npages = %u, size = %lu]\n", data_ptr, n_pages, endpoint->tx_zone->size);
-        struct rte_pktmbuf_extmem *extmem_pages =
-            malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
+        uint32_t n_pages    = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
+        char *data_ptr      = (char*)(endpoint->tx_zone + 1);
+
+        struct rte_pktmbuf_extmem *extmem_pages = malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
+
         for (uint32_t i = 0; i < n_pages; i++) {
-            void *ptr                = (i==0)? 
-                                            data_ptr : 
-                                            addr + i * endpoint->page_size;
+            void *ptr = (i==0) ? data_ptr : addr + i * endpoint->page_size;
             extmem_pages[i].buf_ptr  = ptr; 
             struct rte_memseg *ms    = rte_mem_virt2memseg(ptr, rte_mem_virt2memseg_list(ptr));
             extmem_pages[i].buf_iova = ms->iova + ((char *)ptr - (char *)ms->addr);
-            extmem_pages[i].buf_len  = (i==0)? 
-                                            endpoint->page_size - (data_ptr - (char*)addr) : 
-                                            endpoint->page_size;
+            extmem_pages[i].buf_len  = (i==0) 
+                                        ? endpoint->page_size - (data_ptr - (char*)addr) 
+                                        : endpoint->page_size;
             extmem_pages[i].elt_size = endpoint->io_bufs_size;
         }
+
         size_t private_size    = sizeof(size_t);
         size_t data_room_size  = 0;
-        conn->rx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
-            pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
+        conn->rx_data_pool = 
+            nsn_dpdk_pktmbuf_pool_create_extmem(
+                pool_name, endpoint->io_bufs_count, 0, private_size, 
+                data_room_size, socket_id, extmem_pages, n_pages, 
+                endpoint->free_slots
+            );
         if (!conn->rx_data_pool) {
             fprintf(stderr, "[udpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
             goto error_3;
         }  
+
         // This is the HACK that makes the external memory work. The external mempool must be
         // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
         // to know the size of the mbufs. So, afer the creation, we set the data room size of the
@@ -328,31 +342,26 @@ NSN_DATAPATH_CONN_MANAGER(udpdpdk)
     nsn_unused(endpoint_list);
     struct rte_mbuf      *pkts_burst[MAX_RX_BURST_ARP];
     struct rte_ether_hdr *eth_hdr;
-    uint16_t              ether_type;
-    uint16_t              queue_id = 0;
-    int j;
-
-    // Send ARP requests for "missing" peers
-    // for (int i = 0; i < n_peers; i++) {
-    //     if (!peers[i].mac_set) {
-    //         arp_request(peers[i].ip_net);
-    //     }
-    // }
-
-    // Receive ARP replies or answer incoming ARP requests
-    uint16_t rx_count = rte_eth_rx_burst(port_id, 0, pkts_burst, MAX_RX_BURST_ARP);
-
-    for (j = 0; j < rx_count; j++) {
+    u16 ether_type;
+    
+    const u16 queue_id = 0;
+    u16 rx_count  = rte_eth_rx_burst(port_id, 0, pkts_burst, MAX_RX_BURST_ARP);
+    if (rx_count > 0)
+        fprintf(stderr, "[%s] received %u packets\n", __func__, rx_count);
+    
+    for (int j = 0; j < rx_count; j++) {
         eth_hdr    = rte_pktmbuf_mtod(pkts_burst[j], struct rte_ether_hdr *);
         ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
         switch (ether_type) {
-            case RTE_ETHER_TYPE_ARP:
-                // Receive ARP and, if necessary, reply. Free is done by the internal TX.
+            case RTE_ETHER_TYPE_ARP: {
+                fprintf(stderr, "[%s] handling an ARP packet (%d)\n", __func__, j);
                 arp_receive(port_id, tx_queue_id, &local_mac_addr, local_ip_net, pkts_burst[j], peers, n_peers);
-                break;
-            default:
+            } break;
+            default: {
+                fprintf(stderr, "[%s] received an unexpected packet with etype=%x (%d)\n", 
+                        __func__, ether_type, j);
                 rte_pktmbuf_free(pkts_burst[j]);
-                break;
+            } break;
         }
     }
    
@@ -681,7 +690,8 @@ NSN_DATAPATH_RX(udpdpdk)
 
     // Deliver only UDP packet payloads
     usize valid = 0;
-    for(uint16_t i = 0; i < nb_rx; i++) {
+    for(uint16_t i = 0; i < nb_rx; i++) 
+    {
         struct rte_mbuf *mbuf = rx_bufs[i];
         struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
         struct rte_ipv4_hdr *ih = (struct rte_ipv4_hdr *)(eth_hdr + 1);
@@ -768,4 +778,3 @@ NSN_DATAPATH_DEINIT(udpdpdk)
 
     return 0;
 }
-

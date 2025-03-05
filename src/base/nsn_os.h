@@ -10,6 +10,7 @@ u64 nsn_os_get_cycles(void);
 i64 nsn_os_get_time_ns(void);
 
 // --- Library -----------------------------------------------------------------
+typedef struct nsn_os_module nsn_os_module_t;
 struct nsn_os_module
 {
 #if NSN_OS_LINUX
@@ -19,15 +20,16 @@ struct nsn_os_module
 #endif
 };
 
-enum nsn_os_library_flag {
+enum nsn_os_library_flag 
+{
     NsnOsLibraryFlag_None = 0,
     NsnOsLibraryFlag_Lazy = 1 << 0,
     NsnOsLibraryFlag_Now  = 1 << 1,
 };
 
-struct nsn_os_module nsn_os_load_library(const char *path, int flags);
-void *nsn_os_get_proc_address(struct nsn_os_module, const char *name);
-void nsn_os_unload_library(struct nsn_os_module module);
+nsn_os_module_t nsn_os_load_library     (const char *path, int flags);
+void *          nsn_os_get_proc_address (nsn_os_module_t module, const char *name);
+void            nsn_os_unload_library   (nsn_os_module_t module);
 
 // --- Memory ------------------------------------------------------------------
 
@@ -44,11 +46,11 @@ enum nsn_os_memory_flag {
     NsnOsMemoryFlag_HugePage = 1 << 4,
 };
 
-void *nsn_os_allocate_memory(usize size, int flags);
-void *nsn_os_reserve_memory(usize size, int flags);
-void  nsn_os_commit_memory(void *address, usize size);
-void  nsn_os_decommit_memory(void *address, usize size);
-void  nsn_os_release_memory(void *address, usize size);
+void *nsn_os_allocate_memory (usize size, int flags);
+void *nsn_os_reserve_memory  (usize size, int flags);
+void  nsn_os_commit_memory   (void *address, usize size);
+void  nsn_os_decommit_memory (void *address, usize size);
+void  nsn_os_release_memory  (void *address, usize size);
 
 size_t nsn_os_default_page_size(void);
 
