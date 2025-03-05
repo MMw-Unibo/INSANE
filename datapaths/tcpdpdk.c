@@ -311,7 +311,7 @@ static int be_tcp(uint16_t rx_queue_id) {
                     // If necessary, prepare ARP reply
                     arp_hdr_t *ahdr = rte_pktmbuf_mtod_offset(rx_pkt[i], arp_hdr_t *, RTE_ETHER_HDR_LEN);
                     if(rte_be_to_cpu_16(ahdr->arp_opcode) == ARP_REQUEST) {
-                        arp_reply_prepare(rx_pkt[i], local_ip_net);
+                        arp_reply_prepare(rx_pkt[i], local_ip_net, &local_mac_addr);
                         // Append the mbuf to the TX queue
                         tx_pkt[nb_arp] = rx_pkt[i];
                         nb_arp++;
@@ -516,6 +516,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
             free(endpoint->data);
             return -1;
         }
+        memset(conn->s_sockfd, 0, n_peers * sizeof(struct tldk_stream_handle));
 
         // Assign a queue to this application
         u64 queue_id;
@@ -799,7 +800,7 @@ NSN_DATAPATH_CONN_MANAGER(tcpdpdk) {
                     };
 
                     atomic_fetch_add(&conn->connected_peers, 1);
-                    fprintf(stderr, "[tcpsock] connection manager: accepted connection from %s:%u\n", peers[p].ip_str, ep->app_id);
+                    fprintf(stderr, "[tcpdpdk] connection manager: accepted connection from %s:%u\n", peers[p].ip_str, ep->app_id);
                     break;
                 }
             }

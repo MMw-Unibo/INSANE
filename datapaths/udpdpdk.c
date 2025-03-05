@@ -348,7 +348,7 @@ NSN_DATAPATH_CONN_MANAGER(udpdpdk)
         switch (ether_type) {
             case RTE_ETHER_TYPE_ARP:
                 // Receive ARP and, if necessary, reply. Free is done by the internal TX.
-                arp_receive(port_id, tx_queue_id, local_ip_net, pkts_burst[j], peers, n_peers);
+                arp_receive(port_id, tx_queue_id, &local_mac_addr, local_ip_net, pkts_burst[j], peers, n_peers);
                 break;
             default:
                 rte_pktmbuf_free(pkts_burst[j]);
