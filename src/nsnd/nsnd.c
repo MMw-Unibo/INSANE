@@ -460,11 +460,11 @@ wait:
     clean_ep_list(&ep_list, &data_arena);
 
 unload_and_clean:
-    log_debug("[thread %d] unloading library\n", self);
-    nsn_os_unload_library(module);
-
     plugin->update = NULL;
     plugin->conn_manager = NULL;
+
+    log_debug("[thread %d] unloading library\n", self);
+    nsn_os_unload_library(module);
     
     mem_arena_pop(data_arena.arena, ip_str_size*app_pool.count); // peers' IPs
     mem_arena_pop(data_arena.arena, sizeof(peer_list) * app_pool.count); // array of peers' IPs
