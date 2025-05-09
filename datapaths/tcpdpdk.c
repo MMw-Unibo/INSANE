@@ -69,6 +69,7 @@ struct tcpdpdk_ep {
     atu32 connected_peers;
     struct tldk_stream_handle  s_svc_sockfd; // Server stream
     struct tldk_stream_handle *s_sockfd;     // Array of open streams
+    nsn_buf_t pending_rx_buf; // For non zero-copy receive
 };
 
 // Plugin state
@@ -90,6 +91,9 @@ struct rte_mempool *ctrl_pool;
 static temp_mem_arena_t scratch;
 static struct rte_flow *rx_arp_flow;
 static bool dev_stopped = true;
+
+// Zero-copy RX switch
+static bool zc_rx = false; 
 
 // Mutex on the TLDK backend operations
 static nsn_mutex_t be_lock;
@@ -306,10 +310,10 @@ static int be_tcp(uint16_t rx_queue_id) {
             // Check ethernet type
             if (rte_be_to_cpu_16(eth_hdr->ether_type) != RTE_ETHER_TYPE_IPV4) {
                 if (rte_be_to_cpu_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_ARP) {
-                    // Update the cache
-                    arp_update_cache(rx_pkt[i], peers, n_peers);
-                    // If necessary, prepare ARP reply
                     arp_hdr_t *ahdr = rte_pktmbuf_mtod_offset(rx_pkt[i], arp_hdr_t *, RTE_ETHER_HDR_LEN);
+                    // Update the cache
+                    arp_update_cache(ahdr, peers, n_peers);
+                    // If necessary, prepare ARP reply
                     if(rte_be_to_cpu_16(ahdr->arp_opcode) == ARP_REQUEST) {
                         arp_reply_prepare(rx_pkt[i], local_ip_net, &local_mac_addr);
                         // Append the mbuf to the TX queue
@@ -338,8 +342,8 @@ static int be_tcp(uint16_t rx_queue_id) {
                 continue;
             }
 
-            fprintf(stderr, "[tcpdpdk] received TCP packet on port %u, data_len=%u\n", tldk_ctx.port.id, rx_pkt[i]->data_len);
-
+            //fprintf(stderr, "[tcpdpdk] received TCP packet on queue %u, nb_segs=%u, pkt_len=%u, data_len=%u\n", rx_queue_id, rx_pkt[i]->nb_segs, rx_pkt[i]->pkt_len, rx_pkt[i]->data_len);
+            
             // Compute l2, l3 len (prereq of tle_tcp_rx_bulk)
             rx_pkt[i]->l2_len = RTE_ETHER_HDR_LEN;
             rx_pkt[i]->l3_len = sizeof(struct rte_ipv4_hdr);
@@ -363,9 +367,8 @@ static int be_tcp(uint16_t rx_queue_id) {
     }
     
     // 2. Progress the TCP state machine
-    ret = tle_tcp_process(tldk_ctx.ctx, MAX_STREAMS);
-    if (ret < 0) {
-        printf("Error processing TCP state machine: %s\n", strerror(ret));
+    if (tle_tcp_process(tldk_ctx.ctx, MAX_STREAMS) < 0) {
+        fprintf(stderr, "[tcpdpdk] Error processing TCP state machine\n");
     }
     
     // 3. Transmit
@@ -375,12 +378,9 @@ static int be_tcp(uint16_t rx_queue_id) {
     nb_tx = nb_arp + nb_tx_tcp;
     nb_tx_actual = 0;
     while (nb_tx_actual < nb_tx) {
-        nb_tx_actual += rte_eth_tx_burst(tldk_ctx.port.id, tx_queue_id, tx_pkt, nb_tx);
+        nb_tx_actual += rte_eth_tx_burst(tldk_ctx.port.id, tx_queue_id, tx_pkt + nb_tx_actual, nb_tx - nb_tx_actual);
     }
     
-    if (nb_tx_actual)
-        fprintf(stderr, "[tcpdpdk] sent %u packets on queue %u\n", nb_tx_actual, tx_queue_id);
-
     return 0;
 }
 
@@ -445,6 +445,11 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
     // Case 1. Delete endpoint data.
     if(endpoint->data) {
         struct tcpdpdk_ep *conn = (struct tcpdpdk_ep *)endpoint->data;
+
+        if (!zc_rx) {
+            // Return the pending buffer to the free slots
+            nsn_ringbuf_enqueue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
+        }
         
         // If the device is active, close the connection here and then just stop this queue, not the entire device.
         if(!dev_stopped) {
@@ -456,6 +461,10 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
             }
             for(u16 i = 0; i < n_peers; i++) {
                 if(conn->s_sockfd[i].stream) {
+                    // Flush pending data
+                    while(tle_tcp_stream_tx_pending(conn->s_sockfd[i].stream)) {
+                        be_tcp(conn->rx_queue_id);
+                    }
                     res = tle_tcp_stream_close(conn->s_sockfd[i].stream);
                     be_tcp(conn->rx_queue_id);
                     conn->s_sockfd[i].stream = NULL;
@@ -534,29 +543,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
             goto error_1;
         }
         
-        // RX: header mempool. Must have 10239 as num_mbufs or it fails
-        char pool_name[64];
-        bzero(pool_name, 64);
-        sprintf(pool_name, "rx_hdr_pool_%u", conn->rx_queue_id);
-        if ((conn->rx_hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
-            fprintf(stderr, "[tcpdpdk] failed to create mempool %s\n", pool_name);
-            goto error_2;
-        }
-
-        // RX: data mempool with external memory configuration
-        /* External memory configuration
-            This mempool contains only descriptors, not data: data_room_size is 0.
-            The descriptors will point to the INSANE nbufs, containing the data.
-            This is called "indirect mempool" in DPDK.
-            This mempool is actually a "special" mempool backed by the INSANE ring.
-
-            In INSANE, the data area is not aligned to the page size, so the first page must 
-            be registered with a smaller size than the page size. The rest of the pages will be
-            registered with the full page size. "addr" points to the beginning of the page,
-            and "data_ptr" points to the beginning of the data area on that page.
-        */
-        bzero(pool_name, 64);
-        sprintf(pool_name, "rx_data_pool_%u", conn->rx_queue_id);
+        // Configure the external memory. This is used for RX, if zero-copy is enabled, and always for TX.
         uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
         uint32_t n_pages = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
         char *data_ptr = (char*)(endpoint->tx_zone + 1);
@@ -575,54 +562,104 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
                                             endpoint->page_size;
             extmem_pages[i].elt_size = endpoint->io_bufs_size;
         }
-        size_t private_size    = sizeof(size_t);
-        size_t data_room_size  = 0;
-        conn->rx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
-            pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
-        if (!conn->rx_data_pool) {
-            fprintf(stderr, "[tcpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
-            goto error_3;
-        }  
-        // This is the HACK that makes the external memory work. The external mempool must be
-        // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
-        // to know the size of the mbufs. So, afer the creation, we set the data room size of the
-        // mbufs to the maximum size of the payload. Apparently this works withouth visible side
-        // effects. TODO: Is there a proper way to do this?
-        struct rte_pktmbuf_pool_private *mbp_priv =
-            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->rx_data_pool);
-        mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
 
-        /* Configure RX split: headers and payloads in their respective mempools */
-        struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
-        // Configure the BUFFER_SPLIT offload behavior for the selected RX queue.
-        uint8_t rx_pkt_nb_segs = 2;
-        struct rte_eth_rxseg_split *rx_seg;
-        union rte_eth_rxseg rx_useg[2] = {};
-        // Segment 0 (header)
-        rx_seg         = &rx_useg[0].split;
-        rx_seg->mp     = conn->rx_hdr_pool;
-        rx_seg->offset = 0;
-        // See docs in rte_ethdev.h. Must be zero if length is used (and vice versa)
-        rx_seg->proto_hdr = 0;
-        // Max bytes to be placed in this segment. Must be zero if proto_hdr is used (and vice versa)
-        rx_seg->length = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr);
-        // Segment 1 (payload)
-        rx_seg         = &rx_useg[1].split;
-        rx_seg->offset = 0;
-        rx_seg->mp     = conn->rx_data_pool;
-        rx_seg->proto_hdr = 0;
-        rx_seg->length = 2048;
+        /* We have two separate paths, one to enable the zero-copy receive, one for the copy-on-receive */
+        char pool_name[64];
+        if(zc_rx) {
+            // RX: header mempool. Must have 10239 as num_mbufs or it fails
+            bzero(pool_name, 64);
+            sprintf(pool_name, "rx_hdr_pool_%u", conn->rx_queue_id);
+            if ((conn->rx_hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
+                fprintf(stderr, "[tcpdpdk] failed to create mempool %s\n", pool_name);
+                goto error_2;
+            }
 
-        // Configure the number of segments and the segments themselves
-        rx_conf.rx_nseg     = rx_pkt_nb_segs;
-        rx_conf.rx_seg      = rx_useg;
-        rx_conf.rx_mempools = NULL;
-        rx_conf.rx_nmempool = 0;
-        rx_conf.rx_deferred_start = 1;
-        // Setup the RX queue using the selected configuration
-        if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, &rx_conf, NULL)) != 0) {
-            fprintf(stderr, "[tcpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
-            goto error_4;
+            // RX: data mempool with external memory configuration
+            /* External memory configuration
+                This mempool contains only descriptors, not data: data_room_size is 0.
+                The descriptors will point to the INSANE nbufs, containing the data.
+                This is called "indirect mempool" in DPDK.
+                This mempool is actually a "special" mempool backed by the INSANE ring.
+
+                In INSANE, the data area is not aligned to the page size, so the first page must 
+                be registered with a smaller size than the page size. The rest of the pages will be
+                registered with the full page size. "addr" points to the beginning of the page,
+                and "data_ptr" points to the beginning of the data area on that page.
+            */
+            bzero(pool_name, 64);
+            sprintf(pool_name, "rx_data_pool_%u", conn->rx_queue_id);
+            size_t private_size    = sizeof(size_t);
+            size_t data_room_size  = 0;
+            conn->rx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
+                pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
+            if (!conn->rx_data_pool) {
+                fprintf(stderr, "[tcpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
+                goto error_3;
+            }  
+            // This is the HACK that makes the external memory work. The external mempool must be
+            // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
+            // to know the size of the mbufs. So, afer the creation, we set the data room size of the
+            // mbufs to the maximum size of the payload. Apparently this works withouth visible side
+            // effects. TODO: Is there a proper way to do this?
+            struct rte_pktmbuf_pool_private *mbp_priv =
+                (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->rx_data_pool);
+            mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
+
+            /* Configure RX split: headers and payloads in their respective mempools */
+            struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
+            // Configure the BUFFER_SPLIT offload behavior for the selected RX queue.
+            uint8_t rx_pkt_nb_segs = 2;
+            struct rte_eth_rxseg_split *rx_seg;
+            union rte_eth_rxseg rx_useg[2] = {};
+            // Segment 0 (header)
+            rx_seg         = &rx_useg[0].split;
+            rx_seg->mp     = conn->rx_hdr_pool;
+            rx_seg->offset = 0;
+            // See docs in rte_ethdev.h. Must be zero if length is used (and vice versa)
+            rx_seg->proto_hdr = 0;
+            // Max bytes to be placed in this segment. Must be zero if proto_hdr is used (and vice versa)
+            rx_seg->length = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr);
+            // Segment 1 (payload)
+            rx_seg         = &rx_useg[1].split;
+            rx_seg->offset = 0;
+            rx_seg->mp     = conn->rx_data_pool;
+            rx_seg->proto_hdr = 0;
+            rx_seg->length = 2048;
+
+            // Configure the number of segments and the segments themselves
+            rx_conf.rx_nseg     = rx_pkt_nb_segs;
+            rx_conf.rx_seg      = rx_useg;
+            rx_conf.rx_mempools = NULL;
+            rx_conf.rx_nmempool = 0;
+            rx_conf.rx_deferred_start = 1;
+            // Setup the RX queue using the selected configuration
+            if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, &rx_conf, NULL)) != 0) {
+                fprintf(stderr, "[tcpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
+                goto error_4;
+            }
+        } else {
+
+            // get a descriptor to receive
+            u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
+            if (np == 0) {
+                printf("[udpsock] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                goto error_1;
+            }
+
+
+            // RX mempool. Must have 10239 as num_mbufs or it fails
+            bzero(pool_name, 64);
+            sprintf(pool_name, "rx_pool_%u", conn->rx_queue_id);
+            if ((conn->rx_hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
+                fprintf(stderr, "[tcpdpdk] failed to create mempool %s\n", pool_name);
+                goto error_2;
+            }
+
+            // Setup the RX queue using the selected configuration
+            if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, NULL, conn->rx_hdr_pool)) != 0) {
+                fprintf(stderr, "[tcpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
+                goto error_4;
+            }
         }
 
         // Start the queue
@@ -651,8 +688,8 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         }
 
         /* TX: data mempool. External memory, use the same config as before */
-        private_size    = sizeof(size_t);
-        data_room_size  = 0;
+        size_t private_size    = sizeof(size_t);
+        size_t data_room_size  = 0;
         sprintf(pool_name, "tx_data_pool_%u", conn->rx_queue_id);
         conn->tx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
             pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
@@ -660,11 +697,12 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
             fprintf(stderr, "[tcpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
             goto error_7;
         }      
-        mbp_priv =
+        struct rte_pktmbuf_pool_private *mbp_priv =
             (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->tx_data_pool);
         mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
 
         // try to connect to peers. If we fail, just ignore the peer.
+        at_store(&conn->connected_peers, 0, mo_rlx);
         for (int p = 0; p < n_peers; p++) {
             // Try to get the ARP replies; if no MAC, skip
             if (!be_tcp(0) && !peers[p].mac_set) {
@@ -703,11 +741,16 @@ error_6:
 error_5:
         rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
 error_4:
-        rte_mempool_free(conn->rx_data_pool);
+        if(conn->rx_data_pool) {
+            rte_mempool_free(conn->rx_data_pool);
+        }
 error_3:
         rte_mempool_free(conn->rx_hdr_pool);
 error_2:
         unregister_memory_area(addr, len, endpoint->page_size, port_id);
+        if (!zc_rx) {
+            nsn_ringbuf_enqueue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL); 
+        }
 error_1:
         nsn_ringbuf_enqueue_burst(free_queue_ids, &conn->rx_queue_id, sizeof(void*), 1, NULL);
         free(conn);
@@ -750,7 +793,7 @@ NSN_DATAPATH_CONN_MANAGER(tcpdpdk) {
         nb_err = tle_evq_get(conn->s_svc_sockfd.ereq, (const void**)data, MAX_PKT_BURST);
     
         if (nb_err) {
-            fprintf(stderr, "[tcpdpdk] error while checking incoming connections\n");
+            fprintf(stderr, "[tcpdpdk] connection was closed by peer\n");
             continue;
         }
 
@@ -764,7 +807,6 @@ NSN_DATAPATH_CONN_MANAGER(tcpdpdk) {
         struct tle_tcp_stream_cfg prm[MAX_PKT_BURST];
         nb_req = tle_tcp_stream_accept(conn->s_svc_sockfd.stream, client_streams, MAX_PKT_BURST);
         if (nb_req == 0) {
-            fprintf(stderr, "[tcpdpdk] accept: no clients found!\n");
             continue;
         }
 
@@ -789,7 +831,7 @@ NSN_DATAPATH_CONN_MANAGER(tcpdpdk) {
             struct sockaddr_in *client_addr = (struct sockaddr_in *)&addr.remote;
 
             for (int p = 0; p < n_peers; p++) {
-                if(rte_be_to_cpu_32(client_addr->sin_addr.s_addr) == peers[p].ip_net && 
+                if(client_addr->sin_addr.s_addr == peers[p].ip_net && 
                    rte_be_to_cpu_16(client_addr->sin_port) == ep->app_id) 
                 {
                     conn->s_sockfd[p] = (struct tldk_stream_handle){
@@ -923,11 +965,22 @@ NSN_DATAPATH_INIT(tcpdpdk) {
         !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
         !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) ||
         !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_CHECKSUM) ||
-        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) ||
-        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT))
+        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER)
+    )
     {
-        fprintf(stderr, "[error] NIC does not support one of the required offloads\n");
+        fprintf(stderr, "[tcpdpdk] ERROR: NIC does not support one of the required offloads\n");
         goto fail;
+    }
+
+    /* For the moment, we disable the zero-copy RX path. 
+     * That is because TLDK must be changed to properly handle incoming
+     * multi-segment DPDK mbufs. Once that is fixed, it will be sufficient
+     * to uncomment the following line to enable the zero-copy RX path.
+     */
+    if(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT) {
+        fprintf(stderr, "[tcpdpdk] NIC supports buffer split, but zero-copy receive is disabled\n");
+        // fprintf(stderr, "[error] NIC supports buffer split: zero-copy receive enabled\n");
+        // zc_rx = true;
     }
 
     ret = rte_eth_dev_get_mtu(port_id, &mtu);
@@ -1080,6 +1133,8 @@ NSN_DATAPATH_INIT(tcpdpdk) {
             fprintf(stderr, "[tcpdpdk] tcpdpdk_datapath_update() failed\n");
             goto fail_and_stop;
         }
+        struct tcpdpdk_ep *conn = (struct tcpdpdk_ep *)ep_in->ep->data;
+        be_tcp(conn->rx_queue_id);
     }
 
     return 0;
@@ -1095,21 +1150,169 @@ early_fail:
 }
 
 NSN_DATAPATH_TX(tcpdpdk) {
-    nsn_unused(endpoint);
-    nsn_unused(bufs);
+    struct rte_mbuf *tx_bufs[MAX_TX_BURST];
+    struct rte_mbuf *hdr_mbuf, *data_mbuf;
+    uint16_t nb_tx, nb_px;   
+    usize i, valid;
 
-    fprintf(stderr, "[tcpdpdk] datapath_tx not implemented yet\n");
-    sleep(1);
+    struct tcpdpdk_ep *conn = (struct tcpdpdk_ep *)endpoint->data;
+
+    if (buf_count > MAX_TX_BURST) {
+        fprintf(stderr, "[tcpdpdk] tx burst too large\n");
+        return -1;
+    }
+
+    // Here, we decide to break the stream abstraction of TCP. Assuming that we only send to INSANE DPDK-TCP peers,
+    // we just send the payload on the network. Because we control how packets are written on the network, we can
+    // avoid unwanted forms of batching (like it happens in the kernel), so we work message-by-message. However,
+    // this breaks compatibility with peers that use in-kernel TCP (INSANE-managed or not).
+    // To be compatible, we should send, for each packet, the size first, and then the payload. Possibly within the
+    // same Ethernet frame payload. For the moment, we don't do that.
+
+    // For each peer that is connected, send the burst of packets 
+    for(int p = 0; p < n_peers; p++) {
+        if (conn->s_sockfd[p].stream == NULL) {
+            continue;
+        }
+
+        valid = 0;
+        for (usize i = 0; i < buf_count; i++) {
+            // Prepare the payload - get the corresponding mbuf from the pool
+            data_mbuf = nsn_pktmbuf_alloc(conn->tx_data_pool, bufs[i].index);
+            data_mbuf->pkt_len = data_mbuf->data_len = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
+            if (nsn_unlikely(data_mbuf->data_len == 0 || data_mbuf->data_len > endpoint->io_bufs_size)) {
+                fprintf(stderr, "[tcpdpdk] Invalid packet size: %u. Discarding packet...\n", data_mbuf->data_len);
+                continue;
+            }  
+            
+            // Header len
+            struct rte_mbuf *tx_buf = rte_pktmbuf_alloc(conn->tx_hdr_pool);
+            if (!tx_buf) {
+                fprintf(stderr, "[tcpdpdk] failed to allocate tx mbuf\n");
+                continue;
+            }
+            tx_buf->data_len = tx_buf->pkt_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +
+                                                         sizeof(struct rte_tcp_hdr); // + 20; // 20 bytes of options            
+            // Chain the mbufs
+            rte_pktmbuf_chain(tx_buf, data_mbuf);
+
+            // Prepare the mbuf for TLDK processing
+            tx_buf->l2_len = sizeof(struct rte_ether_hdr);
+            tx_buf->l3_len = sizeof(struct rte_ipv4_hdr);
+            tx_buf->l4_len = sizeof(struct rte_tcp_hdr);
+            
+            // Move the data_off pointer to the beginning of the data, as required by TLDK
+            if (!rte_pktmbuf_adj(tx_buf, tx_buf->data_len)) {
+                fprintf(stderr, "[tcpdpdk] failed to move the data_off pointer\n");
+            }
+
+            tx_bufs[valid] = tx_buf;
+            valid++;
+        }
+
+        /* Send ALL the packet(s) to the TLDK stack */
+        uint16_t np_tx = 0;
+        do {
+            np_tx += tle_tcp_stream_send(conn->s_sockfd[p].stream, tx_bufs + np_tx, valid - np_tx);
+            be_tcp(conn->rx_queue_id);
+        } while(np_tx < valid);
+    }
     return buf_count;
 }
 
 NSN_DATAPATH_RX(tcpdpdk) {
-    nsn_unused(endpoint);
-    nsn_unused(bufs);
-    nsn_unused(buf_count);
 
-    // fprintf(stderr, "[tcpdpdk] datapath_rx not implemented yet\n");
-    return 0;
+    struct tcpdpdk_ep *conn = (struct tcpdpdk_ep *)endpoint->data;
+    struct rte_mbuf *rx_bufs[MAX_RX_BURST];
+    assert(*buf_count <= MAX_RX_BURST);
+
+    struct tldk_stream_handle* hdl;
+    char *error_data[MAX_PKT_BURST];
+    uint32_t ne_err, nb_rx;
+    usize valid = 0;
+
+    // To receive in zero-copy, we need to break the stream abstraction of TCP. INSANE DPDK-TCP operates
+    // per-packet, so no metadata, such as payload size, has to be sent before the payload. This is different
+    // from the kernel, where we need to send the payload size before the payload. We assume that NO BATCHING
+    // is done and that 1 TCP segment received corresponds to 1 INSANE application packet.
+
+    // Progress the backend
+    be_tcp(conn->rx_queue_id);
+
+    // In TCP we decide to receive 1 pkt per time from each peer.
+    usize buf_size;
+    for (int p = 0; p < n_peers; p++) {    
+
+        // If peer not connected, skip
+        if (conn->s_sockfd[p].stream == NULL) {
+            continue;
+        }
+
+        hdl = &conn->s_sockfd[p];
+
+        // Check for errors
+        if ((ne_err = tle_evq_get(hdl->ereq, (const void**)error_data, 1)) > 0 && ((uint64_t)error_data[0]) == 1) {
+            fprintf(stderr, "[tcpdpdk] connection closed by %s\n", peers[p].ip_str);
+            hdl->stream = NULL;
+            atomic_fetch_sub(&conn->connected_peers, 1);
+            continue;
+        }
+
+        // Process received packets for this stream
+        struct rte_mbuf *mbuf;
+        nb_rx = tle_tcp_stream_recv(hdl->stream, (struct rte_mbuf**)&rx_bufs, MAX_PKT_BURST);
+        for(uint16_t i = 0; i < nb_rx; i++) {
+            mbuf = rx_bufs[i];
+            
+            if(zc_rx) {
+                // This is for debug purpose! We should not receive packets with less than 2 segments
+                if(mbuf->nb_segs != 2) {
+                    fprintf(stderr, "[tcpdpdk] received packet with %u segments, expected 2\n", mbuf->nb_segs);
+                    rte_pktmbuf_free(mbuf);
+                    continue;
+                }
+
+                // Set the index (zero-copy receive)
+                bufs[valid].index = *(usize*)(mbuf->next + 1); 
+                usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[valid].index)->len;
+                *size = mbuf->next->data_len; //TODO: Is this ok?
+                
+                // Finalize the rx
+                *buf_count  = *buf_count - 1;
+                valid++;
+                
+                // Release the mbuf with custom free: DO NOT RE-ENQUEUE the index (the app will do that)
+                // This modified function only frees DPDK-specific resources, but not the INSANE-backed mbuf (the app will do that)
+                nsn_pktmbuf_free(mbuf);
+            } else {
+                // Get the packet payload
+                char* payload = rte_pktmbuf_mtod(mbuf, char*);
+                usize payload_size = mbuf->data_len;
+
+                // Get the NSN buffer memory
+                bufs[valid] = conn->pending_rx_buf;
+                char *data  = (char*)(endpoint->tx_zone + 1) + (bufs[valid].index * endpoint->io_bufs_size);    
+                usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[valid].index)->len;
+
+                // Copy the packet payload to the NSN buffer memory        
+                *size = payload_size;        
+                memcpy(data, payload, payload_size);
+                *buf_count  = *buf_count - 1;
+                valid++;
+
+                // Release the mbuf
+                rte_pktmbuf_free(mbuf);
+                
+                // Update the pending tx descriptor
+                u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
+                if (np == 0) {
+                    printf("[udpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                }
+            }
+        }
+    }
+
+    return (int)valid;
 }
 
 NSN_DATAPATH_DEINIT(tcpdpdk)
@@ -1132,6 +1335,10 @@ NSN_DATAPATH_DEINIT(tcpdpdk)
         }
         for(u16 i = 0; i < n_peers; i++) {
             if(conn->s_sockfd[i].stream) {
+                // Flush pending data
+                while(tle_tcp_stream_tx_pending(conn->s_sockfd[i].stream)) {
+                    be_tcp(conn->rx_queue_id);
+                }
                 res = tle_tcp_stream_close(conn->s_sockfd[i].stream);
                 be_tcp(conn->rx_queue_id);
                 conn->s_sockfd[i].stream = NULL;
