@@ -27,9 +27,8 @@ fi
 DPDK=`pkg-config --cflags --libs libdpdk --static`
 
 cd build
-$CC $CFLAGS $LDFLAGS ../ring_tx.c $DEFINES -o ringtx
-$CC $CFLAGS $LDFLAGS ../ring_rx.c $DEFINES -o ringrx
-
-$CC $CFLAGS $LDFLAGS ../dpdk_0cxm.c -mssse3 $DEFINES $DPDK -o dpdk-0cxm
+$CC $CFLAGS $LDFLAGS ../ring_tx.c   -I../../src -I../../include/         $DEFINES       -o ringtx
+$CC $CFLAGS $LDFLAGS ../ring_rx.c   -I../../src -I../../include/         $DEFINES       -o ringrx
+# $CC $CFLAGS $LDFLAGS ../dpdk_0cxm.c -I../../src -I../../include/ -mssse3 $DEFINES $DPDK -o dpdk-0cxm
 
 cd ..

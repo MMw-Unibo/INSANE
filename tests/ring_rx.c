@@ -7,13 +7,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "../src/nsn_memory.c"
-#include "../src/nsn_string.c"
-#include "../src/nsn_log.h"
-#include "../src/nsn_ringbuf.h"
-#include "../src/nsn_ringbuf.c"
-#include "../src/nsn_os.h"
-#include "../src/nsn_os_linux.c"
+#include "base/nsn_memory.c"
+#include "base/nsn_string.c"
+#include "common/nsn_log.h"
+#include "common/nsn_ringbuf.h"
+#include "common/nsn_ringbuf.c"
+#include "base/nsn_os.h"
+#include "base/nsn_os_linux.c"
 
 static volatile bool g_running = true;
 
@@ -78,9 +78,9 @@ int main(int argc, char *argv[]) {
     u64 data[64];
     while(g_running) {
         n = nsn_ringbuf_dequeue_burst(rb, &data, sizeof(u64), rxburst, NULL);
-        if (n!=rxburst && n > 0) {
-            fprintf(stderr, "Only dequeued %u\n", n);
-        }  
+        // if (n!=rxburst && n > 0) {
+        //     fprintf(stderr, "Only dequeued %u\n", n);
+        // }  
         if (n>0) {
             printf("Dequeued %u: ", n);
             for (u32 i = 0; i < n; i++) {
