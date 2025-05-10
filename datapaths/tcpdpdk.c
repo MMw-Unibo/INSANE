@@ -979,7 +979,7 @@ NSN_DATAPATH_INIT(tcpdpdk) {
      */
     if(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT) {
         fprintf(stderr, "[tcpdpdk] NIC supports buffer split, but zero-copy receive is disabled\n");
-        // fprintf(stderr, "[error] NIC supports buffer split: zero-copy receive enabled\n");
+        // fprintf(stderr, "[tcpdpdk] NIC supports buffer split: zero-copy receive enabled\n");
         // zc_rx = true;
     }
 
