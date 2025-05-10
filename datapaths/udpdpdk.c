@@ -521,6 +521,8 @@ NSN_DATAPATH_INIT(udpdpdk)
     if(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT) {
         fprintf(stderr, "[udpdpdk] NIC supports buffer split: zero-copy receive enabled\n");
         zc_rx = true;
+    } else {
+        fprintf(stderr, "[udpdpdk] NIC does not support buffer split: zero-copy receive disabled\n");
     }
 
     socket_id = rte_eth_dev_socket_id(port_id);    
