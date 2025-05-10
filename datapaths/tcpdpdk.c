@@ -642,7 +642,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
             // get a descriptor to receive
             u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
             if (np == 0) {
-                printf("[udpsock] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                printf("[tcpdpdk] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
                 goto error_1;
             }
 
