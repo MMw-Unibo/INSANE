@@ -40,6 +40,9 @@ ninja
 sudo ninja install
 sudo ldconfig
 
+# Make it seen by pkg-config
+export PKG_CONFIG_PATH=$INSTALL_DIR/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
+
 # Cleanup.
 popd
 rm -rf $HOME/tmp/dpdk
