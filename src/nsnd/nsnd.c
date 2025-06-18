@@ -960,6 +960,8 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
             stream->ep.io_bufs_size = mem_cfg.io_buffer_size;            
             stream->ep.io_bufs_count = mem_cfg.io_buffer_pool_size;
             stream->ep.page_size = (1ULL << 21); //2MB TODO: This must become a nsnd param, used also for alloc.
+            stream->ep.data = NULL; // will be set by the plugin update function
+            stream->ep.data_size = 0; // will be set by the plugin update function
             
             // Add the stream to the plugin
             nsn_os_mutex_lock(&plugin->streams_lock);
