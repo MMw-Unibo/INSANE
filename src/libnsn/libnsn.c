@@ -591,6 +591,7 @@ nsn_create_source(nsn_stream_t stream, uint32_t source_id) {
     sources[src_idx].stream = stream;
     n_src++;    
 
+    log_info("created source %u\n", source_id);
     log_trace("created source %u in slot %u with is_active=%d\n", source_id, src_idx, sources[src_idx].is_active);
 
 exit:

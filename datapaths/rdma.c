@@ -39,9 +39,6 @@
 // For RoCE, it should be less than the minimum MTU
 // on the overall data path (usually 1500)
 #define IB_MTU IBV_MTU_1024
-// App-defined WR id. I use only one here, but the ping-pong example
-// used this field to distinguish between ping/pong messages.
-#define TESTRDMA_WRID 2509
 // Max QP
 #define MAX_QP 256
 
@@ -56,6 +53,7 @@ struct conn_state {
 
 // ------------- Plugin specific constants and structures ----------------
 #define MAX_PARAM_STRING_SIZE 2048
+#define MAX_TX_BURST 64
 
 struct arp_peer {
     char* ip_str; // IP in string form
@@ -79,44 +77,22 @@ struct rdma_ep {
     int     sock_svc_fd; // Server socket file descriptor
 };
 //----------------------------------------------------------------------------------------------
-// Handle user work request
-static inline int parse_single_wc(struct ibv_wc *wc) {
+// Handle user work request. Returns the buffer_id of the recv on success, or -1 on failure. If successful, it sets the size of the data in the proper memory area.
+static inline int parse_single_wc(struct ibv_wc *wc, nsn_endpoint_t* ep) {
     if (wc->status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "Failed status %s (%d) for wr_id %d\n", ibv_wc_status_str(wc->status), wc->status,
+        fprintf(stderr, "[rdma] failed WC: %s (%d) for wr_id %d\n", ibv_wc_status_str(wc->status), wc->status,
                   (int)wc->wr_id);
         return -1;
     }
 
-    // Check the ID
-    if ((int)wc->wr_id != TESTRDMA_WRID) {
-        fprintf(stderr, "Completion for unknown wr_id %d\n", (int)wc->wr_id);
-        return -1;
-    }
-
     // Case 1 - Immediate data
-    if (wc->opcode == IBV_WC_RECV) {
-
+    if (wc->opcode == IBV_WC_RECV || wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
         // Retrieve data len
-        // size_t len = wc->byte_len;
-
-        // Do something with the received data
-        // printf("Received data with length %u\n", len);
-        // fflush(stdout);
-
-        // Print data
-        // write(1, "Received data: ", 15);
-        // write(1, mr->addr, len);
-        // write(1, "\n", 1);
-        return 0;
-
-    }
-    // Case 2 - Recv value
-    else if (wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM)
-    {
-        fprintf(stderr, "Reception of data with immediate not supported yet\n");
-        return -1;
+        usize *size = &((nsn_meta_t*)(ep->tx_meta_zone + 1) + wc->wr_id)->len;
+        *size = wc->byte_len;
+        return wc->wr_id; // Returns the buffer_id
     } else {
-        fprintf(stderr, "Invalid opcode received: %d\n", wc->opcode);
+        fprintf(stderr, "[rdma] invalid WC opcode received: %d\n", wc->opcode);
         return -1;
     }
 }
@@ -201,7 +177,7 @@ void wire_gid_to_gid(const char *wgid, union ibv_gid *gid) {
 }
 
 //----------------------------------------------------------------------------------------------
-struct conn_state client_exch_dest(const char *servername, int port,
+struct conn_state client_exch_dest(const char *server_ip, int port, char* client_ip,
                                   const struct conn_state *local_ep) {
     struct addrinfo *res, *t;
     struct addrinfo   hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
@@ -212,41 +188,56 @@ struct conn_state client_exch_dest(const char *servername, int port,
     struct conn_state rem_dest;
     char              gid[33];
 
-    if (asprintf(&service, "%d", port) < 0) {
-        return (struct conn_state){0};
-    }
-
-    n = getaddrinfo(servername, service, &hints, &res);
-    if (n < 0) {
-        fprintf(stderr, "[rdma] %s for %s:%d\n", gai_strerror(n), servername, port);
-        free(service);
-       return (struct conn_state){0};
-    }
-
-    for (t = res; t; t = t->ai_next) {
-        sockfd = socket(t->ai_family, t->ai_socktype, t->ai_protocol);
-        if (sockfd >= 0) {
-            if (!connect(sockfd, t->ai_addr, t->ai_addrlen)) {
-                break;
-            }
-            close(sockfd);
-            sockfd = -1;
-        }
-    }
-
-    freeaddrinfo(res);
-    free(service);
-
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
-        fprintf(stderr, "Couldn't connect to %s:%d\n", servername, port);
+        fprintf(stderr, "[rdma] couldn't connect to %s:%d\n", server_ip, port);
         return (struct conn_state){0};
     }
+
+    int reuseaddr = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr, sizeof(reuseaddr)) == -1) {
+        close(sockfd);
+        fprintf(stderr, "[rdma] setsockopt() failed: %s\n", strerror(errno));
+        return (struct conn_state){0};
+    }
+
+    int reuseport = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &reuseport, sizeof(reuseaddr)) == -1) {
+        close(sockfd);
+        fprintf(stderr, "[rdma] setsockopt() failed: %s\n", strerror(errno));
+        return (struct conn_state){0};
+    }
+
+    // Local endpoint info - must ensure the right client port
+    struct sockaddr_in sock_addr;
+    memory_zero_struct(&sock_addr);
+    sock_addr.sin_family      = AF_INET;
+    sock_addr.sin_port        = htons(port);
+    sock_addr.sin_addr.s_addr = inet_addr(client_ip);
+    if (bind(sockfd, (struct sockaddr *)&sock_addr, sizeof(sock_addr)) == -1) {
+        close(sockfd);
+        fprintf(stderr, "[rdma] bind() failed: %s\n", strerror(errno));
+        return (struct conn_state){0};
+    }
+
+    // Try to connect to peer. If fail, the conn manager will retry
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr.s_addr = inet_addr(server_ip);
+
+    int ret = connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if(ret < 0) {
+        fprintf(stderr, "[rdma] connect() failed: %s (%d)\n", strerror(errno), errno);
+        close(sockfd);
+        return (struct conn_state){0};
+    }    
 
     // Send local address to the remote side
     gid_to_wire_gid(&local_ep->gid, gid);
     sprintf(msg, "%04x:%06x:%06x:%s", local_ep->lid, local_ep->qpn, local_ep->psn, gid);
     if (write(sockfd, msg, sizeof msg) != sizeof msg) {
-        fprintf(stderr, "Couldn't send local address\n");
+        fprintf(stderr, "[rdma] couldn't send local address\n");
         goto out;
     }
 
@@ -254,8 +245,7 @@ struct conn_state client_exch_dest(const char *servername, int port,
     if (read(sockfd, msg, sizeof msg) != sizeof msg ||
         write(sockfd, "done", sizeof "done") != sizeof "done")
     {
-        perror("client read/write");
-        fprintf(stderr, "Couldn't read/write remote address\n");
+        fprintf(stderr, "[rdma] couldn't read/write remote address: %s\n", strerror(errno));
         goto out;
     }
 
@@ -268,26 +258,18 @@ out:
 }
 
 //----------------------------------------------------------------------------------------------
-struct conn_state server_exch_dest(int svc_sock, int ib_port, enum ibv_mtu mtu, int sl, int sgid_idx,
+struct conn_state server_exch_dest(int connfd, int ib_port, enum ibv_mtu mtu, int sl, int sgid_idx,
                                   struct ibv_qp *qp, const struct conn_state *local_ep) {
     char msg[sizeof "0000:000000:000000:00000000000000000000000000000000"];
-    int  n, connfd;
+    int  n;
     char gid[33];
-
-    connfd = accept(svc_sock, NULL, NULL);
-    if (connfd < 0) {
-        fprintf(stderr, "[rdma] accept() failed\n");
-        return (struct conn_state){0};
-    }
 
     struct conn_state rem_dest = (struct conn_state){0};
 
     // Read remote address
     n = read(connfd, msg, sizeof msg);
     if (n != sizeof msg) {
-        perror("server read");
-        fprintf(stderr, "[rdma] %d/%d: Couldn't read remote address\n", n, (int)sizeof msg);
-        close(connfd);
+        fprintf(stderr, "[rdma] %d/%d: Couldn't read remote address: %s\n", n, (int)sizeof msg, strerror(errno));
         return (struct conn_state){0};
     }
 
@@ -296,8 +278,7 @@ struct conn_state server_exch_dest(int svc_sock, int ib_port, enum ibv_mtu mtu, 
     wire_gid_to_gid(gid, &rem_dest.gid);
 
     if (connect_ctx(ib_port, local_ep->psn, mtu, sl, sgid_idx, qp, &rem_dest)) {
-        fprintf(stderr, "Couldn't connect to remote QP\n");
-        close(connfd);
+        fprintf(stderr, "[rdma] couldn't connect to remote QP\n");
         return (struct conn_state){0};
     }
 
@@ -308,23 +289,20 @@ struct conn_state server_exch_dest(int svc_sock, int ib_port, enum ibv_mtu mtu, 
     if (write(connfd, msg, sizeof msg) != sizeof msg ||
         read(connfd, msg, sizeof msg) != sizeof "done")
     {
-        fprintf(stderr, "Couldn't send/recv local address\n");
-        close(connfd);
+        fprintf(stderr, "[rdma] couldn't send/recv local address\n");
         return (struct conn_state){0};
     }
-
-    close(connfd);
     return rem_dest;
 }
 //----------------------------------------------------------------------------------------------
 // Wrap the code to post a receive request
-static inline int post_recv(char *addr, uint32_t length, struct ibv_qp *qp, struct ibv_mr *mr) {
+static inline int post_recv(uint64_t wr_id, char *addr, uint32_t length, struct ibv_qp *qp, struct ibv_mr *mr) {
     // TODO: check that addr + len is within the MR boundary
     struct ibv_sge list    = {.addr = (uint64_t)addr, .length = length, .lkey = mr->lkey};
     int            num_sge = 1;
 
     struct ibv_recv_wr wr = {
-        .wr_id   = TESTRDMA_WRID, /* User defined WR ID */
+        .wr_id   = wr_id,         /* User defined WR ID: here, the buffer index */
         .next    = NULL,          /* Pointer to next WR in list, NULL if last WR */
         .sg_list = &list,         /* Pointer to the s/g array */
         .num_sge = num_sge,       /* Size of the s/g array */
@@ -334,7 +312,7 @@ static inline int post_recv(char *addr, uint32_t length, struct ibv_qp *qp, stru
 
     for (i = 0; i < num_sge; ++i) {
         if (ibv_post_recv(qp, &wr, &bad_wr)) {
-            perror("post send");
+            fprintf(stderr, "[rdma] post send error: %s\n", strerror(errno));
             break;
         }
     }
@@ -345,7 +323,7 @@ static inline int post_recv(char *addr, uint32_t length, struct ibv_qp *qp, stru
 //----------------------------------------------------------------------------------------------
 // Wrap the code to post a send request
 // Send flags: IBV_SEND_SIGNALED
-static inline int post_send(char *addr, uint32_t length, int send_flags, struct ibv_qp_ex *qpx, struct ibv_mr *mr) {
+static inline int post_send(char *addr, uint32_t length, int send_flags, struct ibv_qp_ex *qpx, struct ibv_mr *mr, uint64_t wr_id) {
     struct ibv_sge list    = {.addr = (uint64_t)addr, .length = length, .lkey = mr->lkey};
     
     /* NEW API */
@@ -357,7 +335,7 @@ static inline int post_send(char *addr, uint32_t length, int send_flags, struct 
     // Start critical section
     ibv_wr_start(qpx);
 
-    qpx->wr_id    = TESTRDMA_WRID;
+    qpx->wr_id    = wr_id;
     qpx->wr_flags = send_flags;
     ibv_wr_send(qpx);
     ibv_wr_set_sge(qpx, list.lkey, list.addr, list.length);
@@ -425,6 +403,7 @@ exit:
     return qp;
 clean_qp:
     ibv_destroy_qp(qp);
+    qp = NULL;
     return NULL;
 }
 
@@ -443,6 +422,7 @@ static inline int prepare_cq_qp(struct ibv_context *context, struct rdma_conn *c
     if (!conn_p->qp) {
         printf("[rdma] cannot create a Queue Pair (QP) for peer %s\n", peer->ip_str);
         ibv_destroy_cq(conn_p->cq);
+        conn_p->cq = NULL;
         return -1;
     }
 
@@ -458,22 +438,28 @@ static inline int prepare_cq_qp(struct ibv_context *context, struct rdma_conn *c
     if (ibv_query_port(context, IB_PORT, &ib_port_info)) {
         fprintf(stderr, "[rdma] couldn't get port info for peer %s\n", peer->ip_str);
         ibv_destroy_cq(conn_p->cq);
+        conn_p->cq = NULL;
         ibv_destroy_qp(conn_p->qp);
+        conn_p->qp = NULL;
         return -1;
     }
     conn_p->local_state.lid = ib_port_info.lid;
     if (ib_port_info.link_layer != IBV_LINK_LAYER_ETHERNET && !conn_p->local_state.lid) {
         fprintf(stderr, "[rdma] couldn't get local LID for peer %s\n", peer->ip_str);
         ibv_destroy_cq(conn_p->cq);
+        conn_p->cq = NULL;
         ibv_destroy_qp(conn_p->qp);
+        conn_p->qp = NULL;
         return -1;
     }
     // For RoCE:
     if (ibv_query_gid(context, IB_PORT, conn_p->local_state.gidx, &conn_p->local_state.gid)) {
         fprintf(stderr, "[rdma] can't read sgid of index %d for peer %s\n", conn_p->local_state.gidx, peer->ip_str);
         ibv_destroy_cq(conn_p->cq);
+        conn_p->cq = NULL;
         ibv_destroy_qp(conn_p->qp);
-        return -1;;
+        conn_p->qp = NULL;
+        return -1;
     }
 
     conn_p->local_state.qpn = conn_p->qp->qp_num;
@@ -551,9 +537,11 @@ NSN_DATAPATH_UPDATE(rdma) {
             struct rdma_conn *conn_p = &conn->conns[p];
             if (conn_p->cq) {
                 ibv_destroy_cq(conn_p->cq);
+                conn_p->cq = NULL;
             }
             if (conn_p->qp) {
                 ibv_destroy_qp(conn_p->qp);
+                conn_p->qp = NULL;
             }
         }
         
@@ -617,11 +605,13 @@ NSN_DATAPATH_UPDATE(rdma) {
             } 
 
             // Exchange QP info with the sink
-            conn_p->remote_state = client_exch_dest(peers[p].ip_str, endpoint->app_id, &conn_p->local_state);
+            conn_p->remote_state = client_exch_dest(peers[p].ip_str, endpoint->app_id, local_ip, &conn_p->local_state);
             if (conn_p->remote_state.psn == 0 && conn_p->remote_state.qpn == 0) {
                 fprintf(stderr, "[rdma] failed to exchange remote QP info with peer %s\n", peers[p].ip_str);
                 ibv_destroy_cq(conn_p->cq);
+                conn_p->cq = NULL;
                 ibv_destroy_qp(conn_p->qp);
+                conn_p->qp = NULL;
                 continue;
             }
 
@@ -629,7 +619,9 @@ NSN_DATAPATH_UPDATE(rdma) {
             if (connect_ctx(IB_PORT, conn_p->local_state.psn, IB_MTU, conn_p->local_state.sl, conn_p->local_state.gidx,  conn_p->qp, &conn_p->remote_state)) {
                 fprintf(stderr, "[rdma] failed to move QP to RTS\n");
                 ibv_destroy_cq(conn_p->cq);
+                conn_p->cq = NULL;
                 ibv_destroy_qp(conn_p->qp);
+                conn_p->qp = NULL;
                 continue;
             }
 
@@ -661,6 +653,22 @@ NSN_DATAPATH_UPDATE(rdma) {
             if (conn->sock_svc_fd >= 0) {
                 n = 1;
                 setsockopt(conn->sock_svc_fd, SOL_SOCKET, SO_REUSEADDR, &n, sizeof n);
+
+                int flags = fcntl(conn->sock_svc_fd, F_GETFL, 0);
+                if (flags == -1) {
+                    fprintf(stderr, "[tcpsock] fcntl() failed: %s\n", strerror(errno));
+                    close(conn->sock_svc_fd);
+                    conn->sock_svc_fd = -1;
+                    goto server_fail;
+                }
+                flags |= O_NONBLOCK;
+                if (fcntl(conn->sock_svc_fd, F_SETFL, flags) == -1) {
+                    fprintf(stderr, "[tcpsock] fcntl() failed: %s\n", strerror(errno));
+                    close(conn->sock_svc_fd);
+                    conn->sock_svc_fd = -1;
+                    goto server_fail;
+                }   
+
                 if (!bind(conn->sock_svc_fd, t->ai_addr, t->ai_addrlen))
                     break;
                 close(conn->sock_svc_fd);
@@ -677,15 +685,51 @@ NSN_DATAPATH_UPDATE(rdma) {
         // Listen & Accept
         listen(conn->sock_svc_fd, 1);
 
+        // Prepare a number of receive request for each connected peer (rx-depth of QP is the limit)
+        nsn_buf_t buf;
+        for (int p = 0; p < n_peers; p++) {
+
+            // only if the peer is connected
+            if (conn->conns[p].remote_state.psn == 0 && conn->conns[p].remote_state.qpn == 0) {
+                continue;
+            }
+
+            for (int i = 0; i < rx_depth; ++i) {
+                struct rdma_conn *conn_p = &conn->conns[p];
+                if (conn_p->remote_state.psn == 0 && conn_p->remote_state.qpn == 0) {
+                    continue;
+                }          
+
+                // dequeue a free buffer
+                u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &buf, sizeof(buf), 1, NULL);
+                if (np == 0) {
+                    printf("[rdma] no free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                    continue;
+                }
+
+                // use the buffer to post a receive request
+                char  *addr       = (char*)(endpoint->tx_zone + 1) + (buf.index * endpoint->io_bufs_size);    
+                uint32_t max_size = (uint32_t)endpoint->io_bufs_size;
+
+                int nb_rx = post_recv(buf.index, addr, max_size, conn_p->qp, conn->mr);
+                if (nb_rx < 1) {
+                    fprintf(stderr, "[rdma] couldn't post receive %d (%d)\n", i, nb_rx);
+                    continue;
+                }
+            }
+        }
+
         return 0;
 server_fail:
         for(int p = 0; p < n_peers; p++) {
             struct rdma_conn *conn_p = &conn->conns[p];      
             if (conn_p->cq) {
                 ibv_destroy_cq(conn_p->cq);
+                conn_p->qp = NULL;
             }
             if (conn_p->qp) {
                 ibv_destroy_qp(conn_p->qp);
+                conn_p->qp = NULL;
             }
         }
 clean_pd:
@@ -721,24 +765,63 @@ NSN_DATAPATH_CONN_MANAGER(rdma)
             continue;
         }
 
-        for (int p = 0; p < n_peers; p++) {
-            struct rdma_conn *conn_p = &conn->conns[p];
-            if (conn_p->remote_state.psn == 0 && conn_p->remote_state.qpn == 0) {
-                // Not connected to this peer yet, proceed with creation of server-side QP
-                if (prepare_cq_qp(context, conn_p, &peers[p], conn->pd, rx_depth, tx_depth) < 0) {
-                    fprintf(stderr, "[rdma] prepare_cq_qp() failed for peer %s\n", peers[p].ip_str);
-                    continue;
-                }              
-                struct conn_state rem = server_exch_dest(conn->sock_svc_fd, IB_PORT, IB_MTU, conn_p->local_state.sl, conn_p->local_state.gidx, conn_p->qp, &conn_p->local_state);
-                if (rem.gid.raw[0] == 0 && rem.qpn == 0 && rem.psn == 0) {
-                    fprintf(stderr, "[rdma] failed to exchange remote QP info with the source\n");
-                    continue;
-                } else {
+        // Accept incoming connections
+        bool found;
+        int connfd;
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        while((connfd = accept(conn->sock_svc_fd, (struct sockaddr *)&client_addr, &addr_len)) > 0) {
+            found = false;
+            for (int p = 0; p < n_peers; p++) {
+                // connection was for peer p
+                if(client_addr.sin_addr.s_addr == peers[p].ip_net && client_addr.sin_port == htons(ep->app_id)) {
+                    found = true;
+                    struct rdma_conn *conn_p = &conn->conns[p];
+
+                    if (prepare_cq_qp(context, conn_p, &peers[p], conn->pd, rx_depth, tx_depth) < 0) {
+                        fprintf(stderr, "[rdma] prepare_cq_qp() failed for peer %s\n", peers[p].ip_str);
+                        close(connfd);
+                        continue;
+                    }              
+
+                    struct conn_state rem = server_exch_dest(connfd, IB_PORT, IB_MTU, conn_p->local_state.sl, conn_p->local_state.gidx, conn_p->qp, &conn_p->local_state);
+                    close(connfd);
+                    if (rem.gid.raw[0] == 0 && rem.qpn == 0 && rem.psn == 0) {
+                        fprintf(stderr, "[rdma] failed to exchange remote QP info with the source\n");
+                        continue;
+                    }
                     conn_p->remote_state = rem;
                     atomic_fetch_add(&conn->connected_peers, 1);
                     fprintf(stderr, "[rdma] Connected to peer %s. Remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x\n",
                             peers[p].ip_str, conn_p->remote_state.lid, conn_p->remote_state.qpn, conn_p->remote_state.psn);
-                }       
+                    
+                    // Post a number of receive requests for the peer 
+                    nsn_buf_t buf;
+                    for (int i = 0; i < rx_depth; ++i) {
+                        // dequeue a free buffer
+                        u32 np = nsn_ringbuf_dequeue_burst(ep->free_slots, &buf, sizeof(buf), 1, NULL);
+                        if (np == 0) {
+                            printf("[rdma] no free slots to receive from ring %p [%u]\n", ep->free_slots, nsn_ringbuf_count(ep->free_slots));
+                            continue;
+                        }
+
+                        // use the buffer to post a receive request
+                        char  *addr  = (char*)(ep->tx_zone + 1) + (buf.index * ep->io_bufs_size);    
+                        uint32_t max_size = (uint32_t)ep->io_bufs_size;
+
+                        int nb_rx = post_recv(buf.index, addr, max_size, conn_p->qp, conn->mr);
+                        if (nb_rx < 1) {
+                            fprintf(stderr, "[rdma] couldn't post receive %d (%d)\n", i, nb_rx);
+                            continue;
+                        }
+                    }
+                    break;
+                }
+            }
+            if (!found) {
+                close(connfd);
+                fprintf(stderr, "[rdma] received connection from unknown peer %s:%d. Closed.\n",
+                        inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
             }
         }
     }
@@ -775,24 +858,40 @@ NSN_DATAPATH_INIT(rdma)
     local_ip_net = inet_addr(local_ip);
     fprintf(stderr, "[rdma] parameter: ip: %s\n", local_ip);
 
-    // RDMA queue depth
-    tx_depth = 256;
-    rx_depth = 256;
+    // 1c) Retrieve the device name from the list of parameters
+    string_t ib_dev_name;
+    ib_dev_name.data = mem_arena_push(scratch.arena, MAX_PARAM_STRING_SIZE);
+    ib_dev_name.len = 0;
+    ret = nsn_config_get_string_from_list(&ctx->params, str_lit("device"), &ib_dev_name);
+    if (ret < 0) {
+        fprintf(stderr, "[rdma] nsn_config_get_string_from_list() failed: no option \"device\" found\n");
+        goto early_fail;
+    }
+    const char *ib_dev_name_cstr = to_cstr(ib_dev_name);
+    fprintf(stderr, "[rdma] parameter: device: %s\n", ib_dev_name_cstr);
 
     /* Get RDMA device info and print them */
     int                 num_devices;
     struct ibv_device **dev_list = ibv_get_device_list(&num_devices);
     if (!dev_list) {
-        fprintf(stderr, "Failed to get IB devices list");
+        fprintf(stderr, "[rdma] failed to get IB devices list");
         goto early_fail;
     }
-    fprintf(stderr, "Found %d RDMA devices\n", num_devices);
+    fprintf(stderr, "[rdma] found %d RDMA devices\n", num_devices);
 
-    // TODO: Compare the device with the one specified in the config
-    // Get the first device on the list
-    ib_dev           = dev_list[0];
-    const char *name = ibv_get_device_name(ib_dev);
-    fprintf(stderr, "Using the first device: %s\n", name);
+    // Find the requested device from the available devices list
+    ib_dev = NULL;
+    for (int i = 0; i < num_devices; i++) {
+        if (!strcmp(ibv_get_device_name(dev_list[i]), ib_dev_name_cstr)) {
+            ib_dev = dev_list[i];
+            fprintf(stderr, "Found RDMA device %s\n", ibv_get_device_name(ib_dev));
+            break;
+        }
+    }
+    if (!ib_dev) {
+        fprintf(stderr, "[rdma] failed to find requested RDMA device %s\n", ib_dev_name_cstr);
+        goto early_rdma_fail;
+    }
 
     /* Initialize the IB context by opening the device */
     context = ibv_open_device(ib_dev);
@@ -800,6 +899,10 @@ NSN_DATAPATH_INIT(rdma)
         printf("cannot get context for %s\n", ibv_get_device_name(ib_dev));
         goto early_rdma_fail;
     }
+
+    // RDMA queue depth
+    tx_depth = 256;
+    rx_depth = 256;
 
     // Setup the communication channels to the peers
     ep_initializer_t *ep_in;
@@ -825,18 +928,114 @@ early_fail:
 
 NSN_DATAPATH_TX(rdma)
 {
-    nsn_unused(endpoint);
-    nsn_unused(bufs);
-    return buf_count;
+    int nb_tx = 0;
+    int ret;
+    struct ibv_wc wc;
+
+    if (buf_count > MAX_TX_BURST) {
+        fprintf(stderr, "[tcpdpdk] tx burst too large\n");
+        return -1;
+    }
+    
+    struct rdma_ep *conn = (struct rdma_ep *)endpoint->data;
+    for(int p = 0; p < n_peers; p++) {
+        //if the peer is not connected, skip
+        struct rdma_conn *conn_p = &conn->conns[p];
+        if (conn_p->remote_state.psn == 0 && conn_p->remote_state.qpn == 0) {
+            continue;
+        }
+
+        for (usize i = 0; i < buf_count; i++) {
+
+            char* data = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size); 
+            usize size = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len; 
+
+            if(post_send(data, size, IBV_SEND_SIGNALED, conn_p->qpx, conn->mr, bufs[i].index) < 0) {
+                fprintf(stderr, "[rdma] post_send() failed for buf %d\n", (int)bufs[i].index);
+                continue;
+            }
+            nb_tx++;
+
+            // Get SEND completion
+            // This slows down performance but ensures the receiver
+            // confirms the reception of all data
+            // Alternative: do not use SEND_SIGNALED and do not poll for completions.
+            // But if you use SEND_SIGNALED, you must poll for completions.
+            do {
+                ret = ibv_poll_cq(conn_p->cq, 1, &wc);
+                if (ret < 0) {
+                    fprintf(stderr, "[rdma] failed polling cq: %d\n", ret);
+                    continue;
+                }
+            } while (ret < 1);
+            if (wc.status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "[rdma] failed WR: %s (%d) for wr_id %d\n", ibv_wc_status_str(wc.status),
+                          wc.status, (int)wc.wr_id);
+                continue;
+            }
+            
+        }
+
+    }
+
+    return nb_tx;
 }
 
 NSN_DATAPATH_RX(rdma)
 {
-    nsn_unused(endpoint);
-    nsn_unused(bufs);
-    nsn_unused(buf_count);
+    struct ibv_wc wc;
+    int ret, nb_rx, valid;
 
-    return 0;
+    struct rdma_ep *conn = (struct rdma_ep *)endpoint->data;
+    valid = 0;
+
+    // We attempt to receive once per peer (1) 
+    for (int p = 0; p < n_peers; p++) {
+        struct rdma_conn *conn_p = &conn->conns[p];
+        if (conn_p->remote_state.psn == 0 && conn_p->remote_state.qpn == 0) {
+            // Not connected to this peer yet, skip
+            continue;
+        }
+
+        // Check if there are any completions in the CQ
+        ret = ibv_poll_cq(conn_p->cq, 1, &wc);
+        if (ret < 0) {
+            fprintf(stderr, "[rdma] ibv_poll_cq() failed: %s\n", strerror(errno));
+            return -1;
+        } else if (ret == 0) {
+            // No completions, skip
+            continue;
+        }
+
+        // Parse the WC to get the incoming buf_id (coded in wr_id)
+        if ((ret = parse_single_wc(&wc, endpoint)) < 0) {
+            fprintf(stderr, "[rdma] failed to parse WC\n");
+            continue;
+        }
+        
+        // The size is set in the parse_single_wc() function, if successful.
+        // Here we just pass the buf_id returned by that funcion.
+        bufs[valid].index = ret;
+        *buf_count  = *buf_count - 1;
+        valid++;
+        
+        // Post receive request
+        nsn_buf_t buf;
+        u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &buf, sizeof(buf), 1, NULL);
+        if (np == 0) {
+            printf("[rdma] no free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+            continue;
+        }
+        char  *addr  = (char*)(endpoint->tx_zone + 1) + (buf.index * endpoint->io_bufs_size);    
+        uint32_t max_size = (uint32_t)endpoint->io_bufs_size;
+        int nb_rx = post_recv(buf.index, addr, max_size, conn_p->qp, conn->mr);
+        if (nb_rx < 1) {
+            fprintf(stderr, "[rdma] couldn't post receive (%d)\n", nb_rx);
+            continue;
+        }      
+    }
+
+    return valid;
 }
 
 NSN_DATAPATH_DEINIT(rdma)
