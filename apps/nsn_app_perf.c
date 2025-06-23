@@ -57,6 +57,7 @@ typedef struct test_config {
     uint32_t       payload_size;
     int            qos_datapath;
     int            qos_reliability;
+    int            qos_consumption;
     int64_t        app_source_id;
     uint64_t       sleep_time;
     uint64_t       max_msg;
@@ -90,6 +91,7 @@ void usage(int argc, char *argv[]) {
            "-n: max messages to send (0 = no limit)           \n"
            "-q: datapath QoS. Can be fast or slow             \n"
            "-r: reliability QoS. Can be reliable or unreliable\n"
+           "-c: consumption QoS. Can be poll or low           \n"
            "-a: specify app-defined source id                 \n"
            "-t: configure sleep time (s) in send              \n",
            argv[0]);
@@ -277,6 +279,7 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
     config->payload_size    = strlen(MSG) + 1;
     config->qos_datapath    = NSN_QOS_DATAPATH_DEFAULT;
     config->qos_reliability = NSN_QOS_RELIABILITY_UNRELIABLE;
+    config->qos_consumption = NSN_QOS_CONSUMPTION_POLL;
     config->app_source_id   = 0;
     config->sleep_time      = 0;
     config->max_msg         = 0;
@@ -348,7 +351,21 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
         if (!strncmp(argv[i], "-r", 2) || !strncmp(argv[i], "--qos-rel", 8)) {
             config->qos_reliability = NSN_QOS_RELIABILITY_RELIABLE;
             continue;
-        }        
+        }
+        // QoS Consumption
+        if (!strncmp(argv[i], "-c", 2) || !strncmp(argv[i], "--qos-consumption", 17)) {
+            ENSURE_ONE_MORE_ARGUMENT(argc, argv, i, "--qos-consumption")
+            i++;
+            if (!strcmp(argv[i], "poll")) {
+                config->qos_consumption = NSN_QOS_CONSUMPTION_POLL;
+            } else if (!strcmp(argv[i], "low")) {
+                config->qos_consumption = NSN_QOS_CONSUMPTION_LOW;
+            } else {
+                fprintf(stderr, "! Invalid value for --qos-consumption option: %s\n", argv[i]);
+                return -1;
+            }
+            continue;
+        }
         // Source id
         if (!strncmp(argv[i], "-a", 2) || !strncmp(argv[i], "--app-source-id", 15)) {
             char *ptr;
@@ -410,7 +427,7 @@ int main(int argc, char *argv[]) {
 
     /* Create stream */
     nsn_options_t options = {
-            .consumption = NSN_QOS_CONSUMPTION_POLL, 
+            .consumption = params.qos_consumption, 
             .datapath = params.qos_datapath, 
             .determinism = NSN_QOS_DETERMINISM_DEFAULT,
             .reliability = params.qos_reliability};
