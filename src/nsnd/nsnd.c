@@ -507,8 +507,13 @@ uint32_t nsn_qos_to_plugin_idx(nsn_options_t qos)
     // Return the index of the selected plugin!
     if (qos.datapath == NSN_QOS_DATAPATH_FAST) {
         if (qos.reliability == NSN_QOS_RELIABILITY_RELIABLE) {
-            log_info("QOS: fast, reliable => selected DPDK TCP plugin\n");
-            return 3;
+            if (qos.consumption == NSN_QOS_CONSUMPTION_LOW) {
+                log_info("QOS: fast, reliable => selected RDMA plugin\n");
+                return 4;    
+            } else { 
+                log_info("QOS: fast, reliable => selected DPDK TCP plugin\n");
+                return 3;
+            }
         } else {
             log_info("QOS: fast, unreliable => selected DPDK UDP plugin\n");
             return 2;
@@ -1350,7 +1355,7 @@ main(int argc, char *argv[])
     for (usize i = 0; i < app_pool.count; i++)    app_pool.free_apps_slots[i] = true;
 
     // TODO: Automatically detect which plugins are available and can be used by the daemon.
-    char* plugin_set_names[] = {"udpsock", "tcpsock", "udpdpdk", "tcpdpdk"};
+    char* plugin_set_names[] = {"udpsock", "tcpsock", "udpdpdk", "tcpdpdk", "rdma"};
     plugin_set.count         = array_count(plugin_set_names);
     plugin_set.plugins       = mem_arena_push_array(arena, nsn_plugin_t, plugin_set.count);
 
