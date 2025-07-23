@@ -52,9 +52,10 @@ struct nsn_source_inner {
     bool is_active;
     // Stream id 
     nsn_stream_t stream;
+    // Index in the local array of sources
+    uint32_t idx;
     // User-provided id
     uint32_t id;
-    // Use the tx queue from the stream
 };
 
 typedef struct nsn_sink_inner nsn_sink_inner_t;
@@ -63,6 +64,8 @@ struct nsn_sink_inner {
     bool is_active;
     // Stream id 
     nsn_stream_t stream;
+    // Index in the local array of sinks
+    uint32_t idx;
     // User-provided id
     uint32_t id;
     // Rx queue
@@ -108,7 +111,7 @@ signal_handler(int signum)
             for (uint32_t i = 0; i < array_count(sources); ++i) {
                 if (sources[i].is_active) {
                     log_info("Destroying source %d\n", sources[i].id);
-                    nsn_destroy_source(sources[i].id);
+                    nsn_destroy_source(sources[i].idx);
                 }
             }
         }
@@ -116,7 +119,7 @@ signal_handler(int signum)
             for (uint32_t i = 0; i < array_count(sinks); ++i) {
                 if (sinks[i].is_active) {
                     log_info("Destroying sink %d\n", sinks[i].id);
-                    nsn_destroy_sink(sinks[i].id);
+                    nsn_destroy_sink(sinks[i].idx);
                 }
             }
         }
@@ -576,39 +579,35 @@ nsn_create_source(nsn_stream_t stream, uint32_t source_id) {
     // If successful, receive two handlers to attach to the TX rings
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
         log_error("failed to create source with error '%s', is it running?\n", strerror(errno));
-        source_id = NSN_INVALID_SRC;
+        src_idx = NSN_INVALID_SRC;
         goto exit;
     } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
         int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
         log_error("failed to create source with error '%d'\n", error); 
-        source_id = NSN_INVALID_SRC;
+        src_idx = NSN_INVALID_SRC;
         goto exit;
     }
     
     // finalize the source creation 
+    sources[src_idx].idx = src_idx;
     sources[src_idx].id = source_id;
     sources[src_idx].is_active = true;
     sources[src_idx].stream = stream;
     n_src++;    
 
     log_info("created source %u\n", source_id);
-    log_trace("created source %u in slot %u with is_active=%d\n", source_id, src_idx, sources[src_idx].is_active);
+    log_trace("created source %u with idx %u with is_active=%d\n", source_id, src_idx, sources[src_idx].is_active);
 
 exit:
     temp_mem_arena_end(temp);
-    return source_id;
+    return src_idx;
 }
 
 // -----------------------------------------------------------------------------
 int 
 nsn_destroy_source(nsn_source_t source) {
     
-    uint32_t source_idx = NSN_INVALID_SRC;
-    for(uint32_t i = 0; i < array_count(sources); i++) {
-        if (sources[i].id == (uint32_t)source) {
-           source_idx = i; 
-        }
-    }
+    uint32_t source_idx = source;
     if (source_idx == NSN_INVALID_SRC) {
         log_error("source not found\n");
         return -1;
@@ -673,6 +672,7 @@ nsn_destroy_source(nsn_source_t source) {
     }
 
     // We can proceed to the destruction of the source
+    sources[source_idx].idx = NSN_INVALID_SRC;
     sources[source_idx].id = NSN_INVALID_SRC;
     sources[source_idx].is_active = false;
     sources[source_idx].stream = NSN_INVALID_STREAM_HANDLE;
@@ -724,12 +724,12 @@ nsn_create_sink(nsn_stream_t stream, uint32_t sink_id, handle_data_cb cb) {
     // If successful, receive two handlers
     if (recvfrom(sockfd, cmsg, 4096, 0, NULL, NULL) == -1) {
         log_error("failed to create sink with error '%s', is it running?\n", strerror(errno));
-        sink_id = NSN_INVALID_SNK;
+        snk_idx = NSN_INVALID_SNK;
         goto exit;
     } else if (cmsghdr->type == NSN_CMSG_TYPE_ERROR) {
         int error = *(int *)(cmsg + sizeof(nsn_cmsg_hdr_t));
         log_error("failed to create sink with error '%d'\n", error); 
-        sink_id = NSN_INVALID_SNK;
+        snk_idx = NSN_INVALID_SNK;
         goto exit;
     }
 
@@ -737,11 +737,12 @@ nsn_create_sink(nsn_stream_t stream, uint32_t sink_id, handle_data_cb cb) {
     if (sinks[snk_idx].rx_cons == NULL) {
         log_error("sink failed to attach to the rx ring\n");
         sinks[snk_idx].rx_cons = NULL;
-        sink_id = NSN_INVALID_SNK;       
+        snk_idx = NSN_INVALID_SNK;       
         goto exit;
     }
 
-    // finalize the sink creation 
+    // finalize the sink creation
+    sinks[snk_idx].idx = snk_idx; 
     sinks[snk_idx].id = sink_id;
     sinks[snk_idx].is_active = true;
     sinks[snk_idx].stream = stream;
@@ -752,24 +753,19 @@ nsn_create_sink(nsn_stream_t stream, uint32_t sink_id, handle_data_cb cb) {
 
 exit:
     temp_mem_arena_end(temp);
-    return sink_id;
+    return snk_idx;
 }
 
 // -----------------------------------------------------------------------------
 int
 nsn_destroy_sink(nsn_sink_t sink) {
-    uint32_t sink_idx = NSN_INVALID_SNK;
-    for(uint32_t i = 0; i < array_count(sinks); i++) {
-        if (sinks[i].id == (uint32_t)sink) {
-           sink_idx = i; 
-        }
-    }
+    uint32_t sink_idx = sink;
     if (sink_idx == NSN_INVALID_SNK) {
         log_error("sink not found\n");
         return -1;
     }
     if (!sinks[sink_idx].is_active) {
-        log_error("invalid sink (idx %u, is active %d)\n", sink_idx, sinks[sink_idx].is_active);
+        log_error("invalid sink (idx %u, id %u, is active %d)\n", sink_idx, sinks[sink_idx].id, sinks[sink_idx].is_active);
         return -1;
     }
 
@@ -801,6 +797,7 @@ nsn_destroy_sink(nsn_sink_t sink) {
     }
 
     // If we receive no error, we can proceed to the destruction of the sink
+    sinks[sink_idx].idx = NSN_INVALID_SNK;
     sinks[sink_idx].id = NSN_INVALID_SNK;
     sinks[sink_idx].is_active = false;
     sinks[sink_idx].stream = NSN_INVALID_STREAM_HANDLE;
@@ -817,7 +814,7 @@ nsn_buffer_t tmp_buf;
 // -----------------------------------------------------------------------------
 nsn_buffer_t *nsn_get_buffer(size_t size, int flags) {
 
-    if (size > 1446) {
+    if (size > 1440) {
         log_error("invalid size %lu\n", size);
         tmp_buf.len = 0;
         return &tmp_buf;
@@ -872,7 +869,7 @@ int nsn_emit_data(nsn_source_t source, nsn_buffer_t *buf) {
     while(nsn_ringbuf_enqueue_burst(str->tx_prod, &buf->index, sizeof(buf->index), 1, NULL) == 0) {
         SPIN_LOOP_PAUSE();
     }
-    log_trace("Emitted iobuf #%lu\n", buf->index);
+    log_trace("Emitted iobuf #%lu on ch %u\n", buf->index, src->id);
 
     return buf->index;
 }
