@@ -817,7 +817,7 @@ nsn_buffer_t tmp_buf;
 // -----------------------------------------------------------------------------
 nsn_buffer_t *nsn_get_buffer(size_t size, int flags) {
 
-    if (size > 1500) {
+    if (size > 1446) {
         log_error("invalid size %lu\n", size);
         tmp_buf.len = 0;
         return &tmp_buf;
