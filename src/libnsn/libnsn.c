@@ -153,7 +153,7 @@ nsn_lookup_ringbuf(nsn_mm_zone_t* rings_zone, string_t ring_name) {
         return NULL;
     }
 
-    nsn_ringbuf_pool_t* pool = (nsn_ringbuf_pool_t*)nsn_mm_zone_get_ptr(shm->data, rings_zone);
+    nsn_ringbuf_pool_t* pool = (nsn_ringbuf_pool_t*)nsn_mm_zone_get_ptr(rings_zone);
     if (!pool) {
         log_error("Failed to get the ring buffer pool\n");
         return NULL;
@@ -830,7 +830,7 @@ nsn_buffer_t *nsn_get_buffer(size_t size, int flags) {
         }
     }
 
-    uint8_t *data = (uint8_t*)(tx_bufs + 1) + (tmp_buf.index * tx_buf_size); 
+    uint8_t *data = (uint8_t*)(nsn_mm_zone_get_ptr(tx_bufs)) + (tmp_buf.index * tx_buf_size); 
     log_trace("Got iobuf #%lu, data %p, len %lu\n", tmp_buf.index, data, tx_buf_size);
     tmp_buf.data = data + INSANE_HEADER_LEN;
     tmp_buf.len  = tx_buf_size - INSANE_HEADER_LEN;
@@ -864,7 +864,7 @@ int nsn_emit_data(nsn_source_t source, nsn_buffer_t *buf) {
     // Set the nsn header and metadata
     nsn_hdr_t *hdr = (nsn_hdr_t *)(buf->data - INSANE_HEADER_LEN);
     hdr->channel_id = src->id;
-    ((nsn_meta_t*)(tx_buf_meta + 1))[buf->index].len = buf->len + INSANE_HEADER_LEN;
+    ((nsn_meta_t*)(nsn_mm_zone_get_ptr(tx_buf_meta)))[buf->index].len = buf->len + INSANE_HEADER_LEN;
 
     while(nsn_ringbuf_enqueue_burst(str->tx_prod, &buf->index, sizeof(buf->index), 1, NULL) == 0) {
         SPIN_LOOP_PAUSE();
@@ -913,8 +913,8 @@ nsn_buffer_t *nsn_consume_data(nsn_sink_t sink, int flags) {
         }
     }
 
-    uint8_t *data = (uint8_t*)(tx_bufs + 1) + (tmp_consume_buf.index * tx_buf_size); 
-    usize   len   = ((nsn_meta_t*)(tx_buf_meta + 1) + tmp_consume_buf.index)->len;
+    uint8_t *data = (uint8_t*)(nsn_mm_zone_get_ptr(tx_bufs)) + (tmp_consume_buf.index * tx_buf_size); 
+    usize   len   = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(tx_buf_meta)) + tmp_consume_buf.index)->len;
     tmp_consume_buf.data      = data + INSANE_HEADER_LEN;
     tmp_consume_buf.len       = len - INSANE_HEADER_LEN; 
     log_trace("Received on buf #%lu, data %p, len %lu\n", tmp_consume_buf.index, data, tmp_consume_buf.len);

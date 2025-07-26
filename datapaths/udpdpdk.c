@@ -189,7 +189,7 @@ NSN_DATAPATH_UPDATE(udpdpdk)
         // Configure the external memory. This is used for RX, if zero-copy is enabled, and always for TX.
         uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
         uint32_t n_pages    = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
-        char *data_ptr      = (char*)(endpoint->tx_zone + 1);
+        char *data_ptr      = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone));
 
         struct rte_pktmbuf_extmem *extmem_pages = malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
 
@@ -698,8 +698,8 @@ NSN_DATAPATH_TX(udpdpdk)
 
         for (usize i = 0; i < buf_count; i++) {
             // Get the data and size from the index
-            char* data = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size); 
-            usize size = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
+            char* data = ((char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[i].index * endpoint->io_bufs_size));
+            usize size = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;
 
             // Prepare the header
             prepare_headers(tx_bufs[i], size, endpoint->app_id, p);
@@ -778,7 +778,7 @@ NSN_DATAPATH_RX(udpdpdk)
             bufs[valid].index = *(usize*)(mbuf->next + 1);
 
             // Set the size
-            usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[valid].index)->len;
+            usize *size = &((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[valid].index)->len;
             *size = rte_be_to_cpu_16(uh->dgram_len) - sizeof(struct rte_udp_hdr);
             
             // Finalize the rx
@@ -794,8 +794,8 @@ NSN_DATAPATH_RX(udpdpdk)
 
             // Get the NSN buffer memory
             bufs[valid] = conn->pending_rx_buf;
-            char *data  = (char*)(endpoint->tx_zone + 1) + (bufs[valid].index * endpoint->io_bufs_size);    
-            usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[valid].index)->len;
+            char *data  = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[valid].index * endpoint->io_bufs_size);    
+            usize *size = &((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[valid].index)->len;
 
             // Copy the packet payload to the NSN buffer memory        
             *size = payload_size;        

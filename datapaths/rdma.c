@@ -88,7 +88,7 @@ static inline int parse_single_wc(struct ibv_wc *wc, nsn_endpoint_t* ep) {
     // Case 1 - Immediate data
     if (wc->opcode == IBV_WC_RECV || wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
         // Retrieve data len
-        usize *size = &((nsn_meta_t*)(ep->tx_meta_zone + 1) + wc->wr_id)->len;
+        usize *size = &((nsn_meta_t*)(nsn_mm_zone_get_ptr(ep->tx_meta_zone)) + wc->wr_id)->len;
         *size = wc->byte_len;
         return wc->wr_id; // Returns the buffer_id
     } else {
@@ -708,7 +708,7 @@ NSN_DATAPATH_UPDATE(rdma) {
                 }
 
                 // use the buffer to post a receive request
-                char  *addr       = (char*)(endpoint->tx_zone + 1) + (buf.index * endpoint->io_bufs_size);    
+                char  *addr       = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (buf.index * endpoint->io_bufs_size);    
                 uint32_t max_size = (uint32_t)endpoint->io_bufs_size;
 
                 int nb_rx = post_recv(buf.index, addr, max_size, conn_p->qp, conn->mr);
@@ -806,7 +806,7 @@ NSN_DATAPATH_CONN_MANAGER(rdma)
                         }
 
                         // use the buffer to post a receive request
-                        char  *addr  = (char*)(ep->tx_zone + 1) + (buf.index * ep->io_bufs_size);    
+                        char  *addr  = (char*)(nsn_mm_zone_get_ptr(ep->tx_zone)) + (buf.index * ep->io_bufs_size);    
                         uint32_t max_size = (uint32_t)ep->io_bufs_size;
 
                         int nb_rx = post_recv(buf.index, addr, max_size, conn_p->qp, conn->mr);
@@ -947,8 +947,8 @@ NSN_DATAPATH_TX(rdma)
 
         for (usize i = 0; i < buf_count; i++) {
 
-            char* data = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size); 
-            usize size = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len; 
+            char* data = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[i].index * endpoint->io_bufs_size); 
+            usize size = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len; 
 
             if(post_send(data, size, IBV_SEND_SIGNALED, conn_p->qpx, conn->mr, bufs[i].index) < 0) {
                 fprintf(stderr, "[rdma] post_send() failed for buf %d\n", (int)bufs[i].index);
@@ -1026,7 +1026,7 @@ NSN_DATAPATH_RX(rdma)
             printf("[rdma] no free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
             continue;
         }
-        char  *addr  = (char*)(endpoint->tx_zone + 1) + (buf.index * endpoint->io_bufs_size);    
+        char  *addr  = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (buf.index * endpoint->io_bufs_size);    
         uint32_t max_size = (uint32_t)endpoint->io_bufs_size;
         int nb_rx = post_recv(buf.index, addr, max_size, conn_p->qp, conn->mr);
         if (nb_rx < 1) {

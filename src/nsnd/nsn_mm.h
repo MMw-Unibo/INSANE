@@ -38,7 +38,7 @@ struct nsn_mem_manager
 nsn_mem_manager_t  *nsn_memory_manager_create  (mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg);
 void                nsn_memory_manager_destroy (nsn_mem_manager_t *mem);
 
-nsn_mm_zone_t      *nsn_memory_manager_create_zone (nsn_mem_manager_t *mem, string_t name, usize size, usize type);
+nsn_mm_zone_t      *nsn_memory_manager_create_zone (nsn_mem_manager_t *mem, string_t name, usize size, usize type, usize slot_alignment);
 
 nsn_ringbuf_pool_t *nsn_memory_manager_create_ringbuf_pool (nsn_mem_manager_t *mem, string_t name, usize count, usize esize, usize ecount); 
 nsn_ringbuf_pool_t *nsn_memory_manager_get_ringbuf_pool    (nsn_mem_manager_t* mem);

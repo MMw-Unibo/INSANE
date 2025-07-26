@@ -426,7 +426,7 @@ wait:
             // 2. Dispatch the packets to the sinks
             bool delivered;
             for(uint32_t j = 0; j < np_rx; j++) {
-                uint8_t* data = (uint8_t*)(stream->ep.tx_zone + 1) + (io_buffs[j].index * stream->ep.io_bufs_size);
+                uint8_t* data = (uint8_t*)(nsn_mm_zone_get_ptr(stream->ep.tx_zone)) + (io_buffs[j].index * stream->ep.io_bufs_size);
                 nsn_hdr_t *hdr = (nsn_hdr_t *)data;
                 nsn_inner_sink_t* sink;
                 delivered = false;
