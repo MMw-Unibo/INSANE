@@ -31,10 +31,8 @@
 struct udpdpdk_ep {
     u16 rx_queue_id;
     nsn_buf_t pending_rx_buf; // For non zero-copy receive
-    struct rte_mempool *rx_hdr_pool;
-    struct rte_mempool *rx_data_pool;
-    struct rte_mempool *tx_hdr_pool;
-    struct rte_mempool *tx_data_pool;
+    struct rte_mempool *hdr_pool; // Pool for headers, and RX payloads if zc_rx is false
+    struct rte_mempool *zc_pool;  // Pool for zero-copy TX and RX
     struct rte_flow *app_flow;
 };
 
@@ -128,9 +126,9 @@ NSN_DATAPATH_UPDATE(udpdpdk)
             }
         }
 
-        // Destroy the tx mempools
-        rte_mempool_free(conn->tx_data_pool);
-        rte_mempool_free(conn->tx_hdr_pool);
+        // Destroy the mempools
+        rte_mempool_free(conn->zc_pool);
+        rte_mempool_free(conn->hdr_pool);
 
         // Un-register memory
         void *addr = (void*)((usize)endpoint->tx_zone & 0xFFFFFFFFFFF00000);
@@ -203,55 +201,57 @@ NSN_DATAPATH_UPDATE(udpdpdk)
                                         : endpoint->page_size;
             extmem_pages[i].elt_size = endpoint->io_bufs_size;
         }
+        
+        char pool_name[64];
+        bzero(pool_name, 64);
+
+        // Header mempool. Must have 10239 as num_mbufs or it fails. 
+        // It is used for TX and RX headers. If zero-copy RX is disabled,
+        // it is used for RX payloads as well.
+        sprintf(pool_name, "hdr_pool_%u", conn->rx_queue_id);
+        if ((conn->hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
+            fprintf(stderr, "[udpdpdk] failed to create mempool %s\n", pool_name);
+            goto error_2;
+        }
+
+        // Mempool with external memory configuration
+        /* External memory configuration
+            This mempool contains only descriptors, not data: data_room_size is 0.
+            The descriptors will point to the INSANE nbufs, containing the data.
+            This is called "indirect mempool" in DPDK.
+            This mempool is actually a "special" mempool backed by the INSANE ring.
+        
+            In INSANE, the data area is not aligned to the page size, so the first page must 
+            be registered with a smaller size than the page size. The rest of the pages will be
+            registered with the full page size. "addr" points to the beginning of the page,
+            and "data_ptr" points to the beginning of the data area on that page.
+        */
+        bzero(pool_name, 64);
+        sprintf(pool_name, "zc_pool_%u", conn->rx_queue_id);
+        size_t private_size    = sizeof(size_t);
+        size_t data_room_size  = 0;
+        conn->zc_pool = 
+            nsn_dpdk_pktmbuf_pool_create_extmem(
+                pool_name, endpoint->io_bufs_count, 0, private_size, 
+                data_room_size, socket_id, extmem_pages, n_pages, 
+                endpoint->free_slots
+            );
+        if (!conn->zc_pool) {
+            fprintf(stderr, "[udpdpdk]: failed to create zc data pool: %s\n", rte_strerror(rte_errno));
+            goto error_3;
+        }  
+
+        // This is the HACK that makes the external memory work. The external mempool must be
+        // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
+        // to know the size of the mbufs. So, afer the creation, we set the data room size of the
+        // mbufs to the maximum size of the payload. Apparently this works withouth visible side
+        // effects. TODO: Is there a proper way to do this?
+        struct rte_pktmbuf_pool_private *mbp_priv =
+            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->zc_pool);
+        mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
 
         /* We have two separate paths, one to enable the zero-copy receive, one for the copy-on-receive */
-        char pool_name[64];
         if(zc_rx) {
-            // RX: header mempool. Must have 10239 as num_mbufs or it fails
-            char pool_name[64];
-            bzero(pool_name, 64);
-            sprintf(pool_name, "rx_hdr_pool_%u", conn->rx_queue_id);
-            if ((conn->rx_hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
-                fprintf(stderr, "[udpdpdk] failed to create mempool %s\n", pool_name);
-                goto error_2;
-            }
-
-            // RX: data mempool with external memory configuration
-            /* External memory configuration
-                This mempool contains only descriptors, not data: data_room_size is 0.
-                The descriptors will point to the INSANE nbufs, containing the data.
-                This is called "indirect mempool" in DPDK.
-                This mempool is actually a "special" mempool backed by the INSANE ring.
-
-                In INSANE, the data area is not aligned to the page size, so the first page must 
-                be registered with a smaller size than the page size. The rest of the pages will be
-                registered with the full page size. "addr" points to the beginning of the page,
-                and "data_ptr" points to the beginning of the data area on that page.
-            */
-            bzero(pool_name, 64);
-            sprintf(pool_name, "rx_data_pool_%u", conn->rx_queue_id);
-            size_t private_size    = sizeof(size_t);
-            size_t data_room_size  = 0;
-            conn->rx_data_pool = 
-                nsn_dpdk_pktmbuf_pool_create_extmem(
-                    pool_name, endpoint->io_bufs_count, 0, private_size, 
-                    data_room_size, socket_id, extmem_pages, n_pages, 
-                    endpoint->free_slots
-                );
-            if (!conn->rx_data_pool) {
-                fprintf(stderr, "[udpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
-                goto error_3;
-            }  
-
-            // This is the HACK that makes the external memory work. The external mempool must be
-            // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
-            // to know the size of the mbufs. So, afer the creation, we set the data room size of the
-            // mbufs to the maximum size of the payload. Apparently this works withouth visible side
-            // effects. TODO: Is there a proper way to do this?
-            struct rte_pktmbuf_pool_private *mbp_priv =
-                (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->rx_data_pool);
-            mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
-
             /* Configure RX split: headers and payloads in their respective mempools */
             struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
             // Configure the BUFFER_SPLIT offload behavior for the selected RX queue.
@@ -260,7 +260,7 @@ NSN_DATAPATH_UPDATE(udpdpdk)
             union rte_eth_rxseg rx_useg[2] = {};
             // Segment 0 (header)
             rx_seg         = &rx_useg[0].split;
-            rx_seg->mp     = conn->rx_hdr_pool;
+            rx_seg->mp     = conn->hdr_pool;
             rx_seg->offset = 0;
             // See docs in rte_ethdev.h. Must be zero if length is used (and vice versa)
             rx_seg->proto_hdr = 0;
@@ -269,7 +269,7 @@ NSN_DATAPATH_UPDATE(udpdpdk)
             // Segment 1 (payload)
             rx_seg         = &rx_useg[1].split;
             rx_seg->offset = 0;
-            rx_seg->mp     = conn->rx_data_pool;
+            rx_seg->mp     = conn->zc_pool;
             rx_seg->proto_hdr = 0;
             rx_seg->length = 2048;
 
@@ -292,17 +292,8 @@ NSN_DATAPATH_UPDATE(udpdpdk)
                 goto error_1;
             }
 
-
-            // RX mempool. Must have 10239 as num_mbufs or it fails
-            bzero(pool_name, 64);
-            sprintf(pool_name, "rx_pool_%u", conn->rx_queue_id);
-            if ((conn->rx_hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
-                fprintf(stderr, "[udpdpdk] failed to create mempool %s\n", pool_name);
-                goto error_2;
-            }
-
             // Setup the RX queue using the selected configuration
-            if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, NULL, conn->rx_hdr_pool)) != 0) {
+            if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, NULL, conn->hdr_pool)) != 0) {
                 fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
                 goto error_4;
             }
@@ -324,40 +315,13 @@ NSN_DATAPATH_UPDATE(udpdpdk)
             goto error_5;
         }
 
-        /* TX: header mempool */
-        sprintf(pool_name, "tx_hdr_pool_%u", conn->rx_queue_id);
-        conn->tx_hdr_pool = rte_pktmbuf_pool_create(
-            pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
-        if (!conn->tx_hdr_pool) {
-            fprintf(stderr, "[udpdpdk]: failed to create tx hdr pool: %s\n", rte_strerror(rte_errno));
-            goto error_6;
-        }
-
-        /* TX: data mempool. External memory, use the same config as before */
-        size_t private_size    = sizeof(size_t);
-        size_t data_room_size  = 0;
-        sprintf(pool_name, "tx_data_pool_%u", conn->rx_queue_id);
-        conn->tx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
-            pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
-        if (!conn->tx_data_pool) {
-            fprintf(stderr, "[udpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
-            goto error_7;
-        }      
-        struct rte_pktmbuf_pool_private *mbp_priv =
-            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->tx_data_pool);
-        mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
-
         return 0;
-error_7:
-        rte_mempool_free(conn->tx_hdr_pool);
-error_6:
-        rte_flow_destroy(port_id, conn->app_flow, NULL);
 error_5:
         rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
 error_4:
-        rte_mempool_free(conn->rx_data_pool);
+        rte_mempool_free(conn->zc_pool);
 error_3:
-        rte_mempool_free(conn->rx_hdr_pool);
+        rte_mempool_free(conn->hdr_pool);
 error_2:
         unregister_memory_area(addr, len, endpoint->page_size, port_id);
         if (!zc_rx) {
@@ -694,7 +658,7 @@ NSN_DATAPATH_TX(udpdpdk)
         }        
 
         // Prepare the header mbuf
-        rte_pktmbuf_alloc_bulk(conn->tx_hdr_pool, tx_bufs, buf_count);
+        rte_pktmbuf_alloc_bulk(conn->hdr_pool, tx_bufs, buf_count);
 
         for (usize i = 0; i < buf_count; i++) {
             // Get the data and size from the index
@@ -705,7 +669,7 @@ NSN_DATAPATH_TX(udpdpdk)
             prepare_headers(tx_bufs[i], size, endpoint->app_id, p);
             
             // Prepare the payload - get the corresponding mbuf from the pool
-            data_mbuf = nsn_pktmbuf_alloc(conn->tx_data_pool, bufs[i].index);
+            data_mbuf = nsn_pktmbuf_alloc(conn->zc_pool, bufs[i].index);
             data_mbuf->data_len = size;
            
             // Chain the mbufs
