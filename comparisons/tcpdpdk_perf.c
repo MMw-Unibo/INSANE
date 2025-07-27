@@ -219,7 +219,16 @@ static void init_tldk_ctx(test_config_t *params) {
     }
 
     /* 2. Create the TCP context */
-    uint16_t socket_id = rte_eth_dev_socket_id(params->port_id);
+    int socket_id = rte_eth_dev_socket_id(params->port_id);
+    if (socket_id < 0) {
+        if (rte_errno == EINVAL) {
+            fprintf(stderr, "[error] cannot get socket ID for port %u: %s. .\n", params->port_id, strerror(-socket_id));
+            rte_exit(EXIT_FAILURE, "cannot create the frag mempool\n");
+        } else {
+            socket_id = 0; // Default to socket 0 if socket could not be determined (e.g., in VMs)
+        }
+    }
+
     struct tle_ctx_param ctx_params = {
         .socket_id         = socket_id,
         .proto             = TLE_PROTO_TCP,
@@ -1000,6 +1009,14 @@ static inline int port_init(struct rte_mempool *mempool, uint16_t mtu, test_conf
         return retval;
 
     int socket_id = rte_eth_dev_socket_id(port_id);
+    if (socket_id < 0) {
+        if (rte_errno == EINVAL) {
+            fprintf(stderr, "[error] cannot get socket ID for port %u: %s. .\n", params->port_id, strerror(-socket_id));
+            return -EINVAL;
+        } else {
+            socket_id = 0; // Default to socket 0 if socket could not be determined (e.g., in VMs)
+        }
+    }
 
     for (uint16_t q = 0; q < rx_rings; q++) {
         retval = rte_eth_rx_queue_setup(port_id, q, nb_rxd, socket_id, NULL, mempool);
@@ -1049,7 +1066,17 @@ int main(int argc, char *argv[]) {
     }
 
     /* Create mempool for all TX and RX data */
-    uint16_t socket_id = rte_eth_dev_socket_id(params.port_id);
+    int socket_id = rte_eth_dev_socket_id(params.port_id);
+    if (socket_id < 0) {
+        if (rte_errno == EINVAL) {
+            fprintf(stderr, "[error] cannot get socket ID for port %u: %s. .\n", params.port_id, strerror(rte_errno));
+            rte_exit(EXIT_FAILURE, "cannot create the frag mempool\n");
+        } else {
+            socket_id = 0; // Default to socket 0 if socket could not be determined (e.g., in VMs)
+        }
+    }
+
+
     struct rte_mempool *mbuf_pool = rte_pktmbuf_pool_create(
         "mbuf_pool", 10240, 64, 0, RTE_MBUF_DEFAULT_DATAROOM, socket_id);
     if (mbuf_pool == NULL) {
