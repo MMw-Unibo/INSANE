@@ -15,6 +15,8 @@ First, it is necessary to prepare the environment and to install the prerequisit
 
 Depending on which network stack you will use, you might also want to install:
 * DPDK 22.11 ([script](scripts/install-dpdk.sh))
+* TLDK ([script](scripts/install-tldk.sh)), only after DPDK.
+We suggest to perform a local installation by creating a $INSANE_DIR/deps folder, and passing its path to the above scripts. In the building scripts, we assume that setup.
 
 Then, it is possible to proceed with the project build.
 
