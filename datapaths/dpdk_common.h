@@ -31,13 +31,13 @@ int register_memory_area(void *addr, const uint64_t len, uint32_t page_size,
     // Pin pages in memory (necessary if we do not use hugepages)
     mlock(addr, len);
 
-    fprintf(stderr, "[udpdpdk] registering memory area %p, len %lu, page_size %u, port_id %u\n", addr, len, page_size, port_id);
+    fprintf(stderr, "[dpdk] registering memory area %p, len %lu, page_size %u, port_id %u\n", addr, len, page_size, port_id);
 
     // Prepare for the external memory registration with DPDK: compute page IOVAs
     uint32_t    n_pages = len < page_size ? 1 : len / page_size;
     rte_iova_t *iovas   = (rte_iova_t*)malloc(sizeof(*iovas) * n_pages);
     if (iovas == NULL) {
-        fprintf(stderr, "[udpdpdk] failed to allocate iovas: %s\n", strerror(errno));
+        fprintf(stderr, "[dpdk] failed to allocate iovas: %s\n", strerror(errno));
         return -1;
     }
     for (uint32_t cur_page = 0; cur_page < n_pages; cur_page++) {
@@ -54,7 +54,7 @@ int register_memory_area(void *addr, const uint64_t len, uint32_t page_size,
     // use the internal DPDK page table to get IOVAs.
     int ret = rte_extmem_register(addr, len, iovas, n_pages, page_size);
     if (ret < 0) {
-        fprintf(stderr, "[udpdpdk] failed to register external memory with DPDK: %s\n",
+        fprintf(stderr, "[dpdk] failed to register external memory with DPDK: %s\n",
                rte_strerror(rte_errno));
         return -1;
     }
@@ -66,7 +66,7 @@ int register_memory_area(void *addr, const uint64_t len, uint32_t page_size,
         ret = rte_dev_dma_map(dev_info.device, addr + (cur_page * page_size), iovas[cur_page],
                               page_size);
         if (ret < 0) {
-            fprintf(stderr, "[udpdpdk] failed to pin memory for DMA: %s\n", rte_strerror(rte_errno));
+            fprintf(stderr, "[dpdk] failed to pin memory for DMA: %s\n", rte_strerror(rte_errno));
             return -1;
         }
     }
@@ -87,14 +87,14 @@ int unregister_memory_area(void *addr, const uint64_t len, uint32_t page_size,
         size_t     offset = page_size * cur_page;
         ret = rte_dev_dma_unmap(dev_info.device, addr + offset, rte_mem_virt2iova(addr + offset), page_size);
         if (ret < 0) {
-            fprintf(stderr, "[udpdpdk] failed to unpin memory for DMA: %s\n", rte_strerror(rte_errno));
+            fprintf(stderr, "[dpdk] failed to unpin memory for DMA: %s\n", rte_strerror(rte_errno));
         }
     }
 
     // De-register pages from DPDK
     ret = rte_extmem_unregister(addr, len);
     if (ret < 0) {
-        fprintf(stderr, "[udpdpdk] failed to unregister external memory from DPDK: %s\n",
+        fprintf(stderr, "[dpdk] failed to unregister external memory from DPDK: %s\n",
         rte_strerror(rte_errno));
     }
 
@@ -532,10 +532,10 @@ static int nsn_mp_alloc(struct rte_mempool *mp) {
     // Actually, to enable that, we expect the user to already set the mp->pool to a ring.
     // And so here we just verify it exists!
     if(mp->pool_data == NULL) {
-        // fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: deferring init...\n", mp->name);
+        // fprintf(stderr, "[dpdk] Mempool %s has no ring attached: deferring init...\n", mp->name);
     } else {
         nsn_ringbuf_t *ring = (nsn_ringbuf_t *)mp->pool_data;
-        fprintf(stderr, "[udpdpdk] mempool %s backed by ring %s at %p\n", mp->name, ring->name, ring);
+        fprintf(stderr, "[dpdk] mempool %s backed by ring %s at %p\n", mp->name, ring->name, ring);
     }
 
     // Create the array to keep the mbufs
@@ -552,7 +552,7 @@ static void nsn_mp_free(struct rte_mempool *mp) {
 
 static int nsn_mp_enqueue(struct rte_mempool *mp, void * const *obj_table, unsigned n) {
     if (!mp->pool_data ) {
-        // fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: cannot enqueue yet\n", mp->name);
+        // fprintf(stderr, "[dpdk] Mempool %s has no ring attached: cannot enqueue yet\n", mp->name);
         return 0;
     }
     size_t index;
@@ -568,7 +568,7 @@ static int nsn_mp_enqueue(struct rte_mempool *mp, void * const *obj_table, unsig
 
 static int nsn_mp_dequeue(struct rte_mempool *mp, void **obj_table, unsigned n) {
     if (!mp->pool_data) {
-        // fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: cannot dequeue yet\n", mp->name);
+        // fprintf(stderr, "[dpdk] Mempool %s has no ring attached: cannot dequeue yet\n", mp->name);
         return 0;
     }
     size_t index;
@@ -591,7 +591,7 @@ static unsigned
 nsn_mp_get_count(const struct rte_mempool *mp)
 {
     if (!mp->pool_data ) {
-        fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: cannot use it yet\n", mp->name);
+        fprintf(stderr, "[dpdk] Mempool %s has no ring attached: cannot use it yet\n", mp->name);
         return 0;
     }
 	return nsn_ringbuf_count((nsn_ringbuf_t *)mp->pool_data);

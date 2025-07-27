@@ -546,7 +546,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         // Configure the external memory. This is used for RX, if zero-copy is enabled, and always for TX.
         uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
         uint32_t n_pages = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
-        char *data_ptr = (char*)(endpoint->tx_zone + 1);
+        char *data_ptr = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone));
         // fprintf(stderr, "Memory for data starts at %p [npages = %u, size = %lu]\n", data_ptr, n_pages, endpoint->tx_zone->size);
         struct rte_pktmbuf_extmem *extmem_pages =
             malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
@@ -1179,7 +1179,7 @@ NSN_DATAPATH_TX(tcpdpdk) {
         for (usize i = 0; i < buf_count; i++) {
             // Prepare the payload - get the corresponding mbuf from the pool
             data_mbuf = nsn_pktmbuf_alloc(conn->tx_data_pool, bufs[i].index);
-            data_mbuf->pkt_len = data_mbuf->data_len = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
+            data_mbuf->pkt_len = data_mbuf->data_len = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;
             if (nsn_unlikely(data_mbuf->data_len == 0 || data_mbuf->data_len > endpoint->io_bufs_size)) {
                 fprintf(stderr, "[tcpdpdk] Invalid packet size: %u. Discarding packet...\n", data_mbuf->data_len);
                 continue;
@@ -1274,7 +1274,7 @@ NSN_DATAPATH_RX(tcpdpdk) {
 
                 // Set the index (zero-copy receive)
                 bufs[valid].index = *(usize*)(mbuf->next + 1); 
-                usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[valid].index)->len;
+                usize *size = &((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[valid].index)->len;
                 *size = mbuf->next->data_len; //TODO: Is this ok?
                 
                 // Finalize the rx
@@ -1291,8 +1291,8 @@ NSN_DATAPATH_RX(tcpdpdk) {
 
                 // Get the NSN buffer memory
                 bufs[valid] = conn->pending_rx_buf;
-                char *data  = (char*)(endpoint->tx_zone + 1) + (bufs[valid].index * endpoint->io_bufs_size);    
-                usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[valid].index)->len;
+                char *data  = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[valid].index * endpoint->io_bufs_size);
+                usize *size = &((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[valid].index)->len;
 
                 // Copy the packet payload to the NSN buffer memory        
                 *size = payload_size;        

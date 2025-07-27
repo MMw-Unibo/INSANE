@@ -393,8 +393,8 @@ NSN_DATAPATH_TX(tcpsock)
 
     for (i = 0; i < buf_count; i++) {
         // Get the data and size from the index
-        char* data = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size); 
-        usize size = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;  
+        char* data = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[i].index * endpoint->io_bufs_size); 
+        usize size = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;  
 
         if (nsn_unlikely(size == 0 || size > endpoint->io_bufs_size)) {
             fprintf(stderr, "[tcpsock] Invalid packet size: %lu. Discarding packet...\n", size);
@@ -489,8 +489,8 @@ NSN_DATAPATH_RX(tcpsock)
 
     // set the receive buffer
     bufs[i]     = ep_sk->pending_rx_buf;
-    char *data  = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size);    
-    usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
+    char *data  = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[i].index * endpoint->io_bufs_size);
+    usize *size = &((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;
 
     // In TCP we decide to receive 1 pkt per time from each peer. First the size, then the data
     usize buf_size;
@@ -581,8 +581,8 @@ NSN_DATAPATH_RX(tcpsock)
         
         // set the receive buffer for next rx
         bufs[i] = ep_sk->pending_rx_buf;
-        data    = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size);    
-        size    = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
+        data    = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[i].index * endpoint->io_bufs_size);
+        size    = &((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;
     }
 
     return i;

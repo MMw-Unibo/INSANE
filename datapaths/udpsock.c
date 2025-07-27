@@ -184,8 +184,8 @@ NSN_DATAPATH_TX(udpsock)
 
     for (i = 0; i < buf_count; i++) {
         // Get the data and size from the index
-        char* data = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size); 
-        usize size = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;        
+        char* data = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[i].index * endpoint->io_bufs_size);
+        usize size = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;
 
         // Send the buf to all the peers
         for(int p = 0; p < n_peers; p++) {
@@ -219,8 +219,8 @@ NSN_DATAPATH_RX(udpsock)
 
     // set the receive buffer
     bufs[i]     = ep_sk->pending_rx_buf;
-    char *data  = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size);    
-    usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
+    char *data  = (char*)(endpoint->tx_zone + endpoint->tx_zone->first_block_offset) + (bufs[i].index * endpoint->io_bufs_size);    
+    usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + endpoint->tx_meta_zone->first_block_offset) + bufs[i].index)->len;
 
     // In UDP, we receive 1 pkt per time - no burst receive
     if ((ret = recvfrom(ep_sk->s_sockfd, data, endpoint->io_bufs_size, 0, NULL, NULL)) > 0) {

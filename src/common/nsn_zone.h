@@ -15,14 +15,14 @@ struct nsn_mm_zone
 {
     char         name[32];
     u32          type;
-
+    // The offset of the zone in the shared memory
     usize        base_offset;
     // The total size of the zone, including the header
     usize        total_size;
     // The size of the zone, excluding the header
     usize        size;
+    // The offset of zone data, relative to the shared memory
     usize        first_block_offset;
-
     // The offset of the next zone in the list
     usize        next_zone_offset; 
 } nsn_cache_aligned;
@@ -35,9 +35,9 @@ struct nsn_mm_zone_list
 } nsn_cache_aligned;
 
 static inline void* 
-nsn_mm_zone_get_ptr(void *mem, nsn_mm_zone_t *zone)
+nsn_mm_zone_get_ptr(nsn_mm_zone_t *zone)
 {
-    return ((u8 *)mem + zone->first_block_offset);
+    return ((char*)zone) + (zone->first_block_offset - zone->base_offset);
 }
 
 void
@@ -69,8 +69,8 @@ nsn_find_zone_by_name(nsn_mm_zone_list_t *zones, string_t name)
     if (zones->count == 0)
         return NULL;
     
-    byte *memory                  = (byte *)zones;
-    nsn_mm_zone_t *zone           = NULL;
+    byte *memory        = (byte *)zones;
+    nsn_mm_zone_t *zone = NULL;
     for (usize offset = zones->head_offset; offset != 0; offset = zone->next_zone_offset)
     {
         zone = (nsn_mm_zone_t *)(memory + offset);

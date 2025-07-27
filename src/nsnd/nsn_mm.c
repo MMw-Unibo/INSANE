@@ -24,7 +24,7 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
     // the pointer to the next zone, the pointer to the previous zone, and the pointer to the first block of the zone.
 
     usize total_zone_size = cfg->io_buffer_pool_size * cfg->io_buffer_size;
-    nsn_mm_zone_t *tx_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+    nsn_mm_zone_t *tx_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL,cfg->io_buffer_size );
     if (!tx_zone) {
         log_error("failed to create the tx_zone\n");
         return NULL;
@@ -32,7 +32,7 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
     
     // The metadata associated with the actual data slots (e.g., pkt len) is kept in a separate zone
     total_zone_size = cfg->io_buffer_pool_size * sizeof(nsn_meta_t);
-    nsn_mm_zone_t *tx_meta_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_META_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL);
+    nsn_mm_zone_t *tx_meta_zone = nsn_memory_manager_create_zone(mem, str_lit(NSN_CFG_DEFAULT_TX_META_NAME), total_zone_size, NSN_MM_ZONE_TYPE_IO_BUFFER_POOL, cfg->io_buffer_size);
     if (!tx_meta_zone) {
         log_error("failed to create the tx_meta_zone\n");
         return NULL;
@@ -70,11 +70,11 @@ nsn_memory_manager_destroy(nsn_mem_manager_t *mem)
 
 // The zone is created in the shared memory and the pointer to the zone is returned.
 // The shared memory works as a linear memory, so the zone is created at the end of the memory, after the last zone.
-// Zone are rounded to the next multiple of the page size.
+// Zones are rounded to the next multiple of the page size.
 nsn_mm_zone_t *
 nsn_memory_manager_create_zone(
     nsn_mem_manager_t *mem, string_t name, 
-    usize size, usize type
+    usize size, usize type, usize slot_alignment
 ) {
     if (nsn_zone_exists(mem->zones, name)) {
         log_warn("zone with name " str_fmt " already exists\n", str_varg(name));
@@ -92,13 +92,24 @@ nsn_memory_manager_create_zone(
         return NULL;
     }
 
-    // initialize the zone
-
+    // Initialize the zone. To ensure proper alignement and avoid cross-page memory slots,
+    // we must ensure that the first slot is aligned to the slot size. Hence, the first block offset
+    // is set to the base_offset + sizeof(nsn_mm_zone_t) + the missing bytes to achieve the alignment.
+    // TODO: Would be even better, in case of slot_alignment < sizeof(nsn_mm_zone_t), to increase the
+    // slot_alignment to the next power of 2 that is greater than sizeof(nsn_mm_zone_t).
+    usize padding = sizeof(nsn_mm_zone_t);
+    if (sizeof(nsn_mm_zone_t) < slot_alignment) {
+        padding = align_to(sizeof(nsn_mm_zone_t), slot_alignment);
+        void* zone_aligned = (void*)((usize)zone & 0xFFFFFFFFFFF00000);
+        usize base_offset_aligned = (usize)zone - (usize)zone_aligned;
+        padding -= base_offset_aligned;
+    }
+    
     zone->base_offset        = base_offset;
     zone->total_size         = zone_size;
-    zone->size               = zone->total_size - sizeof(nsn_mm_zone_t);
+    zone->size               = zone->total_size - padding;
     zone->type               = type;
-    zone->first_block_offset = base_offset + sizeof(nsn_mm_zone_t);
+    zone->first_block_offset = base_offset + padding;
     strncpy(zone->name, to_cstr(name), sizeof(zone->name) - 1);
 
     // add the zone to the list of zones
@@ -117,13 +128,13 @@ nsn_memory_manager_create_ringbuf_pool(
                     + sizeof(nsn_ringbuf_t) * count        // the number of ring buffers
                     + (esize * ecount) * count;            // the size of the elements in the ring buffers
 
-    nsn_mm_zone_t *zone = nsn_memory_manager_create_zone(mem, name, zone_size, NSN_MM_ZONE_TYPE_RINGS);
+    nsn_mm_zone_t *zone = nsn_memory_manager_create_zone(mem, name, zone_size, NSN_MM_ZONE_TYPE_RINGS, esize);
     if (!zone) {
         log_error("Failed to create zone for ring buffer pool\n");
         return NULL;
     }
 
-    nsn_ringbuf_pool_t *pool = (nsn_ringbuf_pool_t *)nsn_mm_zone_get_ptr(mem->shm_arena->base, zone);
+    nsn_ringbuf_pool_t *pool = (nsn_ringbuf_pool_t *)nsn_mm_zone_get_ptr(zone);
     pool->zone              = zone;
     pool->count             = count;
     pool->esize             = esize;
@@ -143,7 +154,7 @@ nsn_memory_manager_get_ringbuf_pool(nsn_mem_manager_t* mem)
         return NULL;
     }
 
-    return (nsn_ringbuf_pool_t*)nsn_mm_zone_get_ptr(mem->shm_arena->base, zone);
+    return (nsn_ringbuf_pool_t*)nsn_mm_zone_get_ptr(zone);
 }
 
 // @param pool: the pool of ring buffers

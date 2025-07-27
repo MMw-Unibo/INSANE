@@ -426,7 +426,7 @@ wait:
             // 2. Dispatch the packets to the sinks
             bool delivered;
             for(uint32_t j = 0; j < np_rx; j++) {
-                uint8_t* data = (uint8_t*)(stream->ep.tx_zone + 1) + (io_buffs[j].index * stream->ep.io_bufs_size);
+                uint8_t* data = (uint8_t*)(nsn_mm_zone_get_ptr(stream->ep.tx_zone)) + (io_buffs[j].index * stream->ep.io_bufs_size);
                 nsn_hdr_t *hdr = (nsn_hdr_t *)data;
                 nsn_inner_sink_t* sink;
                 delivered = false;
@@ -507,8 +507,13 @@ uint32_t nsn_qos_to_plugin_idx(nsn_options_t qos)
     // Return the index of the selected plugin!
     if (qos.datapath == NSN_QOS_DATAPATH_FAST) {
         if (qos.reliability == NSN_QOS_RELIABILITY_RELIABLE) {
-            log_info("QOS: fast, reliable => selected DPDK TCP plugin\n");
-            return 3;
+            if (qos.consumption == NSN_QOS_CONSUMPTION_LOW) {
+                log_info("QOS: fast, reliable => selected RDMA plugin\n");
+                return 4;    
+            } else { 
+                log_info("QOS: fast, reliable => selected DPDK TCP plugin\n");
+                return 3;
+            }
         } else {
             log_info("QOS: fast, unreliable => selected DPDK UDP plugin\n");
             return 2;
@@ -960,6 +965,8 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
             stream->ep.io_bufs_size = mem_cfg.io_buffer_size;            
             stream->ep.io_bufs_count = mem_cfg.io_buffer_pool_size;
             stream->ep.page_size = (1ULL << 21); //2MB TODO: This must become a nsnd param, used also for alloc.
+            stream->ep.data = NULL; // will be set by the plugin update function
+            stream->ep.data_size = 0; // will be set by the plugin update function
             
             // Add the stream to the plugin
             nsn_os_mutex_lock(&plugin->streams_lock);
@@ -1348,7 +1355,7 @@ main(int argc, char *argv[])
     for (usize i = 0; i < app_pool.count; i++)    app_pool.free_apps_slots[i] = true;
 
     // TODO: Automatically detect which plugins are available and can be used by the daemon.
-    char* plugin_set_names[] = {"udpsock", "tcpsock", "udpdpdk", "tcpdpdk"};
+    char* plugin_set_names[] = {"udpsock", "tcpsock", "udpdpdk", "tcpdpdk", "rdma"};
     plugin_set.count         = array_count(plugin_set_names);
     plugin_set.plugins       = mem_arena_push_array(arena, nsn_plugin_t, plugin_set.count);
 

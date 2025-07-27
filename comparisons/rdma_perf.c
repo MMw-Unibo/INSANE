@@ -720,6 +720,15 @@ void do_sink(test_config_t *params, struct endpoint *local_ep) {
         return;
     }
 
+    // Prepare a number of receive request (rx-depth of QP is the limit)
+    for (uint64_t i = 0; i < 256; ++i) {
+        nb_rx = post_recv(mr->addr, mr->length);
+        if (nb_rx < 1) {
+            fprintf(stderr, "Couldn't post receive %lu (%d)\n", i, nb_rx);
+            return;
+        }
+    }
+
     // Print remote address
     char gid[33];
     inet_ntop(AF_INET6, &rem_dest->gid, gid, sizeof gid);
@@ -729,13 +738,6 @@ void do_sink(test_config_t *params, struct endpoint *local_ep) {
     printf("Ready to receive data\n");
 
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
-
-        // Post receive request
-        nb_rx = post_recv(mr->addr, mr->length);
-        if (nb_rx < 1) {
-            fprintf(stderr, "Couldn't post receive (%d)\n", nb_rx);
-            return;
-        }
 
         // Poll CQ to detect new data
         do {
@@ -759,6 +761,13 @@ void do_sink(test_config_t *params, struct endpoint *local_ep) {
 
         counter++;
         // fprintf(stderr, "(%ld) received: %ld, %s)\n", counter, *data.cnt, *data.msg);
+
+        // Post receive request
+        nb_rx = post_recv(mr->addr, mr->length);
+        if (nb_rx < 1) {
+            fprintf(stderr, "Couldn't post receive (%d)\n", nb_rx);
+            return;
+        }
     }
     last_time = get_clock_realtime_ns();
 
@@ -918,7 +927,7 @@ void do_pong(test_config_t *params, struct endpoint *local_ep) {
             }
         } while (ret < 1);
 
-        fprintf(stderr, "Polled a new WC\n");
+        // fprintf(stderr, "Polled a new WC\n");
 
         // Check if it is for us, and if yes, parse the data
         if (parse_single_wc(&wc) < 0) {
@@ -926,7 +935,7 @@ void do_pong(test_config_t *params, struct endpoint *local_ep) {
             continue;
         }
 
-        fprintf(stderr, "Forwarding sample %lu", ((struct test_data *)mr->addr)->cnt);
+        // fprintf(stderr, "Forwarding sample %lu\n", ((struct test_data *)mr->addr)->cnt);
 
         /* Send it back. */
         ret = post_send(mr->addr, params->payload_size, IBV_SEND_SIGNALED);
@@ -934,9 +943,9 @@ void do_pong(test_config_t *params, struct endpoint *local_ep) {
             fprintf(stderr, "Error posting send");
             return;
         }
-        fprintf(stderr, "Posted send request\n");
+        // fprintf(stderr, "Posted send request\n");
 
-        // Poll CQ to detect new data
+        // Get SEND completion
         do {
             ret = ibv_poll_cq(cq, 1, &wc);
             if (ret < 0) {
