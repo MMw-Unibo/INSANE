@@ -8,7 +8,7 @@ PROJECT_NAME=all
 
 DPDK=`pkg-config --cflags --libs libdpdk --static`
 RDMA=`pkg-config --cflags --libs libibverbs --static`
-TLDK="-I ../../deps/tldk/include -L ../../deps/tldk/lib -ltle_dring -ltle_l4p -ltle_memtank -ltle_timer"
+TLDK="-I ../../deps/include -L ../../deps/lib -ltle_dring -ltle_l4p -ltle_memtank -ltle_timer"
 
 if [ $# -eq 1 ]; then
     BUILD_TYPE=$1
