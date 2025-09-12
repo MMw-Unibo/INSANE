@@ -55,7 +55,7 @@ NSN_DATAPATH_UPDATE(udpsock)
         // create the state of the endpoint, which will hold connection data
         endpoint->data = malloc(sizeof(struct udpsock_ep));
         if (endpoint->data == NULL) {
-            fprintf(stderr, "malloc() failed\n");
+            fprintf(stderr, "[udpsock] malloc() failed\n");
             return -1;
         }
         endpoint->data_size = sizeof(struct udpsock_ep);

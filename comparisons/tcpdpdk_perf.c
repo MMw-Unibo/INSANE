@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <rte_arp.h>
 #include <rte_byteorder.h>
 #include <rte_common.h>
 #include <rte_eal.h>
@@ -365,13 +366,42 @@ static int be_tcp() {
             struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(rx_pkt[i], struct rte_ether_hdr *);
             // Check ethernet type
             if (rte_be_to_cpu_16(eth_hdr->ether_type) != RTE_ETHER_TYPE_IPV4) {
-                // if (rte_be_to_cpu_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_ARP) {
-                //     // Prepare ARP reply
-                //     arp_reply(tldk_ctx.port->id, rx_pkt[i]);
-                //     // Append the mbuf to the TX queue
-                //     tx_pkt[nb_arp] = rx_pkt[i];
-                //     nb_arp++;
-                // }
+                if (rte_be_to_cpu_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_ARP) {
+                    
+                    // Prepare ARP reply
+                    struct rte_ether_hdr *eth_hdr  = rte_pktmbuf_mtod(rx_pkt[i], struct rte_ether_hdr *);
+                    struct rte_arp_hdr   *arp_hdr  = (struct rte_arp_hdr*)(eth_hdr + 1);
+                    struct rte_arp_ipv4  *req_data = &arp_hdr->arp_data;
+                
+                    // 1. Ethernet Header
+                    struct rte_ether_addr local_mac_addr;
+                    memcpy(&local_mac_addr, &eth_hdr->dst_addr, RTE_ETHER_ADDR_LEN);
+                    memcpy(&eth_hdr->dst_addr, &req_data->arp_sha, RTE_ETHER_ADDR_LEN);
+                    memcpy(&eth_hdr->src_addr, &local_mac_addr, RTE_ETHER_ADDR_LEN);
+                    eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP);
+                
+                    // 2. ARP Data
+                    memcpy(&req_data->arp_tha, &req_data->arp_sha, RTE_ETHER_ADDR_LEN);
+                    memcpy(&req_data->arp_sha, &local_mac_addr, RTE_ETHER_ADDR_LEN);
+                
+                    req_data->arp_tip = req_data->arp_sip;
+                    req_data->arp_sip = rte_cpu_to_be_32(IP_SRC);
+                
+                    arp_hdr->arp_opcode    = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
+                    arp_hdr->arp_hardware  = rte_cpu_to_be_16(RTE_ARP_HRD_ETHER);
+                    arp_hdr->arp_hlen      = RTE_ETHER_ADDR_LEN;
+                    arp_hdr->arp_protocol  = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+                    arp_hdr->arp_plen      = 4;
+                
+                    // arp_pkt->next     = NULL;
+                    // arp_pkt->nb_segs  = 1;
+                    // arp_pkt->pkt_len  = sizeof(arp_hdr_t) + RTE_ETHER_HDR_LEN;
+                    // arp_pkt->data_len = arp_pkt->pkt_len;
+
+                    // Append the mbuf to the TX queue
+                    tx_pkt[nb_arp] = rx_pkt[i];
+                    nb_arp++;
+                }
                 continue;
             }
             // Check IP protocol
@@ -810,14 +840,12 @@ void do_pong(struct rte_mempool *mempool, struct tldk_stream_handle str_hdl, tes
         exit(1);
     }
 
-    // TODO: It looks like this feature is not well implemented...
-    // struct tle_tcp_stream_addr addr;
-    // tle_tcp_stream_get_addr(stream, &addr);
-    // struct sockaddr_in *client_addr = (struct sockaddr_in *)&addr.local;
-    // struct sockaddr_in *server_addr = (struct sockaddr_in *)&addr.remote;
-    // printf("Accepted connection from %s to %s\n", inet_ntoa(server_addr->sin_addr),
-    //        inet_ntoa(client_addr->sin_addr));
-    printf("Accepted connection!\n");
+    struct tle_tcp_stream_addr addr;
+    tle_tcp_stream_get_addr(client_stream, &addr);
+    struct sockaddr_in *client_addr = (struct sockaddr_in *)&addr.local;
+    struct sockaddr_in *server_addr = (struct sockaddr_in *)&addr.remote;
+    printf("Accepted connection from %s to %s\n", inet_ntoa(server_addr->sin_addr),
+           inet_ntoa(client_addr->sin_addr));
 
     counter = 0;
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {

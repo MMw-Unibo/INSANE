@@ -288,11 +288,19 @@ NSN_DATAPATH_CONN_MANAGER(tcpsock)
     list_for_each_entry(ep_in, endpoint_list, node) {    
         nsn_endpoint_t *ep = ep_in->ep;
         struct tcpsock_ep *conn = (struct tcpsock_ep *)ep->data;
-
+        if(conn == NULL) {
+            continue;
+        }
+        
         // already connected to all peers - skip
         u32 conn_peers = at_load(&conn->connected_peers, mo_rlx);
         if (conn_peers == n_peers) {
             continue;
+        }
+
+        // Check if the server socket has already been closed
+        if (conn->s_svc_sockfd < 0) {
+            return 0;
         }
 
         // Accept incoming connections
