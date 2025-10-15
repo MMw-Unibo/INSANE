@@ -283,7 +283,7 @@ nsn_init()
     //     goto exit_error_close_shm;
     // }
 
-    // Retrieve the memory manager's created zones: IO-SLOTS and RINGS. 
+    // Retrieve the memory manager's created zones: IO-SLOTS, META-INFO, and RINGS. 
     // TODO: this is a hack, we should have a proper way to get the zones, e.g., through a memory manager API.
     nsn_mm_zone_list_t *zones = (nsn_mm_zone_list_t *)(nsn_shm_rawdata(shm) + sizeof(fixed_mem_arena_t));
 
@@ -295,6 +295,7 @@ nsn_init()
     }
     tx_buf_size = resp->io_buf_size;
 
+    // b) Find the meta info zone
     tx_buf_meta = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_TX_META_NAME));
     if (tx_buf_meta == NULL) {
         log_error("failed to find the tx_io_meta_pool zone\n");
@@ -308,7 +309,7 @@ nsn_init()
     // }
     // rx_buf_size = ?;
     
-    // b) Find the ring zone, its offset in the arena, and then the free_slots ring inside it.
+    // c) Find the ring zone, its offset in the arena, and then the free_slots ring inside it.
     rings_zone = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_RINGS_ZONE_NAME));
     if (rings_zone == NULL) {
         log_error("failed to find the tx_io_buffer_pool zone\n");
