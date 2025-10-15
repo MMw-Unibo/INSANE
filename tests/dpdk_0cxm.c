@@ -7,13 +7,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "../src/nsn_memory.c"
-#include "../src/nsn_string.c"
-#include "../src/nsn_log.h"
-#include "../src/nsn_ringbuf.h"
-#include "../src/nsn_ringbuf.c"
-#include "../src/nsn_os.h"
-#include "../src/nsn_os_linux.c"
+#include "base/nsn_memory.c"
+#include "base/nsn_string.c"
+#include "common/nsn_log.h"
+#include "common/nsn_ringbuf.h"
+#include "common/nsn_ringbuf.c"
+#include "base/nsn_os.h"
+#include "base/nsn_os_linux.c"
 #include "../datapaths/protocols.h"
 
 #include <rte_arp.h>

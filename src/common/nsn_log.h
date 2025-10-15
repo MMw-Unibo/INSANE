@@ -13,6 +13,8 @@
 # error "Unsupported operating system"
 #endif
 
+#define logger_array_count(a)   (sizeof((a))/sizeof((a)[0]))
+
 //--------------------------------------------------------------------------------------------------
 // Colors
 #define ANSI_COLOR_RED     "\x1b[31m"
@@ -47,6 +49,20 @@ enum logger_level
     LOGGER_LEVEL_TRACE
 };
 
+int 
+log_level_from_cstr(char *s) 
+{
+    int res = LOGGER_LEVEL_ERROR;
+    char* log_levels[] = {"error", "warn", "info", "debug", "trace"};
+    for (size_t i = 0; i < logger_array_count(log_levels); ++i) {
+        if (strncmp(log_levels[i], s, strlen(log_levels[i])) == 0) {
+            res = i;
+            break;
+        }
+    }
+    return res;
+}
+
 #ifdef NSN_ENABLE_LOGGER
 # define log(level, fmt, ...) logger_log(level, fmt, ##__VA_ARGS__)
 # define log_trace(fmt, ...)  logger_log(LOGGER_LEVEL_TRACE, fmt, ##__VA_ARGS__)
@@ -72,7 +88,7 @@ void logger_enable_timestamp(int enable);
 
 #endif // NSN_LOG_H
 
-#ifdef NSN_LOG_IMPLEMENTATION_H
+#ifdef NSN_LOG_IMPLEMENTATION
 
 struct logger        s_logger;
 struct logger_config s_config = {
@@ -115,6 +131,14 @@ void
 logger_set_level(int level)
 {
     s_config.level = level;
+}
+
+void
+logger_set_level_by_name(char *name) 
+{
+    u32 level = log_level_from_cstr(name);
+    printf("level name %s (%d)\n", name, level);
+    logger_set_level(level);
 }
 
 void
@@ -229,4 +253,4 @@ logger_log(int level, const char *fmt, ...)
     va_end(args);
 }
 
-#endif // NSN_LOG_IMPLEMENTATION_H
+#endif // NSN_LOG_IMPLEMENTATION

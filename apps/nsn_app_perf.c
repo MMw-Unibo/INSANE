@@ -13,7 +13,7 @@
 // #include "nsn_string.c"
 // #include "nsn_ringbuf.c"
 
-// #define NSN_LOG_IMPLEMENTATION_H
+// #define NSN_LOG_IMPLEMENTATION
 // #include "nsn_log.h"
 
 #define _GNU_SOURCE
@@ -57,6 +57,7 @@ typedef struct test_config {
     uint32_t       payload_size;
     int            qos_datapath;
     int            qos_reliability;
+    int            qos_consumption;
     int64_t        app_source_id;
     uint64_t       sleep_time;
     uint64_t       max_msg;
@@ -90,6 +91,7 @@ void usage(int argc, char *argv[]) {
            "-n: max messages to send (0 = no limit)           \n"
            "-q: datapath QoS. Can be fast or slow             \n"
            "-r: reliability QoS. Can be reliable or unreliable\n"
+           "-c: consumption QoS. Can be poll or low           \n"
            "-a: specify app-defined source id                 \n"
            "-t: configure sleep time (s) in send              \n",
            argv[0]);
@@ -105,10 +107,10 @@ static inline uint64_t get_clock_realtime_ns() {
 
 //--------------------------------------------------------------------------------------------------
 // source
-void do_source(nsn_stream_t *stream, test_config_t *params) {
+void do_source(nsn_stream_t stream, test_config_t *params) {
     // char             *msg     = MSG;
     uint64_t          counter = 0;
-    nsn_buffer_t      buf;
+    nsn_buffer_t      *buf;
     struct test_data *data;
     int               ret;
 
@@ -124,13 +126,13 @@ void do_source(nsn_stream_t *stream, test_config_t *params) {
         tx_time = get_clock_realtime_ns();
         buf     = nsn_get_buffer(params->payload_size, 0);
 
-        if (nsn_buffer_is_valid(&buf)) {
-            data = (struct test_data *)buf.data;
+        if (nsn_buffer_is_valid(buf)) {
+            data = (struct test_data *)buf->data;
             data->tx_time = tx_time;
             data->cnt     = counter++;
             // strncpy(data->msg, msg, strlen(msg) + 1);
 
-            buf.len = params->payload_size;
+            buf->len = params->payload_size;
 
             ret = nsn_emit_data(source, buf);
             // Check the outcome
@@ -146,7 +148,7 @@ void do_source(nsn_stream_t *stream, test_config_t *params) {
 
 //--------------------------------------------------------------------------------------------------
 // sink
-void do_sink(nsn_stream_t *stream, test_config_t *params) {
+void do_sink(nsn_stream_t stream, test_config_t *params) {
 
     nsn_sink_t sink = nsn_create_sink(stream, params->app_source_id, NULL);
     uint64_t   first_time = 0, last_time = 0;
@@ -155,7 +157,7 @@ void do_sink(nsn_stream_t *stream, test_config_t *params) {
     uint64_t counter = 0;
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
-        nsn_buffer_t buf = nsn_consume_data(sink, NSN_BLOCKING);
+        nsn_buffer_t *buf = nsn_consume_data(sink, NSN_BLOCKING);
 
         if (counter == 0) {
             first_time = get_clock_realtime_ns();
@@ -190,7 +192,7 @@ void do_sink(nsn_stream_t *stream, test_config_t *params) {
 
 //--------------------------------------------------------------------------------------------------
 // ping
-void do_ping(nsn_stream_t *stream, test_config_t *params) {
+void do_ping(nsn_stream_t stream, test_config_t *params) {
     nsn_sink_t   sink   = nsn_create_sink(stream, params->app_source_id, NULL);
     nsn_source_t source = nsn_create_source(stream, params->app_source_id);
 
@@ -199,7 +201,7 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
 
     uint64_t          counter = 0;
     struct test_data *data;
-    nsn_buffer_t      buf_recv, buf_send;
+    nsn_buffer_t      *buf_recv, *buf_send;
     uint64_t          send_time, response_time, latency;
 
     if(params->payload_size < sizeof(struct test_data)) {
@@ -215,15 +217,15 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
 
         buf_send  = nsn_get_buffer(params->payload_size, NSN_BLOCKING);
         send_time = get_clock_realtime_ns();
-        if (!nsn_buffer_is_valid(&buf_send)) {
+        if (!nsn_buffer_is_valid(buf_send)) {
             fprintf(stderr, "Failed to get buffer\n");
             continue;
         }
         
-        data          = (struct test_data *)buf_send.data;
+        data          = (struct test_data *)buf_send->data;
         data->cnt     = counter++;
         data->tx_time = send_time;
-        buf_send.len  = params->payload_size;
+        buf_send->len  = params->payload_size;
         // strncpy(data->msg, msg, msg_len);
         nsn_emit_data(source, buf_send);
 
@@ -241,16 +243,16 @@ void do_ping(nsn_stream_t *stream, test_config_t *params) {
 
 //--------------------------------------------------------------------------------------------------
 // pong
-void do_pong(nsn_stream_t *stream, test_config_t *params) {
+void do_pong(nsn_stream_t stream, test_config_t *params) {
     uint64_t counter = 0;
 
     nsn_sink_t   sink   = nsn_create_sink(stream, params->app_source_id, NULL);
     nsn_source_t source = nsn_create_source(stream, params->app_source_id);
 
-    nsn_buffer_t buf;
+    nsn_buffer_t *buf;
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
         buf = nsn_consume_data(sink, NSN_BLOCKING);
-        if (!nsn_buffer_is_valid(&buf)) {
+        if (!nsn_buffer_is_valid(buf)) {
             fprintf(stderr, "Failing to receive. Continuing...\n");
             continue;
         }
@@ -277,6 +279,7 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
     config->payload_size    = strlen(MSG) + 1;
     config->qos_datapath    = NSN_QOS_DATAPATH_DEFAULT;
     config->qos_reliability = NSN_QOS_RELIABILITY_UNRELIABLE;
+    config->qos_consumption = NSN_QOS_CONSUMPTION_POLL;
     config->app_source_id   = 0;
     config->sleep_time      = 0;
     config->max_msg         = 0;
@@ -348,7 +351,21 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
         if (!strncmp(argv[i], "-r", 2) || !strncmp(argv[i], "--qos-rel", 8)) {
             config->qos_reliability = NSN_QOS_RELIABILITY_RELIABLE;
             continue;
-        }        
+        }
+        // QoS Consumption
+        if (!strncmp(argv[i], "-c", 2) || !strncmp(argv[i], "--qos-consumption", 17)) {
+            ENSURE_ONE_MORE_ARGUMENT(argc, argv, i, "--qos-consumption")
+            i++;
+            if (!strcmp(argv[i], "poll")) {
+                config->qos_consumption = NSN_QOS_CONSUMPTION_POLL;
+            } else if (!strcmp(argv[i], "low")) {
+                config->qos_consumption = NSN_QOS_CONSUMPTION_LOW;
+            } else {
+                fprintf(stderr, "! Invalid value for --qos-consumption option: %s\n", argv[i]);
+                return -1;
+            }
+            continue;
+        }
         // Source id
         if (!strncmp(argv[i], "-a", 2) || !strncmp(argv[i], "--app-source-id", 15)) {
             char *ptr;
@@ -410,7 +427,7 @@ int main(int argc, char *argv[]) {
 
     /* Create stream */
     nsn_options_t options = {
-            .consumption = NSN_QOS_CONSUMPTION_POLL, 
+            .consumption = params.qos_consumption, 
             .datapath = params.qos_datapath, 
             .determinism = NSN_QOS_DETERMINISM_DEFAULT,
             .reliability = params.qos_reliability};
@@ -418,13 +435,13 @@ int main(int argc, char *argv[]) {
 
     /* Do test */
     if (params.role == role_sink) {
-        do_sink(&stream, &params);
+        do_sink(stream, &params);
     } else if (params.role == role_source) {
-        do_source(&stream, &params);
+        do_source(stream, &params);
     } else if (params.role == role_ping) {
-        do_ping(&stream, &params);
+        do_ping(stream, &params);
     } else if (params.role == role_pong) {
-        do_pong(&stream, &params);
+        do_pong(stream, &params);
     } else {
         fprintf(stderr, "Test not supported\n");
         return -1;

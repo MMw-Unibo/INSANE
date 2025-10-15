@@ -24,6 +24,7 @@ sudo apt install -y librdmacm-dev libmnl-dev build-essential clang libnuma-dev p
 set -e
 
 # Switch to working directory.
+home=$(pwd)
 pushd $PWD
 mkdir -p $HOME/tmp/dpdk
 cd $HOME/tmp/dpdk
@@ -32,13 +33,17 @@ cd $HOME/tmp/dpdk
 git clone https://github.com/DPDK/dpdk.git
 cd dpdk
 git checkout v22.11
+git apply "$home/../dpdk_22_11_mods.diff"
 
 # Build and install
-meson --buildtype=release --default_library=shared --prefix=$INSTALL_DIR build
+meson setup --buildtype=release --prefix=$INSTALL_DIR build
 cd build
-ninja build
+ninja
 sudo ninja install
 sudo ldconfig
+
+# Make it seen by pkg-config
+export PKG_CONFIG_PATH=$INSTALL_DIR/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
 
 # Cleanup.
 popd

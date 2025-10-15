@@ -172,7 +172,7 @@ __nsn_ringbuf_do_enqueue_elems(nsn_ringbuf_t *rb, const void *obj_table, u32 esi
     n = __nsn_ringbuf_move_prod_head(rb, n, &prod_head, &prod_next, &free_entries);
     if (n == 0)
     {
-        log_warn("no free entries in ringbuf\n");
+        log_trace("no free entries in ringbuf\n");
         goto end;
     }
 

@@ -31,13 +31,13 @@ int register_memory_area(void *addr, const uint64_t len, uint32_t page_size,
     // Pin pages in memory (necessary if we do not use hugepages)
     mlock(addr, len);
 
-    fprintf(stderr, "[udpdpdk] registering memory area %p, len %lu, page_size %u, port_id %u\n", addr, len, page_size, port_id);
+    fprintf(stderr, "[dpdk] registering memory area %p, len %lu, page_size %u, port_id %u\n", addr, len, page_size, port_id);
 
     // Prepare for the external memory registration with DPDK: compute page IOVAs
     uint32_t    n_pages = len < page_size ? 1 : len / page_size;
     rte_iova_t *iovas   = (rte_iova_t*)malloc(sizeof(*iovas) * n_pages);
     if (iovas == NULL) {
-        fprintf(stderr, "[udpdpdk] failed to allocate iovas: %s\n", strerror(errno));
+        fprintf(stderr, "[dpdk] failed to allocate iovas: %s\n", strerror(errno));
         return -1;
     }
     for (uint32_t cur_page = 0; cur_page < n_pages; cur_page++) {
@@ -54,7 +54,7 @@ int register_memory_area(void *addr, const uint64_t len, uint32_t page_size,
     // use the internal DPDK page table to get IOVAs.
     int ret = rte_extmem_register(addr, len, iovas, n_pages, page_size);
     if (ret < 0) {
-        fprintf(stderr, "[udpdpdk] failed to register external memory with DPDK: %s\n",
+        fprintf(stderr, "[dpdk] failed to register external memory with DPDK: %s\n",
                rte_strerror(rte_errno));
         return -1;
     }
@@ -66,7 +66,7 @@ int register_memory_area(void *addr, const uint64_t len, uint32_t page_size,
         ret = rte_dev_dma_map(dev_info.device, addr + (cur_page * page_size), iovas[cur_page],
                               page_size);
         if (ret < 0) {
-            fprintf(stderr, "[udpdpdk] failed to pin memory for DMA: %s\n", rte_strerror(rte_errno));
+            fprintf(stderr, "[dpdk] failed to pin memory for DMA: %s\n", rte_strerror(rte_errno));
             return -1;
         }
     }
@@ -87,14 +87,14 @@ int unregister_memory_area(void *addr, const uint64_t len, uint32_t page_size,
         size_t     offset = page_size * cur_page;
         ret = rte_dev_dma_unmap(dev_info.device, addr + offset, rte_mem_virt2iova(addr + offset), page_size);
         if (ret < 0) {
-            fprintf(stderr, "[udpdpdk] failed to unpin memory for DMA: %s\n", rte_strerror(rte_errno));
+            fprintf(stderr, "[dpdk] failed to unpin memory for DMA: %s\n", rte_strerror(rte_errno));
         }
     }
 
     // De-register pages from DPDK
     ret = rte_extmem_unregister(addr, len);
     if (ret < 0) {
-        fprintf(stderr, "[udpdpdk] failed to unregister external memory from DPDK: %s\n",
+        fprintf(stderr, "[dpdk] failed to unregister external memory from DPDK: %s\n",
         rte_strerror(rte_errno));
     }
 
@@ -105,7 +105,7 @@ int unregister_memory_area(void *addr, const uint64_t len, uint32_t page_size,
 }
 
 // --------------------------------------------------------------------------------------------
-// RSS Flow Configuration
+// RSS Flow Configurations (UDP and TCP)
 struct rte_flow * 
 configure_udp_rss_flow(u16 port_id, u16 queue_id, 
                        char* local_ip_str, uint16_t udp_port, 
@@ -144,10 +144,10 @@ configure_udp_rss_flow(u16 port_id, u16 queue_id,
     pattern[0].spec              = &item_eth_spec;
 
     bzero(&ipv4_spec, sizeof(ipv4_spec));
-    ipv4_spec.hdr.next_proto_id = 0x11; // UDP only
+    ipv4_spec.hdr.next_proto_id = IPPROTO_UDP; // UDP only
     inet_pton(AF_INET, local_ip_str, &ipv4_spec.hdr.dst_addr); // Local IP only
     bzero(&ipv4_mask, sizeof(ipv4_mask));
-    ipv4_mask.hdr.next_proto_id = 0xff; // UDP Mask
+    ipv4_mask.hdr.next_proto_id = 0xff; // Next Proto Mask
     // ipv4_mask.hdr.dst_addr      = 0xffffffff; // This is not supported by the Intel IGC driver
     pattern[1].type = RTE_FLOW_ITEM_TYPE_IPV4;
     // pattern[1].spec = &ipv4_spec;      // This is not supported by the Intel i40e driver
@@ -161,6 +161,73 @@ configure_udp_rss_flow(u16 port_id, u16 queue_id,
     pattern[2].type       = RTE_FLOW_ITEM_TYPE_UDP;
     pattern[2].spec       = &udp_spec;
     pattern[2].mask       = &udp_mask;
+    pattern[2].last       = NULL;
+
+    pattern[3].type = RTE_FLOW_ITEM_TYPE_END;
+
+    err = rte_flow_validate(port_id, &attr, pattern, action, error);
+    if (!err) {
+        flow = rte_flow_create(port_id, &attr, pattern, action, error);
+    }
+
+    return flow;
+}
+
+struct rte_flow * 
+configure_tcp_rss_flow(u16 port_id, u16 queue_id, 
+                       char* local_ip_str, uint16_t tcp_port, 
+                       struct rte_flow_error *error) 
+{
+    struct rte_flow_attr         attr;
+    struct rte_flow_item         pattern[4];
+    struct rte_flow_item_eth     item_eth_mask = {};
+    struct rte_flow_item_eth     item_eth_spec = {};
+    struct rte_flow_item_ipv4    ipv4_spec;
+    struct rte_flow_item_ipv4    ipv4_mask;
+    struct rte_flow_item_tcp     tcp_spec;
+    struct rte_flow_item_tcp     tcp_mask;
+    struct rte_flow_action       action[2];
+    struct rte_flow             *flow  = NULL;
+    struct rte_flow_action_queue queue = {.index = queue_id};
+    int                          err;
+
+    bzero(&attr, sizeof(attr));
+    bzero(pattern, sizeof(pattern));
+    bzero(action, sizeof(action));
+
+    // rule attr
+    attr.ingress = 1;
+
+    // action sequence
+    action[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+    action[0].conf = &queue;
+    action[1].type = RTE_FLOW_ACTION_TYPE_END;
+
+    // patterns
+    item_eth_spec.hdr.ether_type = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+    item_eth_mask.hdr.ether_type = RTE_BE16(0xFFFF);
+    pattern[0].type              = RTE_FLOW_ITEM_TYPE_ETH;
+    pattern[0].mask              = &item_eth_mask;
+    pattern[0].spec              = &item_eth_spec;
+
+    bzero(&ipv4_spec, sizeof(ipv4_spec));
+    ipv4_spec.hdr.next_proto_id = IPPROTO_TCP; // TCP only
+    inet_pton(AF_INET, local_ip_str, &ipv4_spec.hdr.dst_addr); // Local IP only
+    bzero(&ipv4_mask, sizeof(ipv4_mask));
+    ipv4_mask.hdr.next_proto_id = 0xff; // Next Proto Mask
+    // ipv4_mask.hdr.dst_addr      = 0xffffffff; // This is not supported by the Intel IGC driver
+    pattern[1].type = RTE_FLOW_ITEM_TYPE_IPV4;
+    // pattern[1].spec = &ipv4_spec;      // This is not supported by the Intel i40e driver
+    // pattern[1].mask = &ipv4_mask;      // This is not supported by the Intel i40e driver
+    pattern[1].last = NULL;
+
+    bzero(&tcp_spec, sizeof(tcp_spec));
+    tcp_spec.hdr.dst_port = RTE_BE16(tcp_port); // UDP port
+    bzero(&tcp_mask, sizeof(tcp_mask));
+    tcp_mask.hdr.dst_port = 0xffff;
+    pattern[2].type       = RTE_FLOW_ITEM_TYPE_TCP;
+    pattern[2].spec       = &tcp_spec;
+    pattern[2].mask       = &tcp_mask;
     pattern[2].last       = NULL;
 
     pattern[3].type = RTE_FLOW_ITEM_TYPE_END;
@@ -465,10 +532,10 @@ static int nsn_mp_alloc(struct rte_mempool *mp) {
     // Actually, to enable that, we expect the user to already set the mp->pool to a ring.
     // And so here we just verify it exists!
     if(mp->pool_data == NULL) {
-        // fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: deferring init...\n", mp->name);
+        // fprintf(stderr, "[dpdk] Mempool %s has no ring attached: deferring init...\n", mp->name);
     } else {
         nsn_ringbuf_t *ring = (nsn_ringbuf_t *)mp->pool_data;
-        fprintf(stderr, "[udpdpdk] mempool %s backed by ring %s at %p\n", mp->name, ring->name, ring);
+        fprintf(stderr, "[dpdk] mempool %s backed by ring %s at %p\n", mp->name, ring->name, ring);
     }
 
     // Create the array to keep the mbufs
@@ -485,7 +552,7 @@ static void nsn_mp_free(struct rte_mempool *mp) {
 
 static int nsn_mp_enqueue(struct rte_mempool *mp, void * const *obj_table, unsigned n) {
     if (!mp->pool_data ) {
-        // fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: cannot enqueue yet\n", mp->name);
+        // fprintf(stderr, "[dpdk] Mempool %s has no ring attached: cannot enqueue yet\n", mp->name);
         return 0;
     }
     size_t index;
@@ -501,7 +568,7 @@ static int nsn_mp_enqueue(struct rte_mempool *mp, void * const *obj_table, unsig
 
 static int nsn_mp_dequeue(struct rte_mempool *mp, void **obj_table, unsigned n) {
     if (!mp->pool_data) {
-        // fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: cannot dequeue yet\n", mp->name);
+        // fprintf(stderr, "[dpdk] Mempool %s has no ring attached: cannot dequeue yet\n", mp->name);
         return 0;
     }
     size_t index;
@@ -524,7 +591,7 @@ static unsigned
 nsn_mp_get_count(const struct rte_mempool *mp)
 {
     if (!mp->pool_data ) {
-        fprintf(stderr, "[udpdpdk] Mempool %s has no ring attached: cannot use it yet\n", mp->name);
+        fprintf(stderr, "[dpdk] Mempool %s has no ring attached: cannot use it yet\n", mp->name);
         return 0;
     }
 	return nsn_ringbuf_count((nsn_ringbuf_t *)mp->pool_data);

@@ -4,7 +4,6 @@
 #include "protocols.h"
 
 #include "../src/common/nsn_temp.h"
-
 #include "../src/base/nsn_os_linux.c"
 
 // This DPDK plugin assumes we are working with NICs that use the mlx5 driver.
@@ -31,10 +30,9 @@
 // Per-endpoint state
 struct udpdpdk_ep {
     u16 rx_queue_id;
-    struct rte_mempool *rx_hdr_pool;
-    struct rte_mempool *rx_data_pool;
-    struct rte_mempool *tx_hdr_pool;
-    struct rte_mempool *tx_data_pool;
+    nsn_buf_t pending_rx_buf; // For non zero-copy receive
+    struct rte_mempool *hdr_pool; // Pool for headers, and RX payloads if zc_rx is false
+    struct rte_mempool *zc_pool;  // Pool for zero-copy TX and RX
     struct rte_flow *app_flow;
 };
 
@@ -55,47 +53,57 @@ struct rte_mempool *ctrl_pool;
 static temp_mem_arena_t scratch;
 static struct rte_flow *rx_arp_flow;
 static bool dev_stopped = true;
+static bool zc_rx = false; // Zero-copy RX switch
 
 /* Protocols */
-static inline void prepare_headers(struct rte_mbuf *hdr_mbuf, size_t payload_size, uint16_t udp_port, int peer_idx) {
+static inline void 
+prepare_headers(
+    struct rte_mbuf *hdr_mbuf, size_t payload_size, 
+    uint16_t udp_port, int peer_idx
+) {
 
-    /* Ethernet */
-    struct rte_ether_hdr *ehdr = rte_pktmbuf_mtod(hdr_mbuf, struct rte_ether_hdr*);
-    memcpy(&ehdr->src_addr, &local_mac_addr, RTE_ETHER_ADDR_LEN);
-    memcpy(&ehdr->dst_addr, &peers[peer_idx].mac_addr, RTE_ETHER_ADDR_LEN);
-    ehdr->ether_type = htons(RTE_ETHER_TYPE_IPV4);
+    struct rte_ether_hdr *ehdr;
+    struct rte_ipv4_hdr *ih;
+    struct rte_udp_hdr *uh;
 
-    /* IP */
-    struct rte_ipv4_hdr *ih = (struct rte_ipv4_hdr *)(ehdr + 1);
-    ih->src_addr        = local_ip_net;
-    ih->dst_addr        = peers[peer_idx].ip_net;
-    ih->version         = IPV4;
-    ih->ihl             = 0x05;
-    ih->type_of_service = 0;
-    ih->total_length    = htons(payload_size + IP_HDR_LEN + UDP_HDR_LEN);
-    ih->packet_id       = 0;
-    ih->fragment_offset = 0;
-    ih->time_to_live    = 64;
-    ih->next_proto_id   = IP_UDP;
-    ih->hdr_checksum    = 0;
-    // Compute the IP checksum
-    ih->hdr_checksum = rte_ipv4_cksum(ih);
+    // Ethernet
+    {
+        ehdr = rte_pktmbuf_mtod(hdr_mbuf, struct rte_ether_hdr*);
+        memcpy(&ehdr->src_addr, local_mac_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+        memcpy(&ehdr->dst_addr, &peers[peer_idx].mac_addr, RTE_ETHER_ADDR_LEN);
+        ehdr->ether_type = htons(RTE_ETHER_TYPE_IPV4);
+    }
 
-    /* UDP */
-    struct rte_udp_hdr *uh = (struct rte_udp_hdr *)(ih + 1);
-    uh->dst_port           = htons(udp_port);
-    uh->src_port           = htons(udp_port);
-    uh->dgram_len          = htons(payload_size + UDP_HDR_LEN);
-    uh->dgram_cksum        = 0;
-    // Compute the UDP checksum
-    // uh->dgram_cksum = rte_ipv4_udptcp_cksum(ih, uh);
+    // IP
+    {
+        ih = (struct rte_ipv4_hdr *)(ehdr + 1);
+        memory_zero_struct(ih);
+        ih->src_addr        = local_ip_net;
+        ih->dst_addr        = peers[peer_idx].ip_net;
+        ih->version         = IPV4;
+        ih->ihl             = 0x05;
+        ih->total_length    = htons(payload_size + IP_HDR_LEN + UDP_HDR_LEN);
+        ih->time_to_live    = 64;
+        ih->next_proto_id   = IP_UDP;
+        ih->hdr_checksum    = rte_ipv4_cksum(ih);
+    }
+
+    // UDP
+    {
+        uh = (struct rte_udp_hdr *)(ih + 1);
+        memory_zero_struct(uh);
+        uh->dst_port    = htons(udp_port);
+        uh->src_port    = htons(udp_port);
+        uh->dgram_len   = htons(payload_size + UDP_HDR_LEN);
+    }
 
     // Finally, set the data_len and pkt_len: only headers! The payload size is in another mbuf
     hdr_mbuf->data_len = hdr_mbuf->pkt_len = RTE_ETHER_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN;
 }
 
 /* API */
-NSN_DATAPATH_UPDATE(udpdpdk) {
+NSN_DATAPATH_UPDATE(udpdpdk)
+{
     if (endpoint == NULL) {
         fprintf(stderr, "[udpdpdk] invalid endpoint\n");
         return -1;
@@ -118,15 +126,20 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
             }
         }
 
-        // Destroy the tx mempools
-        rte_mempool_free(conn->tx_data_pool);
-        rte_mempool_free(conn->tx_hdr_pool);
+        // Destroy the mempools
+        rte_mempool_free(conn->zc_pool);
+        rte_mempool_free(conn->hdr_pool);
 
         // Un-register memory
         void *addr = (void*)((usize)endpoint->tx_zone & 0xFFFFFFFFFFF00000);
         usize len  = align_to((endpoint->tx_zone->total_size + (((void*)endpoint->tx_zone) - addr)),
                               endpoint->page_size);
         unregister_memory_area(addr, len, endpoint->page_size, port_id);
+
+        if (!zc_rx) {
+            // Return the pending buffer to the free slots
+            nsn_ringbuf_enqueue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
+        }
 
         // Enqueue the queue_id in the free queue_ids
         nsn_ringbuf_enqueue_burst(free_queue_ids, &conn->rx_queue_id, sizeof(void*), 1, NULL);
@@ -171,95 +184,119 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
             goto error_1;
         }
         
-        // RX: header mempool. Must have 10239 as num_mbufs or it fails
+        // Configure the external memory. This is used for RX, if zero-copy is enabled, and always for TX.
+        uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
+        uint32_t n_pages    = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
+        char *data_ptr      = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone));
+
+        struct rte_pktmbuf_extmem *extmem_pages = malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
+
+        for (uint32_t i = 0; i < n_pages; i++) {
+            void *ptr = (i==0) ? data_ptr : addr + i * endpoint->page_size;
+            extmem_pages[i].buf_ptr  = ptr; 
+            struct rte_memseg *ms    = rte_mem_virt2memseg(ptr, rte_mem_virt2memseg_list(ptr));
+            extmem_pages[i].buf_iova = ms->iova + ((char *)ptr - (char *)ms->addr);
+            extmem_pages[i].buf_len  = (i==0) 
+                                        ? endpoint->page_size - (data_ptr - (char*)addr) 
+                                        : endpoint->page_size;
+            extmem_pages[i].elt_size = endpoint->io_bufs_size;
+        }
+        
         char pool_name[64];
         bzero(pool_name, 64);
-        sprintf(pool_name, "rx_hdr_pool_%u", conn->rx_queue_id);
-        if ((conn->rx_hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
+
+        // Header mempool. Must have 10239 as num_mbufs or it fails. 
+        // It is used for TX and RX headers. If zero-copy RX is disabled,
+        // it is used for RX payloads as well.
+        sprintf(pool_name, "hdr_pool_%u", conn->rx_queue_id);
+        if ((conn->hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
             fprintf(stderr, "[udpdpdk] failed to create mempool %s\n", pool_name);
             goto error_2;
         }
 
-        // RX: data mempool with external memory configuration
+        // Mempool with external memory configuration
         /* External memory configuration
             This mempool contains only descriptors, not data: data_room_size is 0.
             The descriptors will point to the INSANE nbufs, containing the data.
             This is called "indirect mempool" in DPDK.
             This mempool is actually a "special" mempool backed by the INSANE ring.
-
+        
             In INSANE, the data area is not aligned to the page size, so the first page must 
             be registered with a smaller size than the page size. The rest of the pages will be
             registered with the full page size. "addr" points to the beginning of the page,
             and "data_ptr" points to the beginning of the data area on that page.
         */
         bzero(pool_name, 64);
-        sprintf(pool_name, "rx_data_pool_%u", conn->rx_queue_id);
-        uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
-        uint32_t n_pages = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
-        char *data_ptr = (char*)(endpoint->tx_zone + 1);
-        // fprintf(stderr, "Memory for data starts at %p [npages = %u, size = %lu]\n", data_ptr, n_pages, endpoint->tx_zone->size);
-        struct rte_pktmbuf_extmem *extmem_pages =
-            malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
-        for (uint32_t i = 0; i < n_pages; i++) {
-            void *ptr                = (i==0)? 
-                                            data_ptr : 
-                                            addr + i * endpoint->page_size;
-            extmem_pages[i].buf_ptr  = ptr; 
-            struct rte_memseg *ms    = rte_mem_virt2memseg(ptr, rte_mem_virt2memseg_list(ptr));
-            extmem_pages[i].buf_iova = ms->iova + ((char *)ptr - (char *)ms->addr);
-            extmem_pages[i].buf_len  = (i==0)? 
-                                            endpoint->page_size - (data_ptr - (char*)addr) : 
-                                            endpoint->page_size;
-            extmem_pages[i].elt_size = endpoint->io_bufs_size;
-        }
+        sprintf(pool_name, "zc_pool_%u", conn->rx_queue_id);
         size_t private_size    = sizeof(size_t);
         size_t data_room_size  = 0;
-        conn->rx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
-            pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
-        if (!conn->rx_data_pool) {
-            fprintf(stderr, "[udpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
+        conn->zc_pool = 
+            nsn_dpdk_pktmbuf_pool_create_extmem(
+                pool_name, endpoint->io_bufs_count, 0, private_size, 
+                data_room_size, socket_id, extmem_pages, n_pages, 
+                endpoint->free_slots
+            );
+        if (!conn->zc_pool) {
+            fprintf(stderr, "[udpdpdk]: failed to create zc data pool: %s\n", rte_strerror(rte_errno));
             goto error_3;
         }  
+
         // This is the HACK that makes the external memory work. The external mempool must be
         // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
         // to know the size of the mbufs. So, afer the creation, we set the data room size of the
         // mbufs to the maximum size of the payload. Apparently this works withouth visible side
         // effects. TODO: Is there a proper way to do this?
         struct rte_pktmbuf_pool_private *mbp_priv =
-            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->rx_data_pool);
+            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->zc_pool);
         mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
 
-        /* Configure RX split: headers and payloads in their respective mempools */
-        struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
-        // Configure the BUFFER_SPLIT offload behavior for the selected RX queue.
-        uint8_t rx_pkt_nb_segs = 2;
-        struct rte_eth_rxseg_split *rx_seg;
-        union rte_eth_rxseg rx_useg[2] = {};
-        // Segment 0 (header)
-        rx_seg         = &rx_useg[0].split;
-        rx_seg->mp     = conn->rx_hdr_pool;
-        rx_seg->offset = 0;
-        // See docs in rte_ethdev.h. Must be zero if length is used (and vice versa)
-        rx_seg->proto_hdr = 0;
-        // Max bytes to be placed in this segment. Must be zero if proto_hdr is used (and vice versa)
-        rx_seg->length = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
-        // Segment 1 (payload)
-        rx_seg         = &rx_useg[1].split;
-        rx_seg->offset = 0;
-        rx_seg->mp     = conn->rx_data_pool;
-        rx_seg->proto_hdr = 0;
-        rx_seg->length = 2048;
+        /* We have two separate paths, one to enable the zero-copy receive, one for the copy-on-receive */
+        if(zc_rx) {
+            /* Configure RX split: headers and payloads in their respective mempools */
+            struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
+            // Configure the BUFFER_SPLIT offload behavior for the selected RX queue.
+            uint8_t rx_pkt_nb_segs = 2;
+            struct rte_eth_rxseg_split *rx_seg;
+            union rte_eth_rxseg rx_useg[2] = {};
+            // Segment 0 (header)
+            rx_seg         = &rx_useg[0].split;
+            rx_seg->mp     = conn->hdr_pool;
+            rx_seg->offset = 0;
+            // See docs in rte_ethdev.h. Must be zero if length is used (and vice versa)
+            rx_seg->proto_hdr = 0;
+            // Max bytes to be placed in this segment. Must be zero if proto_hdr is used (and vice versa)
+            rx_seg->length = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr);
+            // Segment 1 (payload)
+            rx_seg         = &rx_useg[1].split;
+            rx_seg->offset = 0;
+            rx_seg->mp     = conn->zc_pool;
+            rx_seg->proto_hdr = 0;
+            rx_seg->length = 2048;
 
-        // Configure the number of segments and the segments themselves
-        rx_conf.rx_nseg     = rx_pkt_nb_segs;
-        rx_conf.rx_seg      = rx_useg;
-        rx_conf.rx_mempools = NULL;
-        rx_conf.rx_nmempool = 0;
-        rx_conf.rx_deferred_start = 1;
-        // Setup the RX queue using the selected configuration
-        if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, &rx_conf, NULL)) != 0) {
-            fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
-            goto error_4;
+            // Configure the number of segments and the segments themselves
+            rx_conf.rx_nseg     = rx_pkt_nb_segs;
+            rx_conf.rx_seg      = rx_useg;
+            rx_conf.rx_mempools = NULL;
+            rx_conf.rx_nmempool = 0;
+            rx_conf.rx_deferred_start = 1;
+            // Setup the RX queue using the selected configuration
+            if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, &rx_conf, NULL)) != 0) {
+                fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
+                goto error_4;
+            }
+        } else {
+            // get a descriptor to receive
+            u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
+            if (np == 0) {
+                printf("[udpdpdk] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                goto error_1;
+            }
+
+            // Setup the RX queue using the selected configuration
+            if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, NULL, conn->hdr_pool)) != 0) {
+                fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
+                goto error_4;
+            }
         }
 
         // Start the queue
@@ -278,42 +315,18 @@ NSN_DATAPATH_UPDATE(udpdpdk) {
             goto error_5;
         }
 
-        /* TX: header mempool */
-        sprintf(pool_name, "tx_hdr_pool_%u", conn->rx_queue_id);
-        conn->tx_hdr_pool = rte_pktmbuf_pool_create(
-            pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
-        if (!conn->tx_hdr_pool) {
-            fprintf(stderr, "[udpdpdk]: failed to create tx hdr pool: %s\n", rte_strerror(rte_errno));
-            goto error_6;
-        }
-
-        /* TX: data mempool. External memory, use the same config as before */
-        private_size    = sizeof(size_t);
-        data_room_size  = 0;
-        sprintf(pool_name, "tx_data_pool_%u", conn->rx_queue_id);
-        conn->tx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
-            pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
-        if (!conn->tx_data_pool) {
-            fprintf(stderr, "[udpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
-            goto error_7;
-        }      
-        mbp_priv =
-            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->tx_data_pool);
-        mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
-
         return 0;
-error_7:
-        rte_mempool_free(conn->tx_hdr_pool);
-error_6:
-        rte_flow_destroy(port_id, conn->app_flow, NULL);
 error_5:
         rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
 error_4:
-        rte_mempool_free(conn->rx_data_pool);
+        rte_mempool_free(conn->zc_pool);
 error_3:
-        rte_mempool_free(conn->rx_hdr_pool);
+        rte_mempool_free(conn->hdr_pool);
 error_2:
         unregister_memory_area(addr, len, endpoint->page_size, port_id);
+        if (!zc_rx) {
+            nsn_ringbuf_enqueue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL); 
+        }
 error_1:
         nsn_ringbuf_enqueue_burst(free_queue_ids, &conn->rx_queue_id, sizeof(void*), 1, NULL);
         free(conn);
@@ -329,31 +342,26 @@ NSN_DATAPATH_CONN_MANAGER(udpdpdk)
     nsn_unused(endpoint_list);
     struct rte_mbuf      *pkts_burst[MAX_RX_BURST_ARP];
     struct rte_ether_hdr *eth_hdr;
-    uint16_t              ether_type;
-    uint16_t              queue_id = 0;
-    int j;
-
-    // Send ARP requests for "missing" peers
-    // for (int i = 0; i < n_peers; i++) {
-    //     if (!peers[i].mac_set) {
-    //         arp_request(peers[i].ip_net);
-    //     }
-    // }
-
-    // Receive ARP replies or answer incoming ARP requests
-    uint16_t rx_count = rte_eth_rx_burst(port_id, 0, pkts_burst, MAX_RX_BURST_ARP);
-
-    for (j = 0; j < rx_count; j++) {
+    u16 ether_type;
+    
+    const u16 queue_id = 0;
+    u16 rx_count  = rte_eth_rx_burst(port_id, 0, pkts_burst, MAX_RX_BURST_ARP);
+    if (rx_count > 0)
+        fprintf(stderr, "[%s] received %u packets\n", __func__, rx_count);
+    
+    for (int j = 0; j < rx_count; j++) {
         eth_hdr    = rte_pktmbuf_mtod(pkts_burst[j], struct rte_ether_hdr *);
         ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
         switch (ether_type) {
-            case RTE_ETHER_TYPE_ARP:
-                // Receive ARP and, if necessary, reply. Free is done by the internal TX.
-                arp_receive(port_id, tx_queue_id, local_ip_net, pkts_burst[j], peers, n_peers);
-                break;
-            default:
+            case RTE_ETHER_TYPE_ARP: {
+                fprintf(stderr, "[%s] handling an ARP packet (%d)\n", __func__, j);
+                arp_receive(port_id, tx_queue_id, &local_mac_addr, local_ip_net, pkts_burst[j], peers, n_peers);
+            } break;
+            default: {
+                fprintf(stderr, "[%s] received an unexpected packet with etype=%x (%d)\n", 
+                        __func__, ether_type, j);
                 rte_pktmbuf_free(pkts_burst[j]);
-                break;
+            } break;
         }
     }
    
@@ -467,11 +475,18 @@ NSN_DATAPATH_INIT(udpdpdk)
         !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
         !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) ||
         !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_CHECKSUM) ||
-        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER) ||
-        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT))
+        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER))
     {
         fprintf(stderr, "[error] NIC does not support one of the required offloads\n");
         goto fail;
+    }
+    
+    // Check that the NIC supports the buffer split offload, to enable zero-copy receive
+    if(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT) {
+        fprintf(stderr, "[udpdpdk] NIC supports buffer split: zero-copy receive enabled\n");
+        zc_rx = true;
+    } else {
+        fprintf(stderr, "[udpdpdk] NIC does not support buffer split: zero-copy receive disabled\n");
     }
 
     socket_id = rte_eth_dev_socket_id(port_id);    
@@ -643,18 +658,18 @@ NSN_DATAPATH_TX(udpdpdk)
         }        
 
         // Prepare the header mbuf
-        rte_pktmbuf_alloc_bulk(conn->tx_hdr_pool, tx_bufs, buf_count);
+        rte_pktmbuf_alloc_bulk(conn->hdr_pool, tx_bufs, buf_count);
 
         for (usize i = 0; i < buf_count; i++) {
             // Get the data and size from the index
-            char* data = (char*)(endpoint->tx_zone + 1) + (bufs[i].index * endpoint->io_bufs_size); 
-            usize size = ((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[i].index)->len;
+            char* data = ((char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[i].index * endpoint->io_bufs_size));
+            usize size = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;
 
             // Prepare the header
             prepare_headers(tx_bufs[i], size, endpoint->app_id, p);
             
             // Prepare the payload - get the corresponding mbuf from the pool
-            data_mbuf = nsn_pktmbuf_alloc(conn->tx_data_pool, bufs[i].index);
+            data_mbuf = nsn_pktmbuf_alloc(conn->zc_pool, bufs[i].index);
             data_mbuf->data_len = size;
            
             // Chain the mbufs
@@ -682,7 +697,8 @@ NSN_DATAPATH_RX(udpdpdk)
 
     // Deliver only UDP packet payloads
     usize valid = 0;
-    for(uint16_t i = 0; i < nb_rx; i++) {
+    for(uint16_t i = 0; i < nb_rx; i++) 
+    {
         struct rte_mbuf *mbuf = rx_bufs[i];
         struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
         struct rte_ipv4_hdr *ih = (struct rte_ipv4_hdr *)(eth_hdr + 1);
@@ -715,25 +731,52 @@ NSN_DATAPATH_RX(udpdpdk)
         //     cur = cur->next;
         // }       
 
-        if(mbuf->nb_segs != 2) {
-            fprintf(stderr, "[udpdpdk] received packet with %u segments, expected 2\n", mbuf->nb_segs);
+        if(zc_rx) {
+            if(mbuf->nb_segs != 2) {
+                fprintf(stderr, "[udpdpdk] received packet with %u segments, expected 2\n", mbuf->nb_segs);
+                rte_pktmbuf_free(mbuf);
+                continue;
+            }
+
+            // Set the index (zero-copy receive)
+            bufs[valid].index = *(usize*)(mbuf->next + 1);
+
+            // Set the size
+            usize *size = &((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[valid].index)->len;
+            *size = rte_be_to_cpu_16(uh->dgram_len) - sizeof(struct rte_udp_hdr);
+            
+            // Finalize the rx
+            *buf_count  = *buf_count - 1;
+            valid++;
+
+            // Release the mbuf with custom free: DO NOT RE-ENQUEUE the index (the app will do that)
+            nsn_pktmbuf_free(mbuf);
+        } else {
+            // Get the packet payload
+            char* payload = (char*)(uh + 1);
+            usize payload_size = rte_be_to_cpu_16(uh->dgram_len) - sizeof(struct rte_udp_hdr); 
+
+            // Get the NSN buffer memory
+            bufs[valid] = conn->pending_rx_buf;
+            char *data  = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone)) + (bufs[valid].index * endpoint->io_bufs_size);    
+            usize *size = &((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[valid].index)->len;
+
+            // Copy the packet payload to the NSN buffer memory        
+            *size = payload_size;        
+            memcpy(data, (char*)(uh + 1), payload_size);
+            *buf_count  = *buf_count - 1;
+            valid++;
+
+            // Release the mbuf
             rte_pktmbuf_free(mbuf);
-            continue;
+            
+            // Update the pending tx descriptor
+            u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
+            if (np == 0) {
+                printf("[udpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+            }
+
         }
-
-        // Set the index (zero-copy receive)
-        bufs[valid].index = *(usize*)(mbuf->next + 1);
-
-        // Set the size
-        usize *size = &((nsn_meta_t*)(endpoint->tx_meta_zone + 1) + bufs[valid].index)->len;
-        *size = rte_be_to_cpu_16(uh->dgram_len) - sizeof(struct rte_udp_hdr);
-        
-        // Finalize the rx
-        *buf_count  = *buf_count - 1;
-        valid++;
-
-        // Release the mbuf with custom free: DO NOT RE-ENQUEUE the index (the app will do that)
-        nsn_pktmbuf_free(mbuf);
     }
 
     return (int)valid;
@@ -769,4 +812,3 @@ NSN_DATAPATH_DEINIT(udpdpdk)
 
     return 0;
 }
-

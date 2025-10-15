@@ -12,16 +12,18 @@ INSANE (<u>I</u>ntegrated a<u>N</u>d <u>S</u>elective <u>A</u>cceleration for th
 First, it is necessary to prepare the environment and to install the prerequisites:
 * Ubuntu 22.04 or newer (we did not test other environments)
 * Setup hugepages (you need root access) ([script](scripts/hugepages.sh))
+* Install cJSON and citiweb as required by the REST support ([script](scripts/install-rest.sh))
 
 Depending on which network stack you will use, you might also want to install:
 * DPDK 22.11 ([script](scripts/install-dpdk.sh))
+* TLDK ([script](scripts/install-tldk.sh)), only after DPDK.
+We suggest to perform a local installation by creating a $INSANE_DIR/deps folder, and passing its path to the above scripts. In the building scripts, we assume that setup.
 
 Then, it is possible to proceed with the project build.
 
 ### Build the project
 
 To build the code, `cd` into the `insane` directory and run:
-* `mkdir build`
 * `./build.sh [debug|release]`
 
 Those commands will create the executables in a folder called `build`. You can `cd` into it to see the results: the daemon executable (`nsnd`) and a demo application (`nsn-app`).
@@ -50,3 +52,6 @@ Once the daemon is running on a machine, you can run multiple INSANE-based appli
 To fully support a DPDK-based plugin and still guarantee the flexibility of INSANE, we had to modify a few lines of the driver of the Mellanox card (mlx5). Hence, we provide a [diff file](dpdk_22_11_mods.diff) that contains the changes we made to the driver source code. You can apply this patch to the DPDK source code before building it.
 
 Furthermore, if you are using a Mellanox card for the DPDK plugin, you need to explicitly disable the use of vectorial instructions, as it conflicts with the features we use in the DPDK plugin. To do so, add the following parameter to the DPDK configuration (i.e., the `eal_args` string) in the INSANE daemon configuration file: `-a <pcie_addr>,rx_vec_en=0`, where `<pcie_addr>` is the PCI address of the Mellanox card (e.g., `0000:05:00.0`).
+
+## REST API
+The INSANE daemon provides a REST API to monitor and control its operations. The API is documented in the [dedicated](docs/rest.md) file.
