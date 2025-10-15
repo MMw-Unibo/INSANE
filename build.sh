@@ -30,6 +30,21 @@ else
     exit 1
 fi
 
+# Check dependencies for the REST server. Defaulting to the local "deps" folder for installation
+INSTALL_DIR=$(pwd)/deps
+export PKG_CONFIG_PATH=$INSTALL_DIR/lib/pkgconfig:$INSTALL_DIR/share/pkgconfig:$PKG_CONFIG_PATH
+CJSON=`pkg-config --cflags --libs libcjson --static`
+if [ $? -ne 0 ]; then
+    echo "libcjson not found. Please install it using the script in scripts/install-rest.sh."
+    exit 1
+fi
+CIVETWEB=`pkg-config --cflags --libs civetweb --static`
+if [ $? -ne 0 ]; then
+    echo "civetweb not found. Please install it using the script in scripts/install-rest.sh."
+    exit 1
+fi
+REST_INCLUDES="-DNO_SSL -DMG_EXPERIMENTAL_INTERFACES"
+
 if [ ! -d build ]; then
     mkdir build
 fi
@@ -37,13 +52,16 @@ fi
 echo "Compiling in '${BUILD_TYPE_STR}' mode"
 cd build
 set -x
-$CC $CFLAGS ../src/nsnd/nsnd.c  -I../src -I../include/ -I../include/nsnd $DEFINES -o nsnd${POSTFIX} $LDFLAGS
+$CC $CFLAGS ../src/nsnd/nsnd.c ../src/rest/rest.c -I../src -I../include/ -I../include/nsnd $DEFINES $REST_INCLUDES -o nsnd${POSTFIX} $CJSON $CIVETWEB $LDFLAGS
 
 # Build the libnsn.a and libnsn.so libraries
-gcc $CFLAGS -fPIC ../src/libnsn/libnsn.c -I../src -I../include/ $DEFINES -shared -o libnsn.so
-gcc $CFLAGS -fPIC ../src/libnsn/libnsn.c -I../src -I../include/ $DEFINES -c -o libnsn.o
+$CC $CFLAGS -fPIC ../src/libnsn/libnsn.c -I../src -I../include/ $DEFINES -shared -o libnsn.so
+$CC $CFLAGS -fPIC ../src/libnsn/libnsn.c -I../src -I../include/ $DEFINES -c -o libnsn.o
 ar rcs libnsn.a libnsn.o
 cp libnsn.so ../bindings/libnsn.so
+
+# Build the libinterception.so library
+$CC $CFLAGS -fPIC ../src/libinterception/libinterception.c -I../src -I../include/ $DEFINES -shared -o libinterception.so -L. -l:libnsn.a $LDFLAGS
 
 # Build the Applications
 $CC $CFLAGS ../apps/nsn_app_tx.c    -I../include $DEFINES -L. -l:libnsn.a -o nsn-app-tx $LDFLAGS
