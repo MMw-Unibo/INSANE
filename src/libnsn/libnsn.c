@@ -35,11 +35,9 @@ typedef struct nsn_stream_inner nsn_stream_inner_t;
 struct nsn_stream_inner {
     // The stream is valid
     bool is_active;
-    // Local INDEX, to be used in this lib
+    // Local stream id, to be used in this lib
     nsn_stream_t stream_id;
-    // Plugin id
-    uint32_t plugin_id;
-    // Stream idx: use only for lib-to-daemon interactions 
+    // Global stream index: use only for lib-to-daemon interactions
     nsn_stream_t _idx;
     // send tx slot to the daemon
     nsn_ringbuf_t *tx_prod;
@@ -325,7 +323,6 @@ nsn_init()
     // Initialize the local steam state
     for (uint32_t i = 0; i < array_count(streams); i++) {
         streams[i].is_active = false;
-        streams[i].plugin_id = NSN_INVALID_PLUGIN_HANDLE;
         streams[i]._idx = NSN_INVALID_STREAM_HANDLE;
         streams[i].stream_id = NSN_INVALID_STREAM_HANDLE;
         streams[i].tx_prod = NULL;
@@ -474,7 +471,6 @@ nsn_create_stream(nsn_options_t opts)
     }
 
     // Success: fill in the remaining fields of the stream descriptor
-    streams[stream].plugin_id = msg->plugin_idx;
     streams[stream].stream_id = stream;
     streams[stream].is_active = true;
     n_str++;
@@ -510,7 +506,6 @@ nsn_destroy_stream(nsn_stream_t stream)
     cmsghdr->app_id = app_id;
 
     nsn_cmsg_create_stream_t* msg = (nsn_cmsg_create_stream_t *)(cmsghdr + 1);
-    msg->plugin_idx = streams[stream].plugin_id;
     msg->stream_idx = streams[stream]._idx;
 
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t) + sizeof(nsn_cmsg_create_stream_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
@@ -524,7 +519,6 @@ nsn_destroy_stream(nsn_stream_t stream)
         } else {
             // clean up the stream descriptor
             streams[stream].is_active = false;
-            streams[stream].plugin_id = NSN_INVALID_PLUGIN_HANDLE;
             streams[stream]._idx = NSN_INVALID_STREAM_HANDLE;
             streams[stream].stream_id = NSN_INVALID_STREAM_HANDLE;
             streams[stream].tx_prod = NULL;
@@ -571,7 +565,6 @@ nsn_create_source(nsn_stream_t stream, uint32_t source_id) {
 
     // Send the request to the daemon, including the stream id of the source
     nsn_cmsg_create_source_t *msg = (nsn_cmsg_create_source_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-    msg->plugin_idx = streams[stream].plugin_id;
     msg->stream_idx = streams[stream]._idx;
     msg->source_id  = source_id;
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_source_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
@@ -627,7 +620,6 @@ nsn_destroy_source(nsn_source_t source) {
     cmsghdr->app_id = app_id;
 
     nsn_cmsg_create_source_t *msg = (nsn_cmsg_create_source_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-    msg->plugin_idx = streams[sources[source_idx].stream].plugin_id;
     msg->stream_idx = streams[sources[source_idx].stream]._idx;
     msg->source_id  = sources[source_idx].id;
 
@@ -716,7 +708,6 @@ nsn_create_sink(nsn_stream_t stream, uint32_t sink_id, handle_data_cb cb) {
 
     // Send the request to the daemon, including the stream id of the sink
     nsn_cmsg_create_sink_t *msg = (nsn_cmsg_create_sink_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-    msg->plugin_idx = streams[stream].plugin_id;
     msg->stream_idx = streams[stream]._idx;
     msg->sink_id  = sink_id;
     sendto(sockfd, cmsg, sizeof(nsn_cmsg_hdr_t)+sizeof(nsn_cmsg_create_sink_t), 0, (struct sockaddr *)&nsnd_addr, sizeof(struct sockaddr_un));
@@ -779,7 +770,6 @@ nsn_destroy_sink(nsn_sink_t sink) {
     cmsghdr->app_id = app_id;
 
     nsn_cmsg_create_sink_t *msg = (nsn_cmsg_create_sink_t *)(cmsg + sizeof(nsn_cmsg_hdr_t));
-    msg->plugin_idx = streams[sinks[sink_idx].stream].plugin_id;
     msg->stream_idx = streams[sinks[sink_idx].stream]._idx;
     msg->sink_id  = sinks[sink_idx].id;
 

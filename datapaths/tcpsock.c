@@ -335,9 +335,9 @@ NSN_DATAPATH_CONN_MANAGER(tcpsock)
                 return -1;
             }   
         }
-        if (client_fd < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
+        if (client_fd < 0 && errno != EWOULDBLOCK && errno != EAGAIN && errno != ENOTSOCK) {
             fprintf(stderr, "[tcpsock] connection manager: accept failed: %s\n", strerror(errno));
-        }       
+        }        
 
         // Try to connect to missing peer
         // for (int p = 0; p < n_peers; p++) {

@@ -36,25 +36,33 @@
 #include "nsn_mm.c"
 
 ////////////////////////////////////////////////////////////////////////////////
+// @RestServer
+#include "rest/rest.h"
+
+////////////////////////////////////////////////////////////////////////////////
 // @Defines 
-#define NSN_DEFAULT_CONFIG_FILE     "nsnd.cfg"
+#define NSN_DEFAULT_CONFIG_FILE                 "nsnd.cfg"
 
-#define NSN_CFG_DEFAULT_SECTION                     "global"
-#define NSN_CFG_DEFAULT_SHM_NAME                    "nsnd_datamem"
-#define NSN_CFG_DEFAULT_IO_BUFS_NUM                 1024
-#define NSN_CFG_DEFAULT_IO_BUFS_SIZE                2048
-#define NSN_CFG_DEFAULT_SHM_SIZE                    64      // in MB
-#define NSN_CFG_DEFAULT_MAX_TX_BURST                32
-#define NSN_CFG_DEFAULT_MAX_RX_BURST                32
-#define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME             "tx_io_buffer_pool"
-#define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME             "rx_io_buffer_pool"
-#define NSN_CFG_DEFAULT_RINGS_ZONE_NAME             "rings_zone"
-#define NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME        "free_slots"
-#define NSN_CFG_DEFAULT_TX_RING_SIZE                4096
-#define NSN_CFG_DEFAULT_RX_RING_SIZE                4096
-#define NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN      2
+#define NSN_CFG_DEFAULT_SECTION                 "global"
+#define NSN_CFG_DEFAULT_SHM_NAME                "nsnd_datamem"
+#define NSN_CFG_DEFAULT_IO_BUFS_NUM             1024
+#define NSN_CFG_DEFAULT_IO_BUFS_SIZE            2048
+#define NSN_CFG_DEFAULT_SHM_SIZE                64      // in MB
+#define NSN_CFG_DEFAULT_MAX_TX_BURST            32
+#define NSN_CFG_DEFAULT_MAX_RX_BURST            32
+#define NSN_CFG_DEFAULT_TX_IO_BUFS_NAME         "tx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_RX_IO_BUFS_NAME         "rx_io_buffer_pool"
+#define NSN_CFG_DEFAULT_RINGS_ZONE_NAME         "rings_zone"
+#define NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME    "free_slots"
+#define NSN_CFG_DEFAULT_TX_RING_SIZE            4096
+#define NSN_CFG_DEFAULT_RX_RING_SIZE            4096
+#define NSN_CFG_DEFAULT_MAX_THREADS_PER_PLUGIN  2
+#define NSN_CFG_DEFAULT_REST_PORT               8080
+#define NSN_CFG_DEFAULT_REST_HOST               "localhost"
 
 
+// --- Variables for REST Server ------------------------------------------
+static unsigned request = 0; //request counter
 
 // --- Plugin, Streams, Endpoints, Sinks -------------------------------------------------
 
@@ -82,7 +90,8 @@ struct nsn_inner_stream
     list_head_t         node;
     u32                 plugin_idx; // Shortcut to the plugin
     u32                 idx;        // Index of this stream
-
+    u32                 global_idx; // Global index of this stream
+    
     // tx ring from srcs to the plugin
     nsn_ringbuf_t*      tx_prod;
     list_head_t         sources;
@@ -90,12 +99,12 @@ struct nsn_inner_stream
 
     // tx ring - packets that need a retry send
     nsn_ringbuf_t*      tx_pending;
-
+    
     // Sinks active for this stream
     list_head_t        sinks; 
     nsn_mutex_t        sinks_lock;
     atu32              n_sinks;
-
+    
     // Endpoint info (for the plugin)
     nsn_endpoint_t          ep;
 };
@@ -121,6 +130,16 @@ struct nsn_plugin_set
     usize         count;
 };
 
+// Global counter for the stream id
+static atu32 global_stream_id_counter = 0;
+
+// List of global streams
+typedef struct nsn_streams_manager nsn_streams_manager_t ;
+struct nsn_streams_manager
+{
+    list_head_t global_streams;
+    nsn_mutex_t  global_streams_lock;
+};
 
 struct datapath_ops
 {
@@ -179,6 +198,8 @@ mem_arena_t *state_arena      = NULL;
 nsn_app_pool_t app_pool       = {0};
 nsn_plugin_set_t plugin_set   = {0};
 nsn_thread_pool_t thread_pool = {0};
+// global streams list
+nsn_streams_manager_t *streams_manager = NULL;
 
 string_list_t arg_list = {0};
 nsn_cfg_t *config      = NULL;
@@ -191,6 +212,11 @@ signal_handler(int signum)
     if (signum == SIGINT || signum == SIGTERM) {
         g_running = false;
     }
+}
+
+// --- Global stream id helper ----------------------------------------------
+static u32 get_next_global_stream_id() {
+    return atomic_fetch_add(&global_stream_id_counter, 1);
 }
 
 // --- Datapath helpers -----------------------------------------------------
@@ -554,20 +580,13 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         return -1;
     }
 
-    // Find the (valid) plugin
+    // Find the (valid) plugin using the stream index
     nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
-    uint32_t plugin_idx = reply->plugin_idx;
-    if (plugin_idx >= plugin_set.count) {
-        log_error("plugin index %d is out of bound\n");
-        return -2;
-    }
-    nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
-
     // Find the (valid) stream
     uint32_t stream_idx = (uint32_t)reply->stream_idx;
     nsn_inner_stream_t *stream;
-    list_for_each_entry(stream, &plugin->streams, node) {
-        if (stream->idx == stream_idx) {
+    list_for_each_entry(stream, &streams_manager->global_streams, node) {
+        if (stream->global_idx == stream_idx) {
             break;
         }
     }
@@ -575,7 +594,9 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
         log_error("stream %d not found in the plugin\n", stream_idx);
         return -3;
     }
-
+    //Find the plugin of the stream
+    nsn_plugin_t *plugin = &plugin_set.plugins[stream->plugin_idx];
+    
     // If sink, create the descriptor and the ring. Here, because if it fails, it has no other side effect.
     if(type == NSN_CHANNEL_TYPE_SINK) {
         nsn_cmsg_create_sink_t *reply_snk = (nsn_cmsg_create_sink_t *)(cmsghdr + 1);
@@ -612,7 +633,7 @@ ipc_create_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type)
     // This will also automatically create the network state for all the streams.
     if (plugin->active_channels == 0) {
         // Currently, we just consider that thread j is assigned to plugin j.
-        uint32_t thread_idx = plugin_idx;
+        uint32_t thread_idx = stream->plugin_idx;
         struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
         // It might be the case that the thread is already associated with the plugin,
         // until we implement a thread pool manager. In this case, no need to add a 
@@ -674,32 +695,30 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
         return 1;
     }
 
-    // Check plugin id and retrieve the plugin
-    nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1);
-    uint32_t plugin_idx = reply->plugin_idx;
-    if (plugin_idx >= plugin_set.count) {
-        log_error("plugin index is out of bound\n");
-        return 2;
-    } 
-    nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
-    
     // Check stream id and retrieve the stream
+    nsn_cmsg_create_source_t *reply = (nsn_cmsg_create_source_t *)(cmsghdr + 1); 
     uint32_t stream_idx = (uint32_t)reply->stream_idx;
+    log_debug("Global stream_id retrieved: %d\n", stream_idx);
     nsn_inner_stream_t *stream;
-    nsn_os_mutex_lock(&plugin->streams_lock);
-    list_for_each_entry(stream, &plugin->streams, node) {
-        if (stream->idx == stream_idx) {
+    nsn_os_mutex_lock(&streams_manager->global_streams_lock);
+    list_for_each_entry(stream, &streams_manager->global_streams, node) {
+        if (stream->global_idx == stream_idx) {
+            log_debug("stream %d found\n", stream->global_idx);
             break;
         }
     }
-    nsn_os_mutex_unlock(&plugin->streams_lock);
+    nsn_os_mutex_unlock(&streams_manager->global_streams_lock);
     if (!stream) {
         log_error("stream %d not found in the plugin\n", stream_idx);
         return 3;
     }
 
+    //Find the plugin of the stream
+    nsn_plugin_t *plugin = &plugin_set.plugins[stream->plugin_idx];
+
     if (type == NSN_CHANNEL_TYPE_SINK) {
         nsn_inner_sink_t *sink, *dead_sink = NULL;
+        log_debug("[thread %d] stream %d found\n", stream_idx);
         nsn_os_mutex_lock(&stream->sinks_lock);
         if (list_empty(&stream->sinks)) {
             nsn_os_mutex_unlock(&stream->sinks_lock);
@@ -775,7 +794,7 @@ ipc_destroy_channel(int app_id, nsn_cmsg_hdr_t *cmsghdr, nsn_channel_type_t type
     // (which remains attached to the plugin, until we implement a thread pool manager)
     // (ideally, the thread should go back into the pool)
     // Currently, we just consider that thread j is assigned to plugin j.
-    uint32_t thread_idx = plugin_idx;
+    uint32_t thread_idx = stream->plugin_idx;
     struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
     if(!plugin->active_channels) {
         // pause the dp thread
@@ -901,6 +920,7 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
             nsn_inner_stream_t *stream = malloc(sizeof(nsn_inner_stream_t));
             stream->plugin_idx = plugin_idx;
             stream->idx = plugin->stream_id_cnt++;
+            stream->global_idx = get_next_global_stream_id();
             atomic_store(&stream->n_srcs, 0);
             stream->sources = list_head_init(stream->sources);
             atomic_store(&stream->n_sinks, 0);
@@ -908,10 +928,9 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
             nsn_os_mutex_init(&stream->sinks_lock);
 
             // Set the index of the plugin and stream in the reply
-            uint32_t stream_idx = stream->idx;
+            uint32_t stream_idx = stream->global_idx; //changed from stream->idx
             nsn_cmsg_create_stream_t *reply = (nsn_cmsg_create_stream_t*)(cmsghdr + 1);
-            reply->plugin_idx = plugin_idx;
-            reply->stream_idx = stream_idx;
+            reply->stream_idx = stream_idx; //here i have to send the global stream id
 
             // Create the tx ring buffer. The "consumer" and "producer" definitions are relative to the application.
             // The tx_cons and the rx_prod are the same ring, the free_slots ring, which is already available to the app.
@@ -968,10 +987,14 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
             stream->ep.data = NULL; // will be set by the plugin update function
             stream->ep.data_size = 0; // will be set by the plugin update function
             
-            // Add the stream to the plugin
+            nsn_os_mutex_lock(&streams_manager->global_streams_lock);
             nsn_os_mutex_lock(&plugin->streams_lock);
+            // Add the stream to the global stream list
+            list_add_tail(&streams_manager->global_streams, &stream->node);
+            // Add the stream to the plugin
             list_add_tail(&plugin->streams, &stream->node);
             nsn_os_mutex_unlock(&plugin->streams_lock);
+            nsn_os_mutex_unlock(&streams_manager->global_streams_lock);
 
             // Successful operation: return success
             cmsghdr->type = NAN_CSMG_TYPE_CREATED_STREAM;
@@ -1001,24 +1024,12 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
             }
 
             nsn_cmsg_create_stream_t *reply = (nsn_cmsg_create_stream_t *)(cmsghdr + 1);
-            uint32_t plugin_idx = (uint32_t)reply->plugin_idx;
             uint32_t stream_idx = (uint32_t)reply->stream_idx;
 
-            // Check that the plugin index is valid
-            if (plugin_idx >= plugin_set.count) {
-                log_error("plugin index %d is out of bounds\n", stream_idx);
-                cmsghdr->type = NSN_CMSG_TYPE_ERROR;
-                int *error_code = (int *)(buffer + sizeof(nsn_cmsg_hdr_t));
-                *error_code     = 2;
-                reply_len       = sizeof(nsn_cmsg_hdr_t) + sizeof(int);
-                break;
-            }
-
-            // Check that the stream index is valid
-            nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx];
+            // Check that the global stream index is valid
             nsn_inner_stream_t *stream;
-            list_for_each_entry(stream, &plugin->streams, node) {
-                if (stream->idx == stream_idx) {
+            list_for_each_entry(stream, &streams_manager->global_streams, node) {
+                if (stream->global_idx == stream_idx) {
                     break;
                 }
             }
@@ -1071,10 +1082,14 @@ main_thread_control_ipc(int sockfd, nsn_mem_manager_cfg_t mem_cfg)
                 break;
             }
             
+            // Find the plugin associated with the stream to destroy
+            nsn_plugin_t *plugin = &plugin_set.plugins[stream->plugin_idx];
             // Finalize the destruction of the stream
+            nsn_os_mutex_lock(&streams_manager->global_streams_lock);
             nsn_os_mutex_lock(&plugin->streams_lock);
             list_del(&stream->node);
             nsn_os_mutex_unlock(&plugin->streams_lock);
+            nsn_os_mutex_unlock(&streams_manager->global_streams_lock);
             free(stream);
 
             // Return success
@@ -1208,7 +1223,6 @@ clean_and_next:
 }
 
 // -- Connection manager thread ------------------------------------------------
-
 int
 main_thread_connection_manager() 
 {   
@@ -1245,8 +1259,310 @@ main_thread_connection_manager()
     return 0;
 }
 
-// --- Os Initialization ------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+// REST server utils. Use nsnd state info to create JSON responses. 
+static cJSON* 
+create_stream_count_sink_src(nsn_inner_stream_t *stream){
 
+    cJSON *stream_obj = cJSON_CreateObject();
+    //Add Stream and plugin ID
+    cJSON_AddNumberToObject(stream_obj, "global_stream_id", stream->global_idx);
+    cJSON_AddNumberToObject(stream_obj, "stream_id", stream->idx);
+    cJSON_AddNumberToObject(stream_obj, "plugin_idx", stream->plugin_idx);
+
+    u32 src_count = 0;
+    src_count = stream->n_srcs;
+    cJSON_AddNumberToObject(stream_obj, "source_count", src_count);
+    
+    u32 sink_count = 0;
+    sink_count = stream->n_sinks;
+    cJSON_AddNumberToObject(stream_obj, "sink_count", sink_count);
+    
+    return stream_obj;
+}
+
+// Create a JSON Object for a single plugin
+static cJSON* 
+create_plugin_json(nsn_plugin_t *plugin) {
+    
+    cJSON *plugin_obj = cJSON_CreateObject();
+
+    // Convert the name of the plugin in a C string
+    char *name_cstr = malloc(plugin->name.len + 1);
+    if (!name_cstr) {
+        cJSON_Delete(plugin_obj);
+        return NULL;
+    }
+ 
+    memcpy(name_cstr, plugin->name.data, plugin->name.len);
+    name_cstr[plugin->name.len] = '\0';
+    
+    cJSON_AddStringToObject(plugin_obj, "name", name_cstr);
+    free(name_cstr);
+      
+    // Create an array for data of the streams
+    cJSON *streams_array = cJSON_CreateArray();
+    cJSON_AddItemToObject(plugin_obj, "streams", streams_array);
+
+    //Iterate on the streams of the plugin
+    nsn_os_mutex_lock(&plugin->streams_lock);
+    nsn_inner_stream_t *stream;
+    list_for_each_entry(stream, &plugin->streams, node) {
+        cJSON *stream_obj = create_stream_count_sink_src(stream);
+        if(stream_obj){
+            cJSON_AddItemToArray(streams_array, stream_obj);
+        }
+    }
+    nsn_os_mutex_unlock(&plugin->streams_lock);
+    return plugin_obj;
+}
+
+static cJSON* 
+create_plugin_stream_counts_json(nsn_plugin_set_t *plugin_set) {
+       
+    cJSON *plugin_stream_counts = cJSON_CreateObject();
+    if (!plugin_stream_counts) {
+        return NULL;
+    }
+    
+    // Create an array to contain plugins
+    cJSON *plugins_array = cJSON_CreateArray();
+    if (!plugins_array) {
+        cJSON_Delete(plugin_stream_counts);
+        return NULL;
+    }
+    
+    // Add the array to the main JSON object
+    cJSON_AddItemToObject(plugin_stream_counts, "plugins", plugins_array);
+    
+    // Fill the array with data of each plugin
+    for (usize i = 0; i < plugin_set->count; i++) {
+        nsn_plugin_t *plugin = &plugin_set->plugins[i];
+        
+        cJSON *plugin_obj = create_plugin_json(plugin);
+        if (!plugin_obj) {
+            cJSON_Delete(plugin_stream_counts);
+            return NULL;
+        }
+        
+        cJSON_AddItemToArray(plugins_array, plugin_obj);
+    }
+    
+    return plugin_stream_counts;
+}
+
+// --- REST API -----------------------------------------------------------
+// -- /plugins/streams --
+int
+rest_get_plugins_streams_count(struct mg_connection *conn, const char *p1, const char *p2)
+{
+        cJSON *obj = create_plugin_stream_counts_json(&plugin_set);
+
+        if (!obj) {
+                mg_send_http_error(conn, 500, "Server error");
+                return 500;
+        }
+
+        printf("GET %s/%s\n", p1, p2);
+        cJSON_AddStringToObject(obj, "version", CIVETWEB_VERSION);
+        cJSON_AddStringToObject(obj, "path1", p1);
+        cJSON_AddStringToObject(obj, "path2", p2);
+        cJSON_AddNumberToObject(obj, "request", ++request);
+        send_json(conn, obj);
+        cJSON_Delete(obj);
+
+        return 200;
+}
+
+// -- /change/qos --
+int
+rest_post_change_qos(struct mg_connection *conn, const char *p1, const char *p2)
+{
+    char buffer[1024];
+    int dlen = mg_read(conn, buffer, sizeof(buffer) - 1);
+    cJSON *obj, *app_id_json, *reliability_json;
+    int app_id = 0;
+    int reliability = -1;
+    uint32_t target_plugin_idx;
+    uint32_t plugin_idx; 
+
+    printf("PUT %s/%s\n", p1, p2);
+    if ((dlen < 1) || (dlen >= (int)sizeof(buffer))) {
+        mg_send_http_error(conn, 400, "%s", "No request body data");
+        return 400;
+    }
+    buffer[dlen] = 0;
+
+    obj = cJSON_Parse(buffer);
+    if (obj == NULL) {
+        mg_send_http_error(conn, 400, "%s", "Invalid request body data");
+        return 400;
+    }
+    app_id_json = cJSON_GetObjectItemCaseSensitive(obj, "app_id");
+    if (!cJSON_IsNumber(app_id_json)) {
+        cJSON_Delete(obj);
+        mg_send_http_error(conn,
+                        400,
+                        "%s",
+                        "No \"app_id\" number in body data");
+        return 400;
+    }
+
+    reliability_json = cJSON_GetObjectItemCaseSensitive(obj, "reliability");
+    if (!cJSON_IsNumber(reliability_json)) {
+        cJSON_Delete(obj);
+        mg_send_http_error(conn,
+                        400,
+                        "%s",
+                        "No \"reliability\" number in body data");
+        return 400;
+    }
+    app_id = (unsigned)app_id_json->valueint;
+    reliability = (unsigned)reliability_json->valueint;
+
+    // Based on the reliability value, set the plugin index for the extraction of the stream
+    if (reliability == NSN_QOS_RELIABILITY_UNRELIABLE) {
+        plugin_idx = 1;
+        target_plugin_idx = 0;
+
+    } else if (reliability == NSN_QOS_RELIABILITY_RELIABLE) {
+        plugin_idx = 0;
+        target_plugin_idx = 1;
+
+    } else {
+        cJSON_Delete(obj);
+        mg_send_http_error(conn,
+                        400,
+                        "%s",
+                        "Invalid \"reliability\" value in body data");
+        return 400;
+    }
+
+    nsn_plugin_t *plugin = &plugin_set.plugins[plugin_idx]; //plugin to move the stream from
+    nsn_plugin_t *target_plugin = &plugin_set.plugins[target_plugin_idx]; //plugin to move the stream to
+
+    nsn_inner_stream_t *stream_to_move = NULL;
+    nsn_inner_stream_t *stream;
+    atu32 num_sources = 0;
+    atu32 num_sinks = 0;
+    
+    nsn_os_mutex_lock(&plugin->streams_lock);
+    list_for_each_entry(stream, &plugin->streams, node) {
+        
+        if (stream->ep.app_id == app_id) {
+            stream_to_move = stream;
+            break;
+        }
+    }
+    nsn_os_mutex_unlock(&plugin->streams_lock);
+    
+    // Decrease the number of active channels in the plugin by the number of sources and sinks of the stream_to_move.
+    plugin->active_channels -= (stream_to_move->n_srcs + stream_to_move->n_sinks);
+    //save n_src and n_snk and set them to 0
+    nsn_os_mutex_lock(&stream_to_move->sinks_lock);
+    num_sources = stream_to_move->n_srcs;
+    num_sinks = stream_to_move->n_sinks;
+    at_store(&stream_to_move->n_srcs, 0, mo_rlx);
+    at_store(&stream_to_move->n_sinks, 0, mo_rlx);
+    nsn_os_mutex_unlock(&stream_to_move->sinks_lock);
+
+    // Check if the the plugin has active channels left
+    uint32_t thread_idx = plugin_idx;
+    struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
+    if(!plugin->active_channels) {
+        // pause the dp thread
+        at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_WAIT, mo_rlx);
+        // wait for the thread to switch to the wait state
+        nsn_os_mutex_lock(&dp_args->lock);
+        while (dp_args->dp_ready) {
+            nsn_os_cnd_wait(&dp_args->cv, &dp_args->lock);
+        }
+        nsn_os_mutex_unlock(&dp_args->lock);
+    } 
+    // In case the plugin is still running but this stream has no more active channels,
+    // we must tell the plugin to delete the stream state
+    else if(!at_load(&stream_to_move->n_sinks, mo_rlx) && !at_load(&stream_to_move->n_srcs, mo_rlx)) { 
+        // This destroys the connection/cleans the network state!
+        // IT MUST BE DONE *AFTER* UPDATING N_SRC/N_SINKS
+        assert(plugin->update && stream_to_move->ep.data);
+        log_debug("Updated DP: no active channels for stream %u\n", stream_to_move->idx);
+        plugin->update(&stream_to_move->ep);
+        stream_to_move->ep.data = NULL;
+    }
+    
+    log_debug("endpoint: %p and data: %p\n", &stream_to_move->ep, stream_to_move->ep.data);
+    // Remove the stream from the plugin
+    nsn_os_mutex_lock(&plugin->streams_lock);
+    list_del(&stream_to_move->node);
+    nsn_os_mutex_unlock(&plugin->streams_lock);
+
+    log_debug("endpoint: %p and data: %p\n", &stream_to_move->ep, stream_to_move->ep.data);
+    // Add the stream to the new plugin
+    nsn_os_mutex_lock(&target_plugin->streams_lock);
+    // Update the stream values
+    stream_to_move->plugin_idx = target_plugin_idx;
+    stream_to_move->idx = target_plugin->stream_id_cnt++;
+    list_add_tail(&target_plugin->streams, &stream_to_move->node);
+    nsn_os_mutex_unlock(&target_plugin->streams_lock);
+    
+    // if this is the first src/snk (=channel) in the PLUGIN, start the first 
+    // data plane thread.
+    if (target_plugin->active_channels == 0) {
+        // Currently, we just consider that thread j is assigned to plugin j.
+        uint32_t thread_idx = target_plugin_idx;
+        struct nsn_dataplane_thread_args *dp_args = &thread_pool.thread_args[thread_idx];
+        // It might be the case that the thread is already associated with the plugin,
+        // until we implement a thread pool manager. In this case, no need to add a 
+        // thread to the plugin; just start the existing one.
+        if (target_plugin->thread_count == 0) {
+            // Keep a pointer to the thread in the plugin
+            target_plugin->threads[target_plugin->thread_count] = thread_pool.threads[thread_idx];
+            target_plugin->thread_count++;
+            // Assign the plugin to the thread
+            dp_args->datapath_name = target_plugin->name;
+            dp_args->plugin_data   = target_plugin;
+        }
+        // start the thread
+        at_store(&dp_args->state, NSN_DATAPLANE_THREAD_STATE_RUNNING, mo_rlx);
+        // wait for the initialization to complete
+        nsn_os_mutex_lock(&dp_args->lock);
+        while (!dp_args->dp_ready) {
+            log_debug("Retry for the dataplane thread to be ready\n");
+            nsn_os_cnd_wait(&dp_args->cv, &dp_args->lock);
+        }
+        nsn_os_mutex_unlock(&dp_args->lock);
+    } 
+    // If the PLUGIN is running, but this is the first channel in the STREAM,
+    // we must tell the PLUGIN to update the STREAM state.
+    else if (!stream_to_move->ep.data) {
+        // This creates a connection/initializes network state!
+        // IT MUST BE DONE *BEFORE* UPDATING N_SRC/N_SINKS and N_ACTIVE_CHANNELS
+        assert(target_plugin->update && !stream_to_move->ep.data);
+        target_plugin->update(&stream_to_move->ep);
+        log_debug("Updated DP: new active channel for stream %u\n", stream_to_move->idx);
+    }
+
+    // Update the number of srcs/sinks in the plugin
+    nsn_os_mutex_lock(&stream_to_move->sinks_lock);
+    at_store(&stream_to_move->n_srcs, num_sources, mo_rlx);
+    at_store(&stream_to_move->n_sinks, num_sinks, mo_rlx);
+    nsn_os_mutex_unlock(&stream_to_move->sinks_lock);
+    target_plugin->active_channels += (stream_to_move->n_srcs + stream_to_move->n_sinks);
+
+    cJSON_Delete(obj);
+
+    mg_printf(conn,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n\r\n"
+        "{\"status\":\"success\", \"message\":\"Reliability aggiornata\", \"app_id\":\"%d\", \"reliability\":%d}",
+        app_id, reliability);
+    
+    return 200;
+    
+}
+
+// --- Os Initialization ------------------------------------------------------
 void
 os_init(void)
 {
@@ -1337,6 +1653,8 @@ main(int argc, char *argv[])
     int shm_size     = NSN_CFG_DEFAULT_SHM_SIZE;
     int max_tx_burst = NSN_CFG_DEFAULT_MAX_TX_BURST;
     int max_rx_burst = NSN_CFG_DEFAULT_MAX_RX_BURST;
+    int rest_port    = NSN_CFG_DEFAULT_REST_PORT;
+    char* rest_host  = NSN_CFG_DEFAULT_REST_HOST;
     
     nsn_config_get_int(config, str_lit("global"), str_lit("app_num"), &app_num);      
     nsn_config_get_int(config, str_lit("global"), str_lit("io_bufs_num"), &io_bufs_num);
@@ -1344,6 +1662,14 @@ main(int argc, char *argv[])
     nsn_config_get_int(config, str_lit("global"), str_lit("shm_size"), &shm_size);
     nsn_config_get_int(config, str_lit("global"), str_lit("max_tx_burst"), &max_tx_burst);
     nsn_config_get_int(config, str_lit("global"), str_lit("max_rx_burst"), &max_rx_burst);
+    nsn_config_get_int(config, str_lit("rest"), str_lit("port"), &rest_port);
+
+    char host[256] = {0};
+    string_t str_host = str_cstr(host);
+    int err = nsn_config_get_string(config, str_lit("rest"), str_lit("host"), &str_host);
+    if (!err) {
+        rest_host = to_cstr(str_host);
+    }
 
     // TODO: Sanity check the configuration values!
 
@@ -1370,6 +1696,11 @@ main(int argc, char *argv[])
         nsn_os_mutex_init(&plugin->streams_lock);
     }
 
+    // init global streams list
+    streams_manager = mem_arena_push(arena, sizeof(nsn_streams_manager_t));
+    streams_manager->global_streams = list_head_init(streams_manager->global_streams);
+    nsn_os_mutex_init(&streams_manager->global_streams_lock);
+    
     // init SIG_INT handler
     {
         struct sigaction sa;
@@ -1378,6 +1709,9 @@ main(int argc, char *argv[])
         sigemptyset(&sa.sa_mask);
         sigaction(SIGINT, &sa, NULL);
     }
+
+    // REST server context
+    struct mg_context *ctx = NULL;
 
     // create the control socket
     int sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -1429,6 +1763,46 @@ main(int argc, char *argv[])
         }
     }
 
+    // create the REST Server    
+    // creation of connection and callbacks
+    char rest_port_str[6];
+    sprintf(rest_port_str, "%d", rest_port);
+    const char *options[] = {"listening_ports",
+        rest_port_str,
+        "request_timeout_ms",
+        "10000",
+        "error_log_file",
+        "nsn-rest-error.log",
+        0};
+
+    struct mg_callbacks callbacks;
+    
+    // Init libcivetweb.
+    mg_init_library(0);
+    memset(&callbacks, 0, sizeof(callbacks));
+
+    // Start CivetWeb web server. It has its own thread that executes the callbacks in rest.c.
+    ctx = mg_start(&callbacks, 0, options);
+
+    // Check return value:
+    if (ctx == NULL) {
+        log_error("Cannot start CivetWeb - mg_start failed: %s\n", strerror(errno));
+        goto clear_and_quit;;
+    }
+
+    // Register REST endpoints
+    int registered = rest_register_endpoints(ctx);
+    if(registered < 0){
+        log_error("Failed to register REST endpoints\n");
+        mg_stop(ctx);
+        goto clear_and_quit;
+    }
+
+    char hostinfo[512];
+    snprintf(hostinfo, sizeof(hostinfo), "http://%s:%d", rest_host, rest_port);
+    printf("Number of streams for each plugins: %s%s\n", hostinfo, PLUGIN_STREAMS_URI);
+    printf("Change QoS: %s%s\n", hostinfo, CHANGE_QOS_URI);
+   
     // Create the shared memory and start the Control Path loop
     {
         nsn_mem_manager_cfg_t mem_cfg = {
@@ -1458,12 +1832,21 @@ main(int argc, char *argv[])
 
     // cleanup
 clear_and_quit:
-    if (sockfd != -1) close(sockfd);
+    // Stop REST server 
+    if (ctx) {
+        mg_stop(ctx);
+    	printf("REST server stopped.\n");
+    }
+
+    if (sockfd != -1) {
+        close(sockfd);
+    }
 
     unlink(NSNAPP_TO_NSND_IPC);
+    
     mem_arena_release(state_arena);
     mem_arena_release(arena);
-
+    
     log_debug("done\n");
 
     return 0;
