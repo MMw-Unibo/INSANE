@@ -976,6 +976,10 @@ NSN_DATAPATH_TX(rdma)
             
         }
 
+        // Returns ALL the buffers to the free slots ring, regardless of the send status
+        if(nsn_ringbuf_enqueue_burst(endpoint->free_slots, bufs, sizeof(bufs[0]), buf_count, NULL) < buf_count) {
+            fprintf(stderr, "[tcpsock] Failed to enqueue descriptors\n");
+        }
     }
 
     return nb_tx;
