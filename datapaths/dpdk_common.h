@@ -4,14 +4,20 @@
 #include <strings.h>
 
 #include <rte_common.h>
+#include <rte_compat.h>
 #include <rte_cycles.h>
+#include <dirent.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <sys/ioctl.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_flow.h>
 #include <rte_malloc.h>
+#include <rte_vfio.h>
+#include <rte_pci.h>
+#include <rte_bus_pci.h>
 
 #include "../src/nsn_datapath.h"
 #include "../src/base/nsn_thread_ctx.h"
@@ -21,6 +27,41 @@
 #include "../src/common/nsn_temp.h"
 #include "../src/common/nsn_config.c"
 #include "../src/common/nsn_ringbuf.c"
+
+#define MAX_PARAM_STRING_SIZE 2048
+#define MAX_DEVICE_QUEUES     4    // Must be at least 2
+#define MAX_RX_BURST_ARP      8     // Must be at least 8
+#define MAX_TX_BURST          64    // Must be at least 32
+#define MAX_RX_BURST          64    // Must be at least 32
+
+//--------------------------------------------------------------------------------------------
+bool probe_supported_offloads(struct rte_eth_dev_info* devinfo) {
+    // Check that the NIC supports all the required offloads and report missing ones individually
+    bool all_ok = true;
+    if (!(devinfo->tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM)) {
+        fprintf(stderr, "[dpdk] NIC missing TX offload: RTE_ETH_TX_OFFLOAD_IPV4_CKSUM\n");
+        all_ok = false;
+    }
+    if (!(devinfo->tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS)) {
+        fprintf(stderr, "[dpdk] NIC missing TX offload: RTE_ETH_TX_OFFLOAD_MULTI_SEGS\n");
+        all_ok = false;
+    }
+    if (!(devinfo->tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)) {
+        fprintf(stderr, "[dpdk] NIC missing TX offload: RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE (optional but recommended)\n");
+        /* keep going but not-fully-capable */
+        all_ok = true;
+    }
+    if (!(devinfo->rx_offload_capa & RTE_ETH_RX_OFFLOAD_CHECKSUM)) {
+       fprintf(stderr, "[dpdk] NIC missing RX offload: RTE_ETH_RX_OFFLOAD_CHECKSUM\n");
+       all_ok = false;
+    }
+    if (!(devinfo->rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER)) {
+       fprintf(stderr, "[dpdk] NIC missing RX offload: RTE_ETH_RX_OFFLOAD_SCATTER\n");
+       all_ok = false;
+    }   
+    return all_ok;
+    
+}
 
 // --------------------------------------------------------------------------------------------
 // Memory configuration
@@ -510,6 +551,94 @@ static struct rte_mempool* nsn_dpdk_pktmbuf_pool_create_extmem(const char *name,
 
 	return mp;
 }
+
+//--------------------------------------------------------------------------------------------
+int setup_memory_and_mempools(nsn_endpoint_t *endpoint, 
+    uint16_t rx_queue_id, uint16_t port_id, int socket_id,
+    struct rte_mempool *hdr_pool, struct rte_mempool *zc_pool) {
+    // Register the application memory with the NIC
+    // See the alignment comment in the function.
+    void *addr = (void*)((usize)endpoint->tx_zone & 0xFFFFFFFFFFF00000);
+    usize len = align_to((endpoint->tx_zone->total_size + (((void*)endpoint->tx_zone) - addr)), 
+                          endpoint->page_size);
+    int ret = register_memory_area(addr, len, endpoint->page_size, port_id);
+    if (ret < 0) {
+        fprintf(stderr, "[dpdk] failed to register memory area with DPDK and NIC\n");
+        goto error_1;
+    }
+        
+    // Configure the external memory. This is used for RX, if zero-copy is enabled, and always for TX.
+    uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
+    uint32_t n_pages    = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
+    char *data_ptr      = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone));
+
+    // TODO: Who frees this? It should be us here or the update() on destruction of zc_pool?
+    struct rte_pktmbuf_extmem *extmem_pages = malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
+
+    for (uint32_t i = 0; i < n_pages; i++) {
+        void *ptr = (i==0) ? data_ptr : addr + i * endpoint->page_size;
+        extmem_pages[i].buf_ptr  = ptr; 
+        struct rte_memseg *ms    = rte_mem_virt2memseg(ptr, rte_mem_virt2memseg_list(ptr));
+        extmem_pages[i].buf_iova = ms->iova + ((char *)ptr - (char *)ms->addr);
+        extmem_pages[i].buf_len  = (i==0) 
+                                    ? endpoint->page_size - (data_ptr - (char*)addr) 
+                                    : endpoint->page_size;
+        extmem_pages[i].elt_size = endpoint->io_bufs_size;
+    }
+        
+    char pool_name[64];
+    bzero(pool_name, 64);
+
+    // Retrieve the header mempool for the associated queue
+    sprintf(pool_name, "hdr_pool_%u", rx_queue_id);
+    if ((hdr_pool = rte_mempool_lookup(pool_name)) == NULL) {
+        fprintf(stderr, "[dpdk] failed to lookup mempool %s\n", pool_name);
+        goto error_2;
+    }
+
+    // Mempool with external memory configuration
+    /* External memory configuration
+        This mempool contains only descriptors, not data: data_room_size is 0.
+        The descriptors will point to the INSANE nbufs, containing the data.
+        This is called "indirect mempool" in DPDK.
+        This mempool is actually a "special" mempool backed by the INSANE ring.
+    
+        In INSANE, the data area is not aligned to the page size, so the first page must 
+        be registered with a smaller size than the page size. The rest of the pages will be
+        registered with the full page size. "addr" points to the beginning of the page,
+        and "data_ptr" points to the beginning of the data area on that page.
+    */
+    bzero(pool_name, 64);
+    sprintf(pool_name, "zc_pool_%u", rx_queue_id);
+    size_t private_size    = sizeof(size_t);
+    size_t data_room_size  = 0;
+    zc_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
+                pool_name, endpoint->io_bufs_count, 0, private_size, 
+                data_room_size, socket_id, extmem_pages, n_pages, 
+                endpoint->free_slots
+            );
+    if (!zc_pool) {
+        fprintf(stderr, "[dpdk] failed to create zc data pool: %s\n", rte_strerror(rte_errno));
+        goto error_2;
+    }  
+
+    // This is the HACK that makes the external memory work. The external mempool must be
+    // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
+    // to know the size of the mbufs. So, afer the creation, we set the data room size of the
+    // mbufs to the maximum size of the payload. Apparently this works withouth visible side
+    // effects. TODO: Is there a proper way to do this?
+    struct rte_pktmbuf_pool_private *mbp_priv =
+        (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(zc_pool);
+    mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
+
+    return 0;
+
+error_2:
+    unregister_memory_area(addr, len, endpoint->page_size, port_id);
+error_1:
+    return -1;
+}
+
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // MEMPOOL HANDLERS and helper functions

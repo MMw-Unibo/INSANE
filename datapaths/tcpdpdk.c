@@ -9,6 +9,20 @@
 #include <tle_event.h>
 #include <tle_tcp.h>
 
+// This DPDK plugin assumes we are working with NICs that use the mlx5 or i40e drivers.
+// We need RSS filtering to enable the zero-copy receive, because we can associate
+// different mempools with different queues, i.e., different applications. 
+// However, the mlx5/i40e drivers do not allow us to have just some queues active when
+// the device is started (as DPDK would allow with rx_deferred start). So we need to 
+// configure and start a number of queues (MAX_DEVICE_QUEUES) which will be active
+// immediately, then we stop them until it is necessary (i.e., we have an EP for them).
+// If supported, we set the rte_isolate_flow() o ensure that a queue only receives packets
+// matching its RSS flow rule. This has some implications:
+// - we need to create a rule to receive ARP packets on queue 0 (control queue)
+// - isolate() works only for bifurcated drivers: other drivers will need code to 
+//     ensure that all traffic not matching the RSS ruls of other queues is received
+//     on queue 0 (or dropped)
+
 // Peer descriptor - augmented
 struct tcpdpdk_peer {
     char* ip_str; // IP in string form
@@ -16,12 +30,6 @@ struct tcpdpdk_peer {
     bool  mac_set; // MAC address set or not (for ARP)
     struct rte_ether_addr mac_addr; // MAC address
 };
-
-#define MAX_PARAM_STRING_SIZE 2048
-#define MAX_DEVICE_QUEUES     16    // Must be at least 2
-#define MAX_RX_BURST_ARP      8     // Must be at least 8
-#define MAX_TX_BURST          64    // Must be at least 32
-#define MAX_RX_BURST          64    // Must be at least 32
 
 //--------------------------------------------------------------------------------------------------
 // TLDK definitions
@@ -61,15 +69,13 @@ struct tldk_stream_handle {
 // Per-endpoint state
 struct tcpdpdk_ep {
     u16 rx_queue_id;
-    struct rte_mempool *rx_hdr_pool;
-    struct rte_mempool *rx_data_pool;
-    struct rte_mempool *tx_hdr_pool;
-    struct rte_mempool *tx_data_pool;
+    struct rte_mempool *hdr_pool; // Pool for headers, and RX payloads if zc_rx is false
+    struct rte_mempool *zc_pool;  // Pool for zero-copy TX and RX
     struct rte_flow *app_flow;
+    nsn_buf_t pending_rx_buf; // For non zero-copy receive
     atu32 connected_peers;
     struct tldk_stream_handle  s_svc_sockfd; // Server stream
     struct tldk_stream_handle *s_sockfd;     // Array of open streams
-    nsn_buf_t pending_rx_buf; // For non zero-copy receive
 };
 
 // Plugin state
@@ -79,6 +85,7 @@ static u16 n_peers;
 static char* local_ip;
 static uint32_t local_ip_net;
 static struct rte_ether_addr local_mac_addr;
+static char* dev_name;
 static u16 port_id;
 static u16 tx_queue_id;
 static u16 mtu;
@@ -484,8 +491,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         }
 
         // Destroy the tx mempools
-        rte_mempool_free(conn->tx_data_pool);
-        rte_mempool_free(conn->tx_hdr_pool);
+        rte_mempool_free(conn->zc_pool);
 
         // Un-register memory
         void *addr = (void*)((usize)endpoint->tx_zone & 0xFFFFFFFFFFF00000);
@@ -532,79 +538,13 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         nsn_ringbuf_dequeue_burst(free_queue_ids, &queue_id, sizeof(void*), 1, NULL);
         conn->rx_queue_id = queue_id;
 
-        // Register the application memory with the NIC
-        // See the alignment comment in the function.
-        void *addr = (void*)((usize)endpoint->tx_zone & 0xFFFFFFFFFFF00000);
-        usize len = align_to((endpoint->tx_zone->total_size + (((void*)endpoint->tx_zone) - addr)),
-                              endpoint->page_size);
-        int ret = register_memory_area(addr, len, endpoint->page_size, port_id);
-        if (ret < 0) {
-            fprintf(stderr, "[tcpdpdk] failed to register memory area with DPDK and NIC\n");
+        if (setup_memory_and_mempools(endpoint, conn->rx_queue_id, port_id, socket_id, conn->hdr_pool, conn->zc_pool) < 0) {
             goto error_1;
-        }
-        
-        // Configure the external memory. This is used for RX, if zero-copy is enabled, and always for TX.
-        uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
-        uint32_t n_pages = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
-        char *data_ptr = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone));
-        // fprintf(stderr, "Memory for data starts at %p [npages = %u, size = %lu]\n", data_ptr, n_pages, endpoint->tx_zone->size);
-        struct rte_pktmbuf_extmem *extmem_pages =
-            malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
-        for (uint32_t i = 0; i < n_pages; i++) {
-            void *ptr                = (i==0)? 
-                                            data_ptr : 
-                                            addr + i * endpoint->page_size;
-            extmem_pages[i].buf_ptr  = ptr; 
-            struct rte_memseg *ms    = rte_mem_virt2memseg(ptr, rte_mem_virt2memseg_list(ptr));
-            extmem_pages[i].buf_iova = ms->iova + ((char *)ptr - (char *)ms->addr);
-            extmem_pages[i].buf_len  = (i==0)? 
-                                            endpoint->page_size - (data_ptr - (char*)addr) : 
-                                            endpoint->page_size;
-            extmem_pages[i].elt_size = endpoint->io_bufs_size;
         }
 
         /* We have two separate paths, one to enable the zero-copy receive, one for the copy-on-receive */
-        char pool_name[64];
+        int ret;
         if(zc_rx) {
-            // RX: header mempool. Must have 10239 as num_mbufs or it fails
-            bzero(pool_name, 64);
-            sprintf(pool_name, "rx_hdr_pool_%u", conn->rx_queue_id);
-            if ((conn->rx_hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
-                fprintf(stderr, "[tcpdpdk] failed to create mempool %s\n", pool_name);
-                goto error_2;
-            }
-
-            // RX: data mempool with external memory configuration
-            /* External memory configuration
-                This mempool contains only descriptors, not data: data_room_size is 0.
-                The descriptors will point to the INSANE nbufs, containing the data.
-                This is called "indirect mempool" in DPDK.
-                This mempool is actually a "special" mempool backed by the INSANE ring.
-
-                In INSANE, the data area is not aligned to the page size, so the first page must 
-                be registered with a smaller size than the page size. The rest of the pages will be
-                registered with the full page size. "addr" points to the beginning of the page,
-                and "data_ptr" points to the beginning of the data area on that page.
-            */
-            bzero(pool_name, 64);
-            sprintf(pool_name, "rx_data_pool_%u", conn->rx_queue_id);
-            size_t private_size    = sizeof(size_t);
-            size_t data_room_size  = 0;
-            conn->rx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
-                pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
-            if (!conn->rx_data_pool) {
-                fprintf(stderr, "[tcpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
-                goto error_3;
-            }  
-            // This is the HACK that makes the external memory work. The external mempool must be
-            // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
-            // to know the size of the mbufs. So, afer the creation, we set the data room size of the
-            // mbufs to the maximum size of the payload. Apparently this works withouth visible side
-            // effects. TODO: Is there a proper way to do this?
-            struct rte_pktmbuf_pool_private *mbp_priv =
-                (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->rx_data_pool);
-            mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
-
             /* Configure RX split: headers and payloads in their respective mempools */
             struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
             // Configure the BUFFER_SPLIT offload behavior for the selected RX queue.
@@ -613,7 +553,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
             union rte_eth_rxseg rx_useg[2] = {};
             // Segment 0 (header)
             rx_seg         = &rx_useg[0].split;
-            rx_seg->mp     = conn->rx_hdr_pool;
+            rx_seg->mp     = conn->hdr_pool;
             rx_seg->offset = 0;
             // See docs in rte_ethdev.h. Must be zero if length is used (and vice versa)
             rx_seg->proto_hdr = 0;
@@ -622,7 +562,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
             // Segment 1 (payload)
             rx_seg         = &rx_useg[1].split;
             rx_seg->offset = 0;
-            rx_seg->mp     = conn->rx_data_pool;
+            rx_seg->mp     = conn->zc_pool;
             rx_seg->proto_hdr = 0;
             rx_seg->length = 2048;
 
@@ -635,38 +575,28 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
             // Setup the RX queue using the selected configuration
             if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, &rx_conf, NULL)) != 0) {
                 fprintf(stderr, "[tcpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
-                goto error_4;
+                goto error_2;
             }
         } else {
-
             // get a descriptor to receive
             u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
             if (np == 0) {
                 printf("[tcpdpdk] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
-                goto error_1;
-            }
-
-
-            // RX mempool. Must have 10239 as num_mbufs or it fails
-            bzero(pool_name, 64);
-            sprintf(pool_name, "rx_pool_%u", conn->rx_queue_id);
-            if ((conn->rx_hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
-                fprintf(stderr, "[tcpdpdk] failed to create mempool %s\n", pool_name);
                 goto error_2;
             }
 
-            // Setup the RX queue using the selected configuration
-            if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, NULL, conn->rx_hdr_pool)) != 0) {
-                fprintf(stderr, "[tcpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
-                goto error_4;
-            }
+            // // Setup the RX queue using the selected configuration
+            // if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, NULL, conn->rx_hdr_pool)) != 0) {
+            //     fprintf(stderr, "[tcpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
+            //     goto error_4;
+            // }
         }
 
         // Start the queue
         ret = rte_eth_dev_rx_queue_start(port_id, conn->rx_queue_id);
         if (ret < 0) {
             fprintf(stderr, "[tcpdpdk] failed to start queue %u: %s\n", conn->rx_queue_id, strerror(ret));
-            goto error_4;
+            goto error_3;
         }
 
         // Now create the RSS filter on that queue for this endpoint's TCP port.
@@ -675,31 +605,8 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         conn->app_flow = configure_tcp_rss_flow(port_id, conn->rx_queue_id, local_ip, endpoint->app_id, &flow_error);
         if (conn->app_flow == NULL) {
             fprintf(stderr, "[tcpdpdk] failed to create flow: %s\n", flow_error.message ? flow_error.message : "unkown");
-            goto error_5;
+            goto error_4;
         }
-
-        /* TX: header mempool */
-        sprintf(pool_name, "tx_hdr_pool_%u", conn->rx_queue_id);
-        conn->tx_hdr_pool = rte_pktmbuf_pool_create(
-            pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id);
-        if (!conn->tx_hdr_pool) {
-            fprintf(stderr, "[tcpdpdk]: failed to create tx hdr pool: %s\n", rte_strerror(rte_errno));
-            goto error_6;
-        }
-
-        /* TX: data mempool. External memory, use the same config as before */
-        size_t private_size    = sizeof(size_t);
-        size_t data_room_size  = 0;
-        sprintf(pool_name, "tx_data_pool_%u", conn->rx_queue_id);
-        conn->tx_data_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
-            pool_name, endpoint->io_bufs_count, 0, private_size, data_room_size, socket_id, extmem_pages, n_pages, endpoint->free_slots);
-        if (!conn->tx_data_pool) {
-            fprintf(stderr, "[tcpdpdk]: failed to create tx data pool: %s\n", rte_strerror(rte_errno));
-            goto error_7;
-        }      
-        struct rte_pktmbuf_pool_private *mbp_priv =
-            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->tx_data_pool);
-        mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
 
         // try to connect to peers. If we fail, just ignore the peer.
         at_store(&conn->connected_peers, 0, mo_rlx);
@@ -720,7 +627,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         // Now create the server connection (i.e., the server "socket")
         conn->s_svc_sockfd = create_tldk_stream(socket_id, endpoint->app_id, NULL);
         if(conn->s_svc_sockfd.stream == NULL) {
-            goto error_7;
+            goto error_5;
         }
         fprintf(stderr, "[tcpdpdk] created server socket\n");
         
@@ -728,29 +635,24 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         ret = tle_tcp_stream_listen(conn->s_svc_sockfd.stream);
         if (ret != 0) {
             printf("[tcpdpdk] listen: %s\n", strerror(ret));
-            goto error_8;
+            goto error_6;
         }
                 
         return 0;
-error_8:
-        tle_tcp_stream_close(conn->s_svc_sockfd.stream);
-error_7:
-        rte_mempool_free(conn->tx_hdr_pool);
 error_6:
-        rte_flow_destroy(port_id, conn->app_flow, NULL);
+        tle_tcp_stream_close(conn->s_svc_sockfd.stream);
 error_5:
-        rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
+        rte_flow_destroy(port_id, conn->app_flow, NULL);
 error_4:
-        if(conn->rx_data_pool) {
-            rte_mempool_free(conn->rx_data_pool);
-        }
+        rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
 error_3:
-        rte_mempool_free(conn->rx_hdr_pool);
-error_2:
-        unregister_memory_area(addr, len, endpoint->page_size, port_id);
         if (!zc_rx) {
             nsn_ringbuf_enqueue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL); 
         }
+error_2:
+    if(conn->zc_pool) {
+        rte_mempool_free(conn->zc_pool);
+    }
 error_1:
         nsn_ringbuf_enqueue_burst(free_queue_ids, &conn->rx_queue_id, sizeof(void*), 1, NULL);
         free(conn);
@@ -930,7 +832,7 @@ NSN_DATAPATH_INIT(tcpdpdk) {
         fprintf(stderr, "[tcpdpdk] nsn_config_get_string_from_list() failed: no option \"pci_device\" found\n");
         goto early_fail;
     }
-    char* dev_name = to_cstr(dev_name_str);
+    dev_name = to_cstr(dev_name_str);
     fprintf(stderr, "[tcpdpdk] parameter: dev_name: %s\n", dev_name);
 
     // Now, finally, initialize EAL
@@ -961,14 +863,8 @@ NSN_DATAPATH_INIT(tcpdpdk) {
     }
 
     // Check that the NIC supports all the required offloads
-    if (!(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) ||
-        !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
-        !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) ||
-        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_CHECKSUM) ||
-        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER)
-    )
-    {
-        fprintf(stderr, "[tcpdpdk] ERROR: NIC does not support one of the required offloads\n");
+    if(!probe_supported_offloads(&devinfo)) {
+        fprintf(stderr, "[tcpdpdk] required offloads not supported by the device\n");
         goto fail;
     }
 
@@ -981,6 +877,8 @@ NSN_DATAPATH_INIT(tcpdpdk) {
         fprintf(stderr, "[tcpdpdk] NIC supports buffer split, but zero-copy receive is disabled\n");
         // fprintf(stderr, "[tcpdpdk] NIC supports buffer split: zero-copy receive enabled\n");
         // zc_rx = true;
+    }  else {
+        fprintf(stderr, "[tcpdpdk] NIC does not support buffer split: zero-copy receive disabled\n");
     }
 
     ret = rte_eth_dev_get_mtu(port_id, &mtu);
@@ -1015,8 +913,10 @@ NSN_DATAPATH_INIT(tcpdpdk) {
     struct rte_eth_conf port_conf;
     bzero(&port_conf, sizeof(port_conf));
     // port_conf.rxmode.mtu = MTU;
-    port_conf.rxmode.offloads |= (RTE_ETH_RX_OFFLOAD_CHECKSUM | RTE_ETH_RX_OFFLOAD_SCATTER
-                                  | RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT);
+    port_conf.rxmode.offloads |= (RTE_ETH_RX_OFFLOAD_CHECKSUM | RTE_ETH_RX_OFFLOAD_SCATTER);
+    if (zc_rx) {
+        port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT;
+    }
     port_conf.txmode.mq_mode  = RTE_ETH_MQ_TX_NONE;
     port_conf.txmode.offloads |= (RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_MULTI_SEGS);
     if (devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
@@ -1038,8 +938,7 @@ NSN_DATAPATH_INIT(tcpdpdk) {
     struct rte_flow_error error;
     ret = rte_flow_isolate(port_id, 1, &error);
     if (ret < 0) {
-        fprintf(stderr, "[tcpdpdk] failed to isolate traffic: %s\n", error.message? error.message : rte_strerror(rte_errno));
-        goto fail;
+         fprintf(stderr, "[tcpdpdk] NIC does not support traffic isolation: %s. Skipping...\n", error.message? error.message : rte_strerror(rte_errno));
     }
     
     // Configure the queues. We have:
@@ -1077,7 +976,6 @@ NSN_DATAPATH_INIT(tcpdpdk) {
     }
 
     // Configure the rx queue 0 (control traffic) to start immediately
-    // The remaining queues are confgured later, when applications start
     struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
     rx_conf.share_group = 0;
     if ((ret = rte_eth_rx_queue_setup(port_id, 0, nb_rxd, socket_id, &rx_conf, ctrl_pool)) != 0) {
@@ -1085,8 +983,39 @@ NSN_DATAPATH_INIT(tcpdpdk) {
         goto fail;
     }
 
-    // Prepare the descriptors for the data queues (q > 0)
-    for(int i = 1; i < rx_queues; i++) {
+    // The remaining queues are confgured with "deferred start"
+    // NOTE: some drivers, like mlx5, do not support deferred start, so this will have no effect,
+    // and we will need to explicitly stop the queues later. 
+    char pool_name[64];
+    struct rte_mempool *rx_pool;
+    rx_conf.rx_deferred_start = 1;
+    for (uint16_t i = 1; i < rx_queues; i++) {                   
+        // Create a mempool for the queue (will be retrieved later by the endpoint,
+        // using its name, through DPDK). 
+        // 1. WHY HERE? Clearly, doing it here wastes memory, as we
+        // create the max possible number of mempool ever needed. But the rules on the
+        // queue config force us to do so, as we are not able to setup queues after the
+        // RTE device is started.
+        // 2. WHAT FOR? Header mempool. Must have 10239 as num_mbufs or it will fail. 
+        // It is used for TX and RX headers. If zero-copy RX is disabled,
+        // it is used for RX payloads as well.
+        bzero(pool_name, 64);
+        sprintf(pool_name, "hdr_pool_%u", i);
+        if ((rx_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) ==  NULL) {
+            fprintf(stderr, "[tcpdpdk] failed to create mempool %s\n", pool_name);
+            goto fail;
+        }
+
+        // TODO: Can we do this here also for ZC?
+        if (!zc_rx) {
+            // Associate the mempool to the queue and request deferred start
+            if ((ret = rte_eth_rx_queue_setup(port_id, i, nb_rxd, socket_id, &rx_conf, rx_pool)) != 0) {
+                fprintf(stderr, "[tcpdpdk] failed configuring rx queue %u: %s\n", i, strerror(-ret));
+                goto fail;
+            } 
+        }
+
+        // Prepare the descriptor for this data queue (q > 0)
         nsn_ringbuf_enqueue_burst(free_queue_ids, &i, sizeof(void*), 1, NULL);
     }
 
@@ -1114,6 +1043,17 @@ NSN_DATAPATH_INIT(tcpdpdk) {
         arp_request(port_id, tx_queue_id, &local_mac_addr, local_ip_net, peers[i].ip_net, ctrl_pool);
     }
 
+    // Stop the queues that are not used. This is necessary because some drivers, 
+    // such as mlx5 and i40e, do not support deferred start, and all queues are 
+    // started immediately (and silently). Other, more basic drivers just do not
+    // support queue_stop/queue_start at all, so in these case we just go on.
+    for (uint16_t i = 1; i < rx_queues; i++) {
+        ret = rte_eth_dev_rx_queue_stop(port_id, i);
+        if (ret < 0 && ret != -ENOTSUP) {
+            fprintf(stderr, "[tcpdpdk] failed to stop queue %u: %s\n", i, strerror(-ret));
+        }
+    }
+
     // Init the TLDK context
     init_tldk_ctx();
 
@@ -1136,6 +1076,9 @@ NSN_DATAPATH_INIT(tcpdpdk) {
         struct tcpdpdk_ep *conn = (struct tcpdpdk_ep *)ep_in->ep->data;
         be_tcp(conn->rx_queue_id);
     }
+
+    // Try to get ARP replies early
+    tcpdpdk_datapath_conn_manager(endpoint_list);
 
     return 0;
 
@@ -1178,7 +1121,7 @@ NSN_DATAPATH_TX(tcpdpdk) {
         valid = 0;
         for (usize i = 0; i < buf_count; i++) {
             // Prepare the payload - get the corresponding mbuf from the pool
-            data_mbuf = nsn_pktmbuf_alloc(conn->tx_data_pool, bufs[i].index);
+            data_mbuf = nsn_pktmbuf_alloc(conn->zc_pool, bufs[i].index);
             data_mbuf->pkt_len = data_mbuf->data_len = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;
             if (nsn_unlikely(data_mbuf->data_len == 0 || data_mbuf->data_len > endpoint->io_bufs_size)) {
                 fprintf(stderr, "[tcpdpdk] Invalid packet size: %u. Discarding packet...\n", data_mbuf->data_len);
@@ -1186,7 +1129,7 @@ NSN_DATAPATH_TX(tcpdpdk) {
             }  
             
             // Header len
-            struct rte_mbuf *tx_buf = rte_pktmbuf_alloc(conn->tx_hdr_pool);
+            struct rte_mbuf *tx_buf = rte_pktmbuf_alloc(conn->hdr_pool);
             if (!tx_buf) {
                 fprintf(stderr, "[tcpdpdk] failed to allocate tx mbuf\n");
                 continue;
