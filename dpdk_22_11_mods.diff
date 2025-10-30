@@ -1,3 +1,16 @@
+diff --git a/drivers/net/i40e/i40e_ethdev.c b/drivers/net/i40e/i40e_ethdev.c
+index 7726a89d99..5496966307 100644
+--- a/drivers/net/i40e/i40e_ethdev.c
++++ b/drivers/net/i40e/i40e_ethdev.c
+@@ -2657,6 +2657,8 @@ i40e_dev_close(struct rte_eth_dev *dev)
+ 
+ 	i40e_clear_automask(pf);
+ 
++	rte_pci_unmap_device(pci_dev);
++
+ 	hw->adapter_closed = 1;
+ 	return ret;
+ }
 diff --git a/drivers/net/mlx5/mlx5_ethdev.c b/drivers/net/mlx5/mlx5_ethdev.c
 index 4a85415ff3..f43b3b2759 100644
 --- a/drivers/net/mlx5/mlx5_ethdev.c

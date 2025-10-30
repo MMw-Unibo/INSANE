@@ -538,7 +538,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         nsn_ringbuf_dequeue_burst(free_queue_ids, &queue_id, sizeof(void*), 1, NULL);
         conn->rx_queue_id = queue_id;
 
-        if (setup_memory_and_mempools(endpoint, conn->rx_queue_id, port_id, socket_id, conn->hdr_pool, conn->zc_pool) < 0) {
+        if (setup_memory_and_mempools(endpoint, conn->rx_queue_id, port_id, socket_id, &conn->hdr_pool, &conn->zc_pool) < 0) {
             goto error_1;
         }
 
@@ -595,7 +595,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         // Start the queue
         ret = rte_eth_dev_rx_queue_start(port_id, conn->rx_queue_id);
         if (ret < 0) {
-            fprintf(stderr, "[tcpdpdk] failed to start queue %u: %s\n", conn->rx_queue_id, strerror(ret));
+            fprintf(stderr, "[tcpdpdk] failed to start queue %u: %s\n", conn->rx_queue_id, strerror(-ret));
             goto error_3;
         }
 
@@ -1025,10 +1025,22 @@ NSN_DATAPATH_INIT(tcpdpdk) {
         ret = rte_eth_dev_start(port_id);
     };
     if (ret) {
-        fprintf(stderr, "[tcpdpdk] impossible to start device: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[tcpdpdk] impossible to start device: %s\n", strerror(-ret));
         goto fail;
     } else {
         dev_stopped = false;
+    }
+
+    // This may take up to 9s
+    struct rte_eth_link link;
+    memset(&link, 0, sizeof(link));
+    ret = rte_eth_link_get(port_id, &link);
+    if (ret < 0) {
+        fprintf(stderr, "[tcpdpdk] failed link get (port %u): %s\n", port_id, strerror(-ret));
+        goto fail;
+    } else if (!link.link_status) {
+        fprintf(stderr, "[tcpdpdk] link never came up on port %u\n", port_id);
+        goto fail;
     }
 
     // ARP packets to be received on queue 0
@@ -1249,7 +1261,7 @@ NSN_DATAPATH_RX(tcpdpdk) {
                 // Update the pending tx descriptor
                 u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
                 if (np == 0) {
-                    printf("[udpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                    printf("[tcpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
                 }
             }
         }
@@ -1298,13 +1310,24 @@ NSN_DATAPATH_DEINIT(tcpdpdk)
         }
         be_tcp(conn->rx_queue_id);
     }
+    
     // Stop the device (and all queues, consequently). Must be done BEFORE destroying resources 
     // (e.g., mempools etc.) => i.e., call this BEFORE the tcpdpdk_datapath_update() below.
     res = rte_eth_dev_stop(port_id);
     if (res < 0) {
-        fprintf(stderr, "[tcpdpdk] failed to stop device: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[tcpdpdk] failed to stop device: %s\n", strerror(-res));
     }
     dev_stopped = true;
+    
+    // This may take up to 9s
+    struct rte_eth_link link;
+    memset(&link, 0, sizeof(link));
+    res = rte_eth_link_get(port_id, &link);
+    if (res < 0) {
+        fprintf(stderr, "[tcpdpdk] failed link get (port %u): %s\n", port_id, strerror(-res));
+    } else if (link.link_status) {
+        fprintf(stderr, "[tcpdpdk] link still up on port %u\n", port_id);
+    }
 
     list_for_each_entry(ep_in, endpoint_list, node) {
         res = tcpdpdk_datapath_update(ep_in->ep);
@@ -1312,10 +1335,15 @@ NSN_DATAPATH_DEINIT(tcpdpdk)
             fprintf(stderr, "[tcpdpdk] failed cleanup of endpoint %d\n", ep_in->ep->app_id);
         }
     }
-    
+
+    res = rte_eth_dev_close(port_id);
+    if (res < 0) {
+        fprintf(stderr, "[tcpdpdk] failed to close device: %s\n", strerror(-res));
+    }
+
     res = rte_eal_cleanup();
     if (res < 0) {
-        fprintf(stderr, "[tcpdpdk] failed to cleanup EAL: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[tcpdpdk] failed to cleanup EAL: %s\n", strerror(-res));
     }
 
     // Destroy the scratch memory

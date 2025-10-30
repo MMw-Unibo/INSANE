@@ -102,7 +102,12 @@ int register_memory_area(void *addr, const uint64_t len, uint32_t page_size,
 
     // Register pages for DMA with the NIC.
     struct rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(port_id, &dev_info);
+    ret = rte_eth_dev_info_get(port_id, &dev_info);
+    if (ret < 0) {
+        fprintf(stderr, "[dpdk] failed to get device info: %s\n", strerror(-ret));
+        return -1;
+    }
+
     for (uint32_t cur_page = 0; cur_page < n_pages; cur_page++) {
         ret = rte_dev_dma_map(dev_info.device, addr + (cur_page * page_size), iovas[cur_page],
                               page_size);
@@ -122,7 +127,12 @@ int unregister_memory_area(void *addr, const uint64_t len, uint32_t page_size,
     // De-register pages from the NIC. This must be done BEFORE de-registering from DPDK.
     int ret;
     struct rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(port_id, &dev_info);
+    ret = rte_eth_dev_info_get(port_id, &dev_info);
+    if(ret < 0) {
+        fprintf(stderr, "[dpdk] failed to get device info: %s\n", strerror(-ret));
+        return -1;
+    }
+    
     uint32_t    n_pages = len < page_size ? 1 : len / page_size;
     for (uint32_t cur_page = 0; cur_page < n_pages; cur_page++) {
         size_t     offset = page_size * cur_page;
@@ -477,9 +487,8 @@ static struct rte_mempool* nsn_dpdk_pktmbuf_pool_create_extmem(const char *name,
 	int ret;
 
 	if (RTE_ALIGN(priv_size, RTE_MBUF_PRIV_ALIGN) != priv_size) {
-		RTE_LOG(ERR, MBUF, "mbuf priv_size=%u is not aligned\n",
-			priv_size);
-		rte_errno = EINVAL;
+        fprintf(stderr, "[dpdk] mbuf priv_size=%u is not aligned\n", priv_size);
+        rte_errno = EINVAL;
 		return NULL;
 	}
 	/* Check the external memory descriptors. */
@@ -487,13 +496,12 @@ static struct rte_mempool* nsn_dpdk_pktmbuf_pool_create_extmem(const char *name,
 		const struct rte_pktmbuf_extmem *extm = ext_mem + i;
 
 		if (!extm->elt_size || !extm->buf_len || !extm->buf_ptr) {
-			RTE_LOG(ERR, MBUF, "invalid extmem descriptor\n");
-			rte_errno = EINVAL;
+            fprintf(stderr, "[dpdk] ext mem descriptor %u is invalid\n", i);
+            rte_errno = EINVAL;
 			return NULL;
 		}
 		if (data_room_size > extm->elt_size) {
-			RTE_LOG(ERR, MBUF, "ext elt_size=%u is too small\n",
-				priv_size);
+            fprintf(stderr, "[dpdk] ext elt_size=%u is too small\n", priv_size);
 			rte_errno = EINVAL;
 			return NULL;
 		}
@@ -501,7 +509,7 @@ static struct rte_mempool* nsn_dpdk_pktmbuf_pool_create_extmem(const char *name,
 	}
 	/* Check whether enough external memory provided. */
 	if (n_elts < n) {
-		RTE_LOG(ERR, MBUF, "not enough extmem\n");
+        fprintf(stderr, "[dpdk] not enough extmem\n");
 		rte_errno = ENOMEM;
 		return NULL;
 	}
@@ -522,7 +530,7 @@ static struct rte_mempool* nsn_dpdk_pktmbuf_pool_create_extmem(const char *name,
     /* Set our custom INSANE-based OPS to back the mempool */
 	ret = rte_mempool_set_ops_byname(mp, "nsn_mp_ops", NULL);
 	if (ret != 0) {
-		RTE_LOG(ERR, MBUF, "error setting mempool handler\n");
+        fprintf(stderr, "[dpdk] error setting mempool handler\n");
 		rte_mempool_free(mp);
 		rte_errno = -ret;
 		return NULL;
@@ -553,9 +561,13 @@ static struct rte_mempool* nsn_dpdk_pktmbuf_pool_create_extmem(const char *name,
 }
 
 //--------------------------------------------------------------------------------------------
+// Setup external memory, retrieves/creates mempools.
+// The last two parameters are output parameters:
+// - hdr_pool: the header pool, associated to the assigned rx_queue_id, retrieved by DPDK
+// - zc_pool: the ext-mem-backed mempool, used for zero-copy TX (and optionally RX).
 int setup_memory_and_mempools(nsn_endpoint_t *endpoint, 
     uint16_t rx_queue_id, uint16_t port_id, int socket_id,
-    struct rte_mempool *hdr_pool, struct rte_mempool *zc_pool) {
+    struct rte_mempool **hdr_pool, struct rte_mempool **zc_pool) {
     // Register the application memory with the NIC
     // See the alignment comment in the function.
     void *addr = (void*)((usize)endpoint->tx_zone & 0xFFFFFFFFFFF00000);
@@ -591,7 +603,7 @@ int setup_memory_and_mempools(nsn_endpoint_t *endpoint,
 
     // Retrieve the header mempool for the associated queue
     sprintf(pool_name, "hdr_pool_%u", rx_queue_id);
-    if ((hdr_pool = rte_mempool_lookup(pool_name)) == NULL) {
+    if ((*hdr_pool = rte_mempool_lookup(pool_name)) == NULL) {
         fprintf(stderr, "[dpdk] failed to lookup mempool %s\n", pool_name);
         goto error_2;
     }
@@ -612,12 +624,12 @@ int setup_memory_and_mempools(nsn_endpoint_t *endpoint,
     sprintf(pool_name, "zc_pool_%u", rx_queue_id);
     size_t private_size    = sizeof(size_t);
     size_t data_room_size  = 0;
-    zc_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
+    *zc_pool = nsn_dpdk_pktmbuf_pool_create_extmem(
                 pool_name, endpoint->io_bufs_count, 0, private_size, 
                 data_room_size, socket_id, extmem_pages, n_pages, 
                 endpoint->free_slots
             );
-    if (!zc_pool) {
+    if (!(*zc_pool)) {
         fprintf(stderr, "[dpdk] failed to create zc data pool: %s\n", rte_strerror(rte_errno));
         goto error_2;
     }  
@@ -628,9 +640,10 @@ int setup_memory_and_mempools(nsn_endpoint_t *endpoint,
     // mbufs to the maximum size of the payload. Apparently this works withouth visible side
     // effects. TODO: Is there a proper way to do this?
     struct rte_pktmbuf_pool_private *mbp_priv =
-        (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(zc_pool);
+        (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv((*zc_pool));
     mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
 
+    free(extmem_pages);
     return 0;
 
 error_2:

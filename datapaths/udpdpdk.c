@@ -170,7 +170,7 @@ NSN_DATAPATH_UPDATE(udpdpdk)
         nsn_ringbuf_dequeue_burst(free_queue_ids, &queue_id, sizeof(void*), 1, NULL);
         conn->rx_queue_id = queue_id;
 
-        if (setup_memory_and_mempools(endpoint, conn->rx_queue_id, port_id, socket_id, conn->hdr_pool, conn->zc_pool) < 0) {
+        if (setup_memory_and_mempools(endpoint, conn->rx_queue_id, port_id, socket_id, &conn->hdr_pool, &conn->zc_pool) < 0) {
             goto error_1;
         }
 
@@ -543,10 +543,22 @@ NSN_DATAPATH_INIT(udpdpdk)
         ret = rte_eth_dev_start(port_id);
     };
     if (ret) {
-        fprintf(stderr, "[udpdpdk] impossible to start device: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[udpdpdk] impossible to start device: %s\n", strerror(-ret));
         goto fail;
     } else {
         dev_stopped = false;
+    }
+
+    // This may take up to 9s
+    struct rte_eth_link link;
+    memset(&link, 0, sizeof(link));
+    ret = rte_eth_link_get(port_id, &link);
+    if (ret < 0) {
+        fprintf(stderr, "[udpdpdk] failed link get (port %u): %s\n", port_id, strerror(-ret));
+        goto fail;
+    } else if (!link.link_status) {
+        fprintf(stderr, "[udpdpdk] link never came up on port %u\n", port_id);
+        goto fail;
     }
 
     // ARP packets to be received on queue 0
@@ -603,6 +615,7 @@ NSN_DATAPATH_TX(udpdpdk)
     struct rte_mbuf *hdr_mbuf, *data_mbuf;
     uint16_t nb_tx, nb_px;   
     struct udpdpdk_ep *conn = (struct udpdpdk_ep *)endpoint->data;
+    int ret;
 
     if (buf_count > MAX_TX_BURST) {
         fprintf(stderr, "[udpdpdk] tx burst too large\n");
@@ -617,7 +630,12 @@ NSN_DATAPATH_TX(udpdpdk)
         }        
 
         // Prepare the header mbuf
-        rte_pktmbuf_alloc_bulk(conn->hdr_pool, tx_bufs, buf_count);
+        ret = rte_pktmbuf_alloc_bulk(conn->hdr_pool, tx_bufs, buf_count);
+        if (ret < 0) {
+            fprintf(stderr, "[udpdpdk] failed to allocate header mbufs: %s\n", strerror(-ret));
+            continue;
+        }
+        
 
         for (usize i = 0; i < buf_count; i++) {
             // Get the data and size from the index
@@ -629,7 +647,10 @@ NSN_DATAPATH_TX(udpdpdk)
             
             // Prepare the payload - get the corresponding mbuf from the pool
             data_mbuf = nsn_pktmbuf_alloc(conn->zc_pool, bufs[i].index);
-            data_mbuf->data_len = size;
+            if(data_mbuf == NULL) {
+                fprintf(stderr, "[udpdpdk] failed to allocate data mbuf for index %lu\n", bufs[i].index);
+            }
+            data_mbuf->pkt_len = data_mbuf->data_len = size;
            
             // Chain the mbufs
             rte_pktmbuf_chain(tx_bufs[i], data_mbuf);
@@ -749,9 +770,19 @@ NSN_DATAPATH_DEINIT(udpdpdk)
     // (e.g., mempools etc.) => i.e., call this BEFORE the udpdpdk_datapath_update() below.
     int res = rte_eth_dev_stop(port_id);
     if (res < 0) {
-        fprintf(stderr, "[udpdpdk] failed to stop device: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[udpdpdk] failed to stop device: %s\n", strerror(-res));
     }
     dev_stopped = true;
+
+    // This may take up to 9s
+    struct rte_eth_link link;
+    memset(&link, 0, sizeof(link));
+    res = rte_eth_link_get(port_id, &link);
+    if (res < 0) {
+        fprintf(stderr, "[udpdpdk] failed link get (port %u): %s\n", port_id, strerror(-res));
+    } else if (link.link_status) {
+        fprintf(stderr, "[udpdpdk] link still up on port %u\n", port_id);
+    }
 
     struct ep_initializer *ep_in;
     list_for_each_entry(ep_in, endpoint_list, node) {
@@ -761,25 +792,14 @@ NSN_DATAPATH_DEINIT(udpdpdk)
         }
     }
 
-    // Destroy the HDR mempools
-    char pool_name[64];
-    struct rte_mempool *pool;
-    for (uint16_t i = 1; i < MAX_DEVICE_QUEUES; i++) {                   
-        bzero(pool_name, 64);
-        sprintf(pool_name, "hdr_pool_%u", i);
-        pool = rte_mempool_lookup(pool_name);
-        if (pool) {
-            rte_mempool_free(pool);
-        }
-    }
-    
     res = rte_eth_dev_close(port_id);
     if (res < 0) {
         fprintf(stderr, "[udpdpdk] failed to close device: %s\n", strerror(-res));
     }
+
     res = rte_eal_cleanup();
     if (res < 0) {
-        fprintf(stderr, "[udpdpdk] failed to cleanup EAL: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[udpdpdk] failed to cleanup EAL: %s\n", strerror(-res));
     }
 
     // Destroy the scratch memory
