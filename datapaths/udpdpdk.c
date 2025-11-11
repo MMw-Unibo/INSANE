@@ -6,42 +6,37 @@
 #include "../src/common/nsn_temp.h"
 #include "../src/base/nsn_os_linux.c"
 
-// This DPDK plugin assumes we are working with NICs that use the mlx5 driver.
+// This DPDK plugin assumes we are working with NICs that use the mlx5 or i40e drivers.
 // We need RSS filtering to enable the zero-copy receive, because we can associate
 // different mempools with different queues, i.e., different applications. 
-// However, the mlx5 driver does not allow to have just some queues active and some
-// stopped (as DPDK would allow with rx_deferred starte). So we need to configure and
-// start a number of queues (MAX_DEVICE_QUEUES) which will be active immediately.
-// Hence, we set the rte_isolate_flow() to ensure that a queue only receives packets
+// However, the mlx5/i40e drivers do not allow us to have just some queues active when
+// the device is started (as DPDK would allow with rx_deferred start). So we need to 
+// configure and start a number of queues (MAX_DEVICE_QUEUES) which will be active
+// immediately, then we stop them until it is necessary (i.e., we have an EP for them).
+// If supported, we set the rte_isolate_flow() o ensure that a queue only receives packets
 // matching its RSS flow rule. This has some implications:
 // - we need to create a rule to receive ARP packets on queue 0 (control queue)
 // - isolate() works only for bifurcated drivers: other drivers will need code to 
 //     ensure that all traffic not matching the RSS ruls of other queues is received
 //     on queue 0 (or dropped)
-// - we did not include rte_queue_start() logic which will be nice to have when supported
 
-
-#define MAX_PARAM_STRING_SIZE 2048
-#define MAX_DEVICE_QUEUES     16    // Must be at least 2
-#define MAX_RX_BURST_ARP      8     // Must be at least 8
-#define MAX_TX_BURST          64    // Must be at least 32
-#define MAX_RX_BURST          64    // Must be at least 32
 
 // Per-endpoint state
 struct udpdpdk_ep {
     u16 rx_queue_id;
-    nsn_buf_t pending_rx_buf; // For non zero-copy receive
     struct rte_mempool *hdr_pool; // Pool for headers, and RX payloads if zc_rx is false
     struct rte_mempool *zc_pool;  // Pool for zero-copy TX and RX
     struct rte_flow *app_flow;
+    nsn_buf_t pending_rx_buf; // For non zero-copy receive
 };
 
-// Local state
+// Plugin state
 static struct arp_peer* peers; // Works as ARP cache
 static u16 n_peers;
 static char* local_ip;
 static uint32_t local_ip_net;
 static struct rte_ether_addr local_mac_addr;
+static char*  dev_name;
 static u16    port_id;
 static u16    tx_queue_id;
 static int    socket_id;
@@ -53,7 +48,9 @@ struct rte_mempool *ctrl_pool;
 static temp_mem_arena_t scratch;
 static struct rte_flow *rx_arp_flow;
 static bool dev_stopped = true;
-static bool zc_rx = false; // Zero-copy RX switch
+
+// Zero-copy RX switch
+static bool zc_rx = false;
 
 /* Protocols */
 static inline void 
@@ -126,9 +123,9 @@ NSN_DATAPATH_UPDATE(udpdpdk)
             }
         }
 
-        // Destroy the mempools
+        // Destroy the ZC mempool. The HDR mempool can be re-used by the next app,
+        // as it is associated with the device RX queue and not to the endpoint.
         rte_mempool_free(conn->zc_pool);
-        rte_mempool_free(conn->hdr_pool);
 
         // Un-register memory
         void *addr = (void*)((usize)endpoint->tx_zone & 0xFFFFFFFFFFF00000);
@@ -173,84 +170,12 @@ NSN_DATAPATH_UPDATE(udpdpdk)
         nsn_ringbuf_dequeue_burst(free_queue_ids, &queue_id, sizeof(void*), 1, NULL);
         conn->rx_queue_id = queue_id;
 
-        // Register the application memory with the NIC
-        // See the alignment comment in the function.
-        void *addr = (void*)((usize)endpoint->tx_zone & 0xFFFFFFFFFFF00000);
-        usize len = align_to((endpoint->tx_zone->total_size + (((void*)endpoint->tx_zone) - addr)),
-                              endpoint->page_size);
-        int ret = register_memory_area(addr, len, endpoint->page_size, port_id);
-        if (ret < 0) {
-            fprintf(stderr, "[udpdpdk] failed to register memory area with DPDK and NIC\n");
+        if (setup_memory_and_mempools(endpoint, conn->rx_queue_id, port_id, socket_id, &conn->hdr_pool, &conn->zc_pool) < 0) {
             goto error_1;
         }
-        
-        // Configure the external memory. This is used for RX, if zero-copy is enabled, and always for TX.
-        uint32_t spare_page = (endpoint->tx_zone->size % endpoint->page_size == 0)? 0 : 1;
-        uint32_t n_pages    = endpoint->tx_zone->size < endpoint->page_size ? spare_page : (endpoint->tx_zone->size / endpoint->page_size) + spare_page;
-        char *data_ptr      = (char*)(nsn_mm_zone_get_ptr(endpoint->tx_zone));
-
-        struct rte_pktmbuf_extmem *extmem_pages = malloc(sizeof(struct rte_pktmbuf_extmem) * n_pages);
-
-        for (uint32_t i = 0; i < n_pages; i++) {
-            void *ptr = (i==0) ? data_ptr : addr + i * endpoint->page_size;
-            extmem_pages[i].buf_ptr  = ptr; 
-            struct rte_memseg *ms    = rte_mem_virt2memseg(ptr, rte_mem_virt2memseg_list(ptr));
-            extmem_pages[i].buf_iova = ms->iova + ((char *)ptr - (char *)ms->addr);
-            extmem_pages[i].buf_len  = (i==0) 
-                                        ? endpoint->page_size - (data_ptr - (char*)addr) 
-                                        : endpoint->page_size;
-            extmem_pages[i].elt_size = endpoint->io_bufs_size;
-        }
-        
-        char pool_name[64];
-        bzero(pool_name, 64);
-
-        // Header mempool. Must have 10239 as num_mbufs or it fails. 
-        // It is used for TX and RX headers. If zero-copy RX is disabled,
-        // it is used for RX payloads as well.
-        sprintf(pool_name, "hdr_pool_%u", conn->rx_queue_id);
-        if ((conn->hdr_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) == NULL) {
-            fprintf(stderr, "[udpdpdk] failed to create mempool %s\n", pool_name);
-            goto error_2;
-        }
-
-        // Mempool with external memory configuration
-        /* External memory configuration
-            This mempool contains only descriptors, not data: data_room_size is 0.
-            The descriptors will point to the INSANE nbufs, containing the data.
-            This is called "indirect mempool" in DPDK.
-            This mempool is actually a "special" mempool backed by the INSANE ring.
-        
-            In INSANE, the data area is not aligned to the page size, so the first page must 
-            be registered with a smaller size than the page size. The rest of the pages will be
-            registered with the full page size. "addr" points to the beginning of the page,
-            and "data_ptr" points to the beginning of the data area on that page.
-        */
-        bzero(pool_name, 64);
-        sprintf(pool_name, "zc_pool_%u", conn->rx_queue_id);
-        size_t private_size    = sizeof(size_t);
-        size_t data_room_size  = 0;
-        conn->zc_pool = 
-            nsn_dpdk_pktmbuf_pool_create_extmem(
-                pool_name, endpoint->io_bufs_count, 0, private_size, 
-                data_room_size, socket_id, extmem_pages, n_pages, 
-                endpoint->free_slots
-            );
-        if (!conn->zc_pool) {
-            fprintf(stderr, "[udpdpdk]: failed to create zc data pool: %s\n", rte_strerror(rte_errno));
-            goto error_3;
-        }  
-
-        // This is the HACK that makes the external memory work. The external mempool must be
-        // created with 0 data room size. But then the driver(s) use the data room size of the mbufs
-        // to know the size of the mbufs. So, afer the creation, we set the data room size of the
-        // mbufs to the maximum size of the payload. Apparently this works withouth visible side
-        // effects. TODO: Is there a proper way to do this?
-        struct rte_pktmbuf_pool_private *mbp_priv =
-            (struct rte_pktmbuf_pool_private *)rte_mempool_get_priv(conn->zc_pool);
-        mbp_priv->mbuf_data_room_size = endpoint->io_bufs_size;
 
         /* We have two separate paths, one to enable the zero-copy receive, one for the copy-on-receive */
+        int ret;
         if(zc_rx) {
             /* Configure RX split: headers and payloads in their respective mempools */
             struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
@@ -282,28 +207,28 @@ NSN_DATAPATH_UPDATE(udpdpdk)
             // Setup the RX queue using the selected configuration
             if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, &rx_conf, NULL)) != 0) {
                 fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
-                goto error_4;
+                goto error_2;
             }
         } else {
             // get a descriptor to receive
             u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
             if (np == 0) {
                 fprintf(stderr, "[udpdpdk] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
-                goto error_1;
+                goto error_2;
             }
 
-            // Setup the RX queue using the selected configuration
-            if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, NULL, conn->hdr_pool)) != 0) {
-                fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(rte_errno));
-                goto error_4;
-            }
+            // // Setup the RX queue using the selected configuration
+            // if ((ret = rte_eth_rx_queue_setup(port_id, conn->rx_queue_id, nb_rxd, socket_id, NULL, conn->hdr_pool)) != 0) {
+            //     fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", conn->rx_queue_id, rte_strerror(-ret));
+            //     goto error_4;
+            // }
         }
 
         // Start the queue
         ret = rte_eth_dev_rx_queue_start(port_id, conn->rx_queue_id);
-        if (ret < 0) {
-            fprintf(stderr, "[udpdpdk] failed to start queue %u: %s\n", conn->rx_queue_id, strerror(ret));
-            goto error_4;
+        if (ret < 0 && ret != -ENOTSUP) {
+            fprintf(stderr, "[udpdpdk] failed to start queue %u: %s\n", conn->rx_queue_id, strerror(-ret));
+            goto error_3;
         }
 
         // Now create the RSS filter on that queue for this endpoint's UDP port.
@@ -312,21 +237,18 @@ NSN_DATAPATH_UPDATE(udpdpdk)
         conn->app_flow = configure_udp_rss_flow(port_id, conn->rx_queue_id, local_ip, endpoint->app_id, &flow_error);
         if (conn->app_flow == NULL) {
             fprintf(stderr, "[udpdpdk] failed to create flow: %s\n", flow_error.message ? flow_error.message : "unkown");
-            goto error_5;
+            goto error_4;
         }
 
         return 0;
-error_5:
-        rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
 error_4:
-        rte_mempool_free(conn->zc_pool);
+        rte_eth_dev_rx_queue_stop(port_id, conn->rx_queue_id);
 error_3:
-        rte_mempool_free(conn->hdr_pool);
-error_2:
-        unregister_memory_area(addr, len, endpoint->page_size, port_id);
         if (!zc_rx) {
             nsn_ringbuf_enqueue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL); 
         }
+error_2:
+        rte_mempool_free(conn->zc_pool);
 error_1:
         nsn_ringbuf_enqueue_burst(free_queue_ids, &conn->rx_queue_id, sizeof(void*), 1, NULL);
         free(conn);
@@ -440,7 +362,7 @@ NSN_DATAPATH_INIT(udpdpdk)
         fprintf(stderr, "[udpdpdk] nsn_config_get_string_from_list() failed: no option \"pci_device\" found\n");
         goto early_fail;
     }
-    char* dev_name = to_cstr(dev_name_str);
+    dev_name = to_cstr(dev_name_str);
     fprintf(stderr, "[udpdpdk] parameter: dev_name: %s\n", dev_name);
 
     // Now, finally, initialize EAL
@@ -471,13 +393,8 @@ NSN_DATAPATH_INIT(udpdpdk)
     }
 
     // Check that the NIC supports all the required offloads
-    if (!(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) ||
-        !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
-        !(devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) ||
-        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_CHECKSUM) ||
-        !(devinfo.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER))
-    {
-        fprintf(stderr, "[error] NIC does not support one of the required offloads\n");
+    if(!probe_supported_offloads(&devinfo)) {
+        fprintf(stderr, "[udpdpdk] required offloads not supported by the device\n");
         goto fail;
     }
     
@@ -514,8 +431,10 @@ NSN_DATAPATH_INIT(udpdpdk)
     struct rte_eth_conf port_conf;
     bzero(&port_conf, sizeof(port_conf));
     // port_conf.rxmode.mtu = MTU;
-    port_conf.rxmode.offloads |= (RTE_ETH_RX_OFFLOAD_CHECKSUM | RTE_ETH_RX_OFFLOAD_SCATTER
-                                  | RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT);
+    port_conf.rxmode.offloads |= (RTE_ETH_RX_OFFLOAD_CHECKSUM | RTE_ETH_RX_OFFLOAD_SCATTER);
+    if (zc_rx) {
+        port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT;
+    }
     port_conf.txmode.mq_mode  = RTE_ETH_MQ_TX_NONE;
     port_conf.txmode.offloads |= (RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_MULTI_SEGS);
     if (devinfo.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
@@ -529,7 +448,7 @@ NSN_DATAPATH_INIT(udpdpdk)
     nb_txd = 1024;
     if ((ret = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &nb_rxd, &nb_txd)) != 0) {
         fprintf(stderr, "[udpdpdk] error setting tx and rx descriptors: %s\n", rte_strerror(rte_errno));
-        goto fail;;
+        goto fail;
     }
 
     // Isolate the flow - only allow traffic that is specified by the flow rules (RSS filter)
@@ -537,8 +456,7 @@ NSN_DATAPATH_INIT(udpdpdk)
     struct rte_flow_error error;
     ret = rte_flow_isolate(port_id, 1, &error);
     if (ret < 0) {
-        fprintf(stderr, "[udpdpdk] failed to isolate traffic: %s\n", error.message? error.message : rte_strerror(rte_errno));
-        goto fail;
+        fprintf(stderr, "[udpdpdk] NIC does not support traffic isolation: %s. Skipping...\n", error.message? error.message : rte_strerror(rte_errno));
     }
     
     // Configure the queues. We have:
@@ -576,7 +494,6 @@ NSN_DATAPATH_INIT(udpdpdk)
     }
 
     // Configure the rx queue 0 (control traffic) to start immediately
-    // The remaining queues are confgured later, when applications start
     struct rte_eth_rxconf rx_conf = devinfo.default_rxconf;
     rx_conf.share_group = 0;
     if ((ret = rte_eth_rx_queue_setup(port_id, 0, nb_rxd, socket_id, &rx_conf, ctrl_pool)) != 0) {
@@ -584,8 +501,39 @@ NSN_DATAPATH_INIT(udpdpdk)
         goto fail;
     }
 
-    // Prepare the descriptors for the data queues (q > 0)
-    for(int i = 1; i < rx_queues; i++) {
+    // The remaining queues are confgured with "deferred start"
+    // NOTE: some drivers, like mlx5, do not support deferred start, so this will have no effect,
+    // and we will need to explicitly stop the queues later. 
+    char pool_name[64];
+    struct rte_mempool *rx_pool;
+    rx_conf.rx_deferred_start = 1;
+    for (uint16_t i = 1; i < rx_queues; i++) {                   
+        // Create a mempool for the queue (will be retrieved later by the endpoint,
+        // using its name, through DPDK). 
+        // 1. WHY HERE? Clearly, doing it here wastes memory, as we
+        // create the max possible number of mempool ever needed. But the rules on the
+        // queue config force us to do so, as we are not able to setup queues after the
+        // RTE device is started.
+        // 2. WHAT FOR? Header mempool. Must have 10239 as num_mbufs or it will fail. 
+        // It is used for TX and RX headers. If zero-copy RX is disabled,
+        // it is used for RX payloads as well.
+        bzero(pool_name, 64);
+        sprintf(pool_name, "hdr_pool_%u", i);
+        if ((rx_pool = rte_pktmbuf_pool_create(pool_name, 10239, 64, 0, RTE_MBUF_DEFAULT_BUF_SIZE, socket_id)) ==  NULL) {
+            fprintf(stderr, "[udpdpdk] failed to create mempool %s\n", pool_name);
+            goto fail;
+        }
+
+        // TODO: Can we do this here also for ZC?
+        if (!zc_rx) {
+            // Associate the mempool to the queue and request deferred start
+            if ((ret = rte_eth_rx_queue_setup(port_id, i, nb_rxd, socket_id, &rx_conf, rx_pool)) != 0) {
+                fprintf(stderr, "[udpdpdk] failed configuring rx queue %u: %s\n", i, strerror(-ret));
+                goto fail;
+            } 
+        }
+
+        // Prepare the descriptor for this data queue (q > 0)
         nsn_ringbuf_enqueue_burst(free_queue_ids, &i, sizeof(void*), 1, NULL);
     }
 
@@ -595,10 +543,22 @@ NSN_DATAPATH_INIT(udpdpdk)
         ret = rte_eth_dev_start(port_id);
     };
     if (ret) {
-        fprintf(stderr, "[udpdpdk] impossible to start device: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[udpdpdk] impossible to start device: %s\n", strerror(-ret));
         goto fail;
     } else {
         dev_stopped = false;
+    }
+
+    // This may take up to 9s
+    struct rte_eth_link link;
+    memset(&link, 0, sizeof(link));
+    ret = rte_eth_link_get(port_id, &link);
+    if (ret < 0) {
+        fprintf(stderr, "[udpdpdk] failed link get (port %u): %s\n", port_id, strerror(-ret));
+        goto fail;
+    } else if (!link.link_status) {
+        fprintf(stderr, "[udpdpdk] link never came up on port %u\n", port_id);
+        goto fail;
     }
 
     // ARP packets to be received on queue 0
@@ -611,6 +571,17 @@ NSN_DATAPATH_INIT(udpdpdk)
     // For each peer, send an ARP request
     for (int i = 0; i < n_peers; i++) {
         arp_request(port_id, tx_queue_id, &local_mac_addr, local_ip_net, peers[i].ip_net, ctrl_pool);
+    }
+
+    // Stop the queues that are not used. This is necessary because some drivers, 
+    // such as mlx5 and i40e, do not support deferred start, and all queues are 
+    // started immediately (and silently). Other, more basic drivers just do not
+    // support queue_stop/queue_start at all, so in these case we just go on.
+    for (uint16_t i = 1; i < rx_queues; i++) {
+        ret = rte_eth_dev_rx_queue_stop(port_id, i);
+        if (ret < 0 && ret != -ENOTSUP) {
+            fprintf(stderr, "[udpdpdk] failed to stop queue %u: %s\n", i, strerror(-ret));
+        }
     }
 
     // Setup the communication channels to the peers
@@ -644,6 +615,7 @@ NSN_DATAPATH_TX(udpdpdk)
     struct rte_mbuf *hdr_mbuf, *data_mbuf;
     uint16_t nb_tx, nb_px;   
     struct udpdpdk_ep *conn = (struct udpdpdk_ep *)endpoint->data;
+    int ret;
 
     if (buf_count > MAX_TX_BURST) {
         fprintf(stderr, "[udpdpdk] tx burst too large\n");
@@ -658,7 +630,12 @@ NSN_DATAPATH_TX(udpdpdk)
         }        
 
         // Prepare the header mbuf
-        rte_pktmbuf_alloc_bulk(conn->hdr_pool, tx_bufs, buf_count);
+        ret = rte_pktmbuf_alloc_bulk(conn->hdr_pool, tx_bufs, buf_count);
+        if (ret < 0) {
+            fprintf(stderr, "[udpdpdk] failed to allocate header mbufs: %s\n", strerror(-ret));
+            continue;
+        }
+        
 
         for (usize i = 0; i < buf_count; i++) {
             // Get the data and size from the index
@@ -670,7 +647,10 @@ NSN_DATAPATH_TX(udpdpdk)
             
             // Prepare the payload - get the corresponding mbuf from the pool
             data_mbuf = nsn_pktmbuf_alloc(conn->zc_pool, bufs[i].index);
-            data_mbuf->data_len = size;
+            if(data_mbuf == NULL) {
+                fprintf(stderr, "[udpdpdk] failed to allocate data mbuf for index %lu\n", bufs[i].index);
+            }
+            data_mbuf->pkt_len = data_mbuf->data_len = size;
            
             // Chain the mbufs
             rte_pktmbuf_chain(tx_bufs[i], data_mbuf);
@@ -790,9 +770,19 @@ NSN_DATAPATH_DEINIT(udpdpdk)
     // (e.g., mempools etc.) => i.e., call this BEFORE the udpdpdk_datapath_update() below.
     int res = rte_eth_dev_stop(port_id);
     if (res < 0) {
-        fprintf(stderr, "[udpdpdk] failed to stop device: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[udpdpdk] failed to stop device: %s\n", strerror(-res));
     }
     dev_stopped = true;
+
+    // This may take up to 9s
+    struct rte_eth_link link;
+    memset(&link, 0, sizeof(link));
+    res = rte_eth_link_get(port_id, &link);
+    if (res < 0) {
+        fprintf(stderr, "[udpdpdk] failed link get (port %u): %s\n", port_id, strerror(-res));
+    } else if (link.link_status) {
+        fprintf(stderr, "[udpdpdk] link still up on port %u\n", port_id);
+    }
 
     struct ep_initializer *ep_in;
     list_for_each_entry(ep_in, endpoint_list, node) {
@@ -801,10 +791,15 @@ NSN_DATAPATH_DEINIT(udpdpdk)
             fprintf(stderr, "[udpdpdk] failed cleanup of endpoint %d\n", ep_in->ep->app_id);
         }
     }
-    
+
+    res = rte_eth_dev_close(port_id);
+    if (res < 0) {
+        fprintf(stderr, "[udpdpdk] failed to close device: %s\n", strerror(-res));
+    }
+
     res = rte_eal_cleanup();
     if (res < 0) {
-        fprintf(stderr, "[udpdpdk] failed to cleanup EAL: %s\n", rte_strerror(rte_errno));
+        fprintf(stderr, "[udpdpdk] failed to cleanup EAL: %s\n", strerror(-res));
     }
 
     // Destroy the scratch memory

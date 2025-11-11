@@ -18,7 +18,7 @@ fi
 
 # Install prerequisites
 sudo apt update
-sudo apt install -y librdmacm-dev libmnl-dev build-essential clang libnuma-dev pkg-config python3 python3-pip meson clang-format cmake python3-pyelftools
+sudo apt install -y librdmacm-dev libmnl-dev build-essential clang libnuma-dev pkg-config python3 python3-pip meson clang-format cmake python3-pyelftools libsystemd-dev libpcap-dev
 
 # Fail on error.
 set -e

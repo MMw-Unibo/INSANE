@@ -11,6 +11,7 @@ INSANE (<u>I</u>ntegrated a<u>N</u>d <u>S</u>elective <u>A</u>cceleration for th
 ### Prerequisites
 First, it is necessary to prepare the environment and to install the prerequisites:
 * Ubuntu 22.04 or newer (we did not test other environments)
+* The following packages: `cmake` and `pkg-config` (you can install them via `sudo apt install cmake pkg-config`)
 * Setup hugepages (you need root access) ([script](scripts/hugepages.sh))
 * Install cJSON and citiweb as required by the REST support ([script](scripts/install-rest.sh))
 

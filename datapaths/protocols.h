@@ -238,7 +238,7 @@ arp_request(
         
     uint16_t ret = 0;
     while(!ret) {
-        ret += rte_eth_tx_burst(port_id, tx_queue_id, &rte_mbuf, 1);
+        ret = rte_eth_tx_burst(port_id, tx_queue_id, &rte_mbuf, 1);
     }
 
     return 0;
