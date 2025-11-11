@@ -158,7 +158,7 @@ static int prepare_dst_headers(void *data, const struct in_addr *addr, struct tl
 }
 
 // Init a TLDK context
-static void init_tldk_ctx() {
+static int init_tldk_ctx() {
     /***** TLDK: Initialize the TLDK context, then open a stream. 
      * The context consists of 4 elements:
      *  1. rte_mempool  - Header pool for fragment headers and control packets
@@ -171,7 +171,16 @@ static void init_tldk_ctx() {
     tldk_ctx.head_mp = ctrl_pool;
 
     /* 2. Create the TCP context */
-    uint16_t socket_id = rte_eth_dev_socket_id(port_id);
+    int32_t socket_id = rte_eth_dev_socket_id(port_id);
+    if (socket_id < 0) {
+        if (rte_errno == EINVAL) {
+            fprintf(stderr, "[error] cannot get socket ID for port %u: %s.\n", port_id, strerror(-socket_id));
+            return -EINVAL;
+        } else {
+            socket_id = 0; // Default to socket 0 if socket could not be determined (e.g., in VMs)
+        }
+    }
+
     struct tle_ctx_param ctx_params = {
         .socket_id         = socket_id,
         .proto             = TLE_PROTO_TCP,
@@ -188,6 +197,10 @@ static void init_tldk_ctx() {
         .lookup4_data      = NULL, // opaque data for lookup4()
     };
     tldk_ctx.ctx = tle_ctx_create(&ctx_params);
+    if(tldk_ctx.ctx == NULL) {
+        fprintf(stderr, "[tcpdpdk] tle_ctx_create() failed\n");
+        return -1;
+    }
 
     /* 3. Prepare the local TCP port */
     struct sockaddr_in local_ip;
@@ -213,8 +226,11 @@ static void init_tldk_ctx() {
 
     tldk_ctx.dev = tle_add_dev(tldk_ctx.ctx, &dprm);
     if (tldk_ctx.dev == NULL) {
-        printf("tle_add_dev() failed\n");
+        fprintf(stderr, "[tcpdpk] tle_add_dev() failed\n");
+        return -1;
     }
+
+    return 0;
 }
 
 // Create a TLDK stream
@@ -229,7 +245,7 @@ static struct tldk_stream_handle create_tldk_stream(uint16_t socket_id, uint16_t
     struct tle_evq *rxeq = tle_evq_create(&eprm); // RX queue
     struct tle_evq *txeq = tle_evq_create(&eprm); // TX queue
     if (ereq == NULL || rxeq == NULL || txeq == NULL) {
-        printf("Error creating event queues\n");
+        fprintf(stderr, "[tcpdpdk] error creating event queues\n");
         rte_exit(EXIT_FAILURE, "Error creating event queues\n");
     }
     
@@ -642,7 +658,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
             // get a descriptor to receive
             u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
             if (np == 0) {
-                printf("[tcpdpdk] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                fprintf(stderr, "[tcpdpdk] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
                 goto error_1;
             }
 
@@ -727,7 +743,7 @@ NSN_DATAPATH_UPDATE(tcpdpdk) {
         // Listen
         ret = tle_tcp_stream_listen(conn->s_svc_sockfd.stream);
         if (ret != 0) {
-            printf("[tcpdpdk] listen: %s\n", strerror(ret));
+            fprintf(stderr, "[tcpdpdk] listen: %s\n", strerror(ret));
             goto error_8;
         }
                 
@@ -992,11 +1008,11 @@ NSN_DATAPATH_INIT(tcpdpdk) {
 
     socket_id = rte_eth_dev_socket_id(port_id);    
     if (socket_id < 0) {
-        if (rte_errno) {
-            fprintf(stderr, "[tcpdpdk] cannot get socket id: %s\n", rte_strerror(rte_errno));
-            goto fail;
+        if (rte_errno == EINVAL) {
+            fprintf(stderr, "[tcpdpdk] cannot get socket ID for port %u: %s.\n", port_id, strerror(-socket_id));
+            return -EINVAL;
         } else {
-            socket_id = rte_socket_id();
+            socket_id = 0; // Default to socket 0 if socket could not be determined (e.g., in VMs)
         }
     } else if (socket_id != (int)rte_socket_id()) {
         fprintf(stderr, "[tcpdpdk] Warning: running on a different socket than that the NIC is attached to!\n");
@@ -1115,7 +1131,11 @@ NSN_DATAPATH_INIT(tcpdpdk) {
     }
 
     // Init the TLDK context
-    init_tldk_ctx();
+    ret = init_tldk_ctx();
+    if (ret < 0) {
+        fprintf(stderr, "[tcpdpdk] init_tldk_ctx() failed\n");
+        goto fail_and_stop;
+    }
 
     // Init the TLDK backend thread mutex
     ret = nsn_os_mutex_init(&be_lock); 
@@ -1306,7 +1326,7 @@ NSN_DATAPATH_RX(tcpdpdk) {
                 // Update the pending tx descriptor
                 u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
                 if (np == 0) {
-                    printf("[udpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                    fprintf(stderr, "[tcpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
                 }
             }
         }

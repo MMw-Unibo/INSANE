@@ -288,7 +288,7 @@ NSN_DATAPATH_UPDATE(udpdpdk)
             // get a descriptor to receive
             u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
             if (np == 0) {
-                printf("[udpdpdk] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                fprintf(stderr, "[udpdpdk] No free slots to receive from ring %p [%u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
                 goto error_1;
             }
 
@@ -491,11 +491,11 @@ NSN_DATAPATH_INIT(udpdpdk)
 
     socket_id = rte_eth_dev_socket_id(port_id);    
     if (socket_id < 0) {
-        if (rte_errno) {
-            fprintf(stderr, "[udpdpdk] cannot get socket id: %s\n", rte_strerror(rte_errno));
-            goto fail;
+        if (rte_errno == EINVAL) {
+            fprintf(stderr, "[udpdpdk] cannot get socket ID for port %u: %s.\n", port_id, strerror(-socket_id));
+            return -EINVAL;
         } else {
-            socket_id = rte_socket_id();
+            socket_id = 0; // Default to socket 0 if socket could not be determined (e.g., in VMs)
         }
     } else if (socket_id != (int)rte_socket_id()) {
         fprintf(stderr, "[udpdpdk] Warning: running on a different socket than that the NIC is attached to!\n");
@@ -773,7 +773,7 @@ NSN_DATAPATH_RX(udpdpdk)
             // Update the pending tx descriptor
             u32 np = nsn_ringbuf_dequeue_burst(endpoint->free_slots, &conn->pending_rx_buf, sizeof(conn->pending_rx_buf), 1, NULL);
             if (np == 0) {
-                printf("[udpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
+                fprintf(stderr, "[udpdpdk] No free slots for next receive! Ring: %p [count %u]\n", endpoint->free_slots, nsn_ringbuf_count(endpoint->free_slots));
             }
 
         }
