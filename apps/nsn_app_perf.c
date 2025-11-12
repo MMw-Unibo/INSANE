@@ -61,6 +61,7 @@ typedef struct test_config {
     int64_t        app_source_id;
     uint64_t       sleep_time;
     uint64_t       max_msg;
+    uint64_t       send_rate;
 } test_config_t;
 
 struct test_data {
@@ -93,7 +94,8 @@ void usage(int argc, char *argv[]) {
            "-r: reliability QoS. Can be reliable or unreliable\n"
            "-c: consumption QoS. Can be poll or low           \n"
            "-a: specify app-defined source id                 \n"
-           "-t: configure sleep time (s) in send              \n",
+           "-t: configure sleep time (s) in send              \n"
+           "-m: specify send rate (msg/s) in source mode      \n",
            argv[0]);
 }
 
@@ -117,30 +119,44 @@ void do_source(nsn_stream_t stream, test_config_t *params) {
     nsn_source_t source = nsn_create_source(stream, params->app_source_id);
 
     uint64_t tx_time;
+    uint64_t next_send_time = get_clock_realtime_ns();
+    uint64_t interval_ns = 0;
+    if (params->send_rate > 0) {
+        interval_ns = (uint64_t)(1e9 / params->send_rate);  // ns per message
+    }
+    
     while (g_running && (params->max_msg == 0 || counter < (params->max_msg))) {
 
         if (params->sleep_time) {
             sleep(params->sleep_time);
         }
+        
+        // Compute target time for next message
+        if (params->send_rate > 0) {
+            next_send_time += interval_ns;
+            while (get_clock_realtime_ns() < next_send_time) {
+                __asm__ __volatile__("pause");
+            }
+        }
 
         tx_time = get_clock_realtime_ns();
         buf     = nsn_get_buffer(params->payload_size, 0);
-
-        if (nsn_buffer_is_valid(buf)) {
-            data = (struct test_data *)buf->data;
-            data->tx_time = tx_time;
-            data->cnt     = counter++;
-            // strncpy(data->msg, msg, strlen(msg) + 1);
-
-            buf->len = params->payload_size;
-
-            ret = nsn_emit_data(source, buf);
-            // Check the outcome
-            // TODO: unimplemented
-            nsn_unused(ret);
-
-            // LOG_DEBUG("%ld)\ttime: %ld (%lu)", counter, data->tx_time);
+        if (!nsn_buffer_is_valid(buf)) {
+            continue;
         }
+
+        data = (struct test_data *)buf->data;
+        data->tx_time = tx_time;
+        data->cnt     = counter++;
+        // strncpy(data->msg, msg, strlen(msg) + 1);
+
+        // Set the length (crucial) and send
+        buf->len = params->payload_size;
+        ret = nsn_emit_data(source, buf);
+
+        nsn_unused(ret);
+        // LOG_DEBUG("%ld)\ttime: %ld (%lu)", counter, data->tx_time);
+        
     }
     printf("Finished sending %lu messages. Exiting...\n", counter);
     nsn_destroy_source(source);
@@ -283,6 +299,7 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
     config->app_source_id   = 0;
     config->sleep_time      = 0;
     config->max_msg         = 0;
+    config->send_rate       = 0;
 
     /* Test role (mandatory argument) */
     if (!strcmp(argv[1], "sink")) {
@@ -388,20 +405,33 @@ int parse_arguments(int argc, char *argv[], test_config_t *config) {
             }
             continue;
         }
+
+        // Send rate
+        if (!strncmp(argv[i], "-m", 2) || !strncmp(argv[i], "--send-rate", 11)) {
+            char *ptr;
+            ENSURE_ONE_MORE_ARGUMENT(argc, argv, i, "--send-rate")
+            config->send_rate = strtol(argv[++i], &ptr, 10);
+            if (*ptr != '\0') {
+                fprintf(stderr, "! Invalid value for send-rate option: %s\n", argv[i]);
+                return -1;
+            }
+            continue;
+        }
     }
 
     // Print out the configuration
     printf("Running with the following arguments:   \n"
            "\tRole............. : %s                \n"
-           "\tPayload size..... : %d                \n"
+           "\tPayload size..... : %d bytes          \n"
            "\tMax messages..... : %lu               \n"
            "\tDatapath QoS..... : %s                \n"
            "\tReliability QoS.. : %s                \n"
            "\tSource id........ : %ld               \n"
-           "\tSleep time....... : %ld               \n\n",
+           "\tSleep time....... : %ld s             \n"
+           "\tSend rate........ : %lu msg/s       \n\n",
            role_strings[config->role], config->payload_size, config->max_msg,
            dp_strings[config->qos_datapath], rel_strings[config->qos_reliability],
-           config->app_source_id, config->sleep_time);
+           config->app_source_id, config->sleep_time, config->send_rate);
 
     return 0;
 }
