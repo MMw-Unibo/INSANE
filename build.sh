@@ -66,7 +66,7 @@ $CC $CFLAGS -fPIC ../src/libinterception/libinterception.c -I../src -I../include
 # Build the Applications
 $CC $CFLAGS ../apps/nsn_app_tx.c    -I../include $DEFINES -L. -l:libnsn.a -o nsn-app-tx $LDFLAGS
 # $CC $CFLAGS ../apps/nsn_app_rx.c    -I../include -lnsn $DEFINES -o nsn-app-rx $LDFLAGS
-$CC $CFLAGS ../apps/nsn_app_perf.c  -I../include $DEFINES -L. -l:libnsn.a -o nsn-perf $LDFLAGS
+$CC $CFLAGS ../apps/perf/nsn_app_perf.c  -I../include $DEFINES -L. -l:libnsn.a -o nsn-perf $LDFLAGS
 
 set +x
 cd ..
