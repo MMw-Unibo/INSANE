@@ -696,6 +696,10 @@ NSN_DATAPATH_CONN_MANAGER(tcpdpdk) {
     list_for_each_entry(ep_in, endpoint_list, node) {    
         nsn_endpoint_t *ep = ep_in->ep;
         struct tcpdpdk_ep *conn = (struct tcpdpdk_ep *)ep->data;
+        if(!conn) {
+            // Not initialized yet
+            continue;
+        }
 
         // already connected to all peers - skip
         u32 conn_peers = at_load(&conn->connected_peers, mo_rlx);
@@ -1154,9 +1158,14 @@ NSN_DATAPATH_TX(tcpdpdk) {
         for (usize i = 0; i < buf_count; i++) {
             // Prepare the payload - get the corresponding mbuf from the pool
             data_mbuf = nsn_pktmbuf_alloc(conn->zc_pool, bufs[i].index);
+            if (!data_mbuf) {
+                fprintf(stderr, "[tcpdpdk] failed to allocate data mbuf %lu from pool %s\n", bufs[i].index, conn->zc_pool->name);
+                continue;
+            }
+
             data_mbuf->pkt_len = data_mbuf->data_len = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;
             if (nsn_unlikely(data_mbuf->data_len == 0 || data_mbuf->data_len > endpoint->io_bufs_size)) {
-                fprintf(stderr, "[tcpdpdk] Invalid packet size: %u. Discarding packet...\n", data_mbuf->data_len);
+                fprintf(stderr, "[tcpdpdk] Invalid packet size: %u\n", data_mbuf->data_len);
                 continue;
             }  
             

@@ -193,7 +193,7 @@ NSN_DATAPATH_TX(udpsock)
             inet_pton(AF_INET, peers[p], &send_addr.sin_addr);
             while((ret = sendto(conn->s_sockfd, data, size, 0, (struct sockaddr *)&send_addr, sizeof(send_addr))) < 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    printf("[udpsock] sendto() failed: %s\n", strerror(errno));
+                    fprintf(stderr,"[udpsock] sendto() failed: %s\n", strerror(errno));
                     goto finalize_and_exit;
                 }
             }

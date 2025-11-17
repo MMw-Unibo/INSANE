@@ -656,14 +656,14 @@ NSN_DATAPATH_UPDATE(rdma) {
 
                 int flags = fcntl(conn->sock_svc_fd, F_GETFL, 0);
                 if (flags == -1) {
-                    fprintf(stderr, "[tcpsock] fcntl() failed: %s\n", strerror(errno));
+                    fprintf(stderr, "[rdma] fcntl() failed: %s\n", strerror(errno));
                     close(conn->sock_svc_fd);
                     conn->sock_svc_fd = -1;
                     goto server_fail;
                 }
                 flags |= O_NONBLOCK;
                 if (fcntl(conn->sock_svc_fd, F_SETFL, flags) == -1) {
-                    fprintf(stderr, "[tcpsock] fcntl() failed: %s\n", strerror(errno));
+                    fprintf(stderr, "[rdma] fcntl() failed: %s\n", strerror(errno));
                     close(conn->sock_svc_fd);
                     conn->sock_svc_fd = -1;
                     goto server_fail;
@@ -758,6 +758,10 @@ NSN_DATAPATH_CONN_MANAGER(rdma)
     list_for_each_entry(ep_in, endpoint_list, node) {    
         nsn_endpoint_t *ep = ep_in->ep;
         struct rdma_ep *conn = (struct rdma_ep *)ep->data;
+        if (!conn) {
+            // not initialized yet
+            continue;
+        }
 
         // already connected to all peers - skip
         u32 conn_peers = at_load(&conn->connected_peers, mo_rlx);
@@ -978,7 +982,7 @@ NSN_DATAPATH_TX(rdma)
 
         // Returns ALL the buffers to the free slots ring, regardless of the send status
         if(nsn_ringbuf_enqueue_burst(endpoint->free_slots, bufs, sizeof(bufs[0]), buf_count, NULL) < buf_count) {
-            fprintf(stderr, "[tcpsock] Failed to enqueue descriptors\n");
+            fprintf(stderr, "[rdma] Failed to enqueue descriptors\n");
         }
     }
 
