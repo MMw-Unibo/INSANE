@@ -805,9 +805,11 @@ nsn_buffer_t tmp_buf;
 // -----------------------------------------------------------------------------
 nsn_buffer_t *nsn_get_buffer(size_t size, int flags) {
 
-    if (size > 1440) {
+    // Reset the temporary buffer
+    tmp_buf.len = 0;
+
+    if (size > 1440 || size == 0) {
         log_error("invalid size %lu\n", size);
-        tmp_buf.len = 0;
         return &tmp_buf;
     }
 
@@ -837,7 +839,7 @@ int nsn_emit_data(nsn_source_t source, nsn_buffer_t *buf) {
         return -1;
     }
 
-    if(buf->len <= 0 || (size_t)buf->len > tx_buf_size) {
+    if(buf->len == 0 || (size_t)buf->len > tx_buf_size) {
         log_error("invalid buffer size %d\n", buf->len);
         return -2;
     }

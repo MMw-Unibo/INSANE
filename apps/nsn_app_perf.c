@@ -153,8 +153,11 @@ void do_source(nsn_stream_t stream, test_config_t *params) {
         // Set the length (crucial) and send
         buf->len = params->payload_size;
         ret = nsn_emit_data(source, buf);
+        if (ret < 0) {
+            fprintf(stderr, "Failed to emit data: %d\n", ret);
+            break;
+        }
 
-        nsn_unused(ret);
         // LOG_DEBUG("%ld)\ttime: %ld (%lu)", counter, data->tx_time);
         
     }
