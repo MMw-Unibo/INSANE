@@ -290,7 +290,7 @@ nsn_init()
     // a) Find the slot zone(s)
     tx_bufs = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_TX_IO_BUFS_NAME));
     if (tx_bufs == NULL) {
-        log_error("failed to find the rx_io_buffer_pool zone\n");
+        log_error("failed to find the tx_io_buffer_pool zone\n");
         goto exit_error;
     }
     tx_buf_size = resp->io_buf_size;
@@ -304,7 +304,7 @@ nsn_init()
     
     // rx_bufs = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_RX_IO_BUFS_NAME));
     // if (rx_bufs == NULL) {
-    //     log_error("failed to find the tx_io_buffer_pool zone\n");
+    //     log_error("failed to find the rx_io_buffer_pool zone\n");
     //     goto exit_error;
     // }
     // rx_buf_size = ?;
@@ -312,7 +312,7 @@ nsn_init()
     // c) Find the ring zone, its offset in the arena, and then the free_slots ring inside it.
     rings_zone = nsn_find_zone_by_name(zones, str_lit(NSN_CFG_DEFAULT_RINGS_ZONE_NAME));
     if (rings_zone == NULL) {
-        log_error("failed to find the tx_io_buffer_pool zone\n");
+        log_error("failed to find the rings zone\n");
         goto exit_error;
     }
     free_slots_ring = nsn_lookup_ringbuf(rings_zone, str_lit(NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME));

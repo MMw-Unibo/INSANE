@@ -170,7 +170,7 @@ void do_source(nsn_stream_t stream, test_config_t *params) {
 void do_sink(nsn_stream_t stream, test_config_t *params) {
 
     nsn_sink_t sink = nsn_create_sink(stream, params->app_source_id, NULL);
-    uint64_t   first_time = 0, last_time = 0;
+    uint64_t   first_time = 0, last_time = 0, int_time = 0;
 
     printf("Ready to receive packets\n");
     uint64_t counter = 0;
@@ -180,11 +180,22 @@ void do_sink(nsn_stream_t stream, test_config_t *params) {
 
         if (counter == 0) {
             first_time = get_clock_realtime_ns();
+            int_time   = first_time;
         }
         counter++;
         // struct test_data *data = (struct test_data *)buf.data;
         // fprintf(stderr, "(%ld) received: %ld, %s)\n", counter, data->cnt, data->msg);
         nsn_release_data(buf);
+
+        if(params->max_msg == 0) {
+            if((counter % 100000) == 0) {
+                uint64_t now = get_clock_realtime_ns();
+                uint64_t elapsed_time_ns = now - int_time;
+                double throughput = (100000 * ((double)1e6)) / ((double)elapsed_time_ns);
+                fprintf(stdout, "%lu %.3f kpkts/s\n", counter, throughput);
+                int_time = now;
+            }
+        }
     }
     last_time = get_clock_realtime_ns();
 

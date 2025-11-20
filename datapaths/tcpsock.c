@@ -405,7 +405,7 @@ NSN_DATAPATH_TX(tcpsock)
         usize size = ((nsn_meta_t*)(nsn_mm_zone_get_ptr(endpoint->tx_meta_zone)) + bufs[i].index)->len;  
 
         if (nsn_unlikely(size == 0 || size > endpoint->io_bufs_size)) {
-            fprintf(stderr, "[tcpsock] Invalid packet size: %lu. Discarding packet...\n", size);
+            fprintf(stderr, "[tcpsock] Invalid packet size: %lu. Discarding packet.\n", size);
             tx_count++;
             continue;
         }      
@@ -417,7 +417,7 @@ NSN_DATAPATH_TX(tcpsock)
                 continue;
             }
 
-            // First, packet size. Asynchronous!
+            // First, packet size. Asynchronous send, so we must ensure all bytes are sent
             nb_tx = 0;
             char* buf_size_ptr = (char*)&size;
             while(nb_tx < sizeof(size)) {
@@ -448,10 +448,13 @@ retry:
             } 
             if (nb_tx != sizeof(size)) {
                 fprintf(stderr, "[tcpsock] error: sent %ld bytes, but expected were %lu\n", ret, sizeof(size));
+                close(conn->s_sockfd[p]);
+                conn->s_sockfd[p] = -1;
+                atomic_fetch_sub(&conn->connected_peers, 1); 
                 continue;
             }
 
-            // Then, the actual packet. Now that we committed by sending a size, we must send synchronously
+            // Then, the actual packet. Now that we committed by sending a size, we must send the payload
             nb_tx = 0;
             while(nb_tx < size) {
                 if((ret = send(conn->s_sockfd[p], data, size - nb_tx, MSG_DONTWAIT)) < 0) {
@@ -471,6 +474,9 @@ retry:
             }
             if(nb_tx != size) {
                 fprintf(stderr, "[tcpsock] error: sent %lu bytes, but expected were %lu\n", nb_tx, size);
+                close(conn->s_sockfd[p]);
+                conn->s_sockfd[p] = -1;
+                atomic_fetch_sub(&conn->connected_peers, 1); 
                 continue;
             }
         }

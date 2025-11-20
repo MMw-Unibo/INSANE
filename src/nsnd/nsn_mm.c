@@ -29,6 +29,7 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
         log_error("failed to create the tx_zone\n");
         return NULL;
     }
+    log_trace("Created tx_zone at %p with size %zu\n", tx_zone, tx_zone->size);
     
     // The metadata associated with the actual data slots (e.g., pkt len) is kept in a separate zone
     total_zone_size = cfg->io_buffer_pool_size * sizeof(nsn_meta_t);
@@ -37,6 +38,7 @@ nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
         log_error("failed to create the tx_meta_zone\n");
         return NULL;
     }
+    log_trace("Created tx_meta_zone at %p with size %zu\n", tx_meta_zone, tx_meta_zone->size);
 
     // Create a pool of ring buffers inside the ring zone. In the current design, all the rings have the same size.
     // TODO: The free_slots can be split into a tx/rx couple of rings, if we decide to keep both the tx and rx memory areas separated. Now we keep 1 zone for slots (tx_zone) and 1 ring for its indexing (NSN_CFG_DEFAULT_FREE_SLOTS_RING_NAME).
@@ -133,6 +135,7 @@ nsn_memory_manager_create_ringbuf_pool(
         log_error("Failed to create zone for ring buffer pool\n");
         return NULL;
     }
+    log_trace("Created rings_zone at %p with size %zu\n", zone, zone->size);
 
     nsn_ringbuf_pool_t *pool = (nsn_ringbuf_pool_t *)nsn_mm_zone_get_ptr(zone);
     pool->zone              = zone;

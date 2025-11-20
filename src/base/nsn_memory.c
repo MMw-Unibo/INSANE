@@ -15,7 +15,7 @@ mem_arena_t *
 mem_arena_alloc_with_alignement(usize size, usize align)
 {
     usize aligned_size = align_to(size, MEM_ARENA_DEFAULT_GRANULARITY);
-    printf("aligned_size: %zu\n", aligned_size);
+    log_trace("aligned_size: %zu\n", aligned_size);
     
     void *base = arena_impl_reserve(aligned_size, NsnOsMemoryFlag_Anonymous | NsnOsMemoryFlag_Private);
     assert(base && "Failed to allocate memory");

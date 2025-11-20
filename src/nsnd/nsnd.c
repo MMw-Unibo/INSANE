@@ -198,7 +198,7 @@ mem_arena_t *state_arena      = NULL;
 nsn_app_pool_t app_pool       = {0};
 nsn_plugin_set_t plugin_set   = {0};
 nsn_thread_pool_t thread_pool = {0};
-// global streams list
+
 nsn_streams_manager_t *streams_manager = NULL;
 
 string_list_t arg_list = {0};
@@ -1771,6 +1771,8 @@ main(int argc, char *argv[])
         rest_port_str,
         "request_timeout_ms",
         "10000",
+        "num_threads",
+        "5",
         "error_log_file",
         "nsn-rest-error.log",
         0};
