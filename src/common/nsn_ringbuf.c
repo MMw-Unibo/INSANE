@@ -151,7 +151,7 @@ __nsn_ringbuf_enqueue_elems(nsn_ringbuf_t *rb, u32 prod_head, const void *obj_ta
         }
         else
         {
-            for (i = 0; i < n; i++, idx++)
+            for (i = 0; i < n && idx < size ; i++, idx++)
                 ring[idx] = src[i];
             for (idx = 0; i < n; i++, idx++)
                 ring[idx] = src[i];
