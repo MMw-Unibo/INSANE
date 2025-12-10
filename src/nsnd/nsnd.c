@@ -1800,10 +1800,15 @@ main(int argc, char *argv[])
         goto clear_and_quit;
     }
 
+    // Pretty print
+    
     char hostinfo[512];
     snprintf(hostinfo, sizeof(hostinfo), "http://%s:%d", rest_host, rest_port);
-    printf("Number of streams for each plugins: %s%s\n", hostinfo, PLUGIN_STREAMS_URI);
-    printf("Change QoS: %s%s\n", hostinfo, CHANGE_QOS_URI);
+    printf("################################################################################\n");
+    printf("# INSANE daemon v%s                                                         #\n", INSANE_VERSION);
+    printf("# Authors: Lorenzo Rosa and Andrea Garbugli (C)2025                            #\n");
+    printf("# REST control server: %s                                   #\n", hostinfo);
+    printf("################################################################################\n");
    
     // Create the shared memory and start the Control Path loop
     {

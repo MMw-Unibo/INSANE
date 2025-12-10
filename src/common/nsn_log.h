@@ -137,7 +137,7 @@ void
 logger_set_level_by_name(char *name) 
 {
     u32 level = log_level_from_cstr(name);
-    printf("level name %s (%d)\n", name, level);
+    // printf("level name %s (%d)\n", name, level);
     logger_set_level(level);
 }
 

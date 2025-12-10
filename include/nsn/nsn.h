@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include <limits.h>
 
+#define INSANE_VERSION "2.0.0"
+
 typedef struct nsn_hdr nsn_hdr_t;
 struct nsn_hdr { uint32_t channel_id; };
 #define INSANE_HEADER_LEN sizeof(nsn_hdr_t)
