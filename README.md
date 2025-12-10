@@ -73,7 +73,7 @@ Once the daemon is started, it is possible to start applications that connect to
 Similarly to the daemon, you must provide a configuration file, where you specify the application ID. An [example](configs/nsn-app.cfg) is provided. Such ID must be a valid UDP/TCP port: only applications with the same ID will be able to communicate. The configuration file must be placed in the current directory from which the application is invoked and be called `nsn-app.cfg`.
 
 
-Please note that while INSANE is designed to have multiple applications running, they **must have different application IDs** if they attach to the same daemon. Future versions of INSANE will enable local app-to-app communication, which is currently not supported.
+Please note that while INSANE is designed to have multiple applications running concurrently, they **must have different application IDs** if they attach to the same daemon. Future versions of INSANE will enable local app-to-app communication, which is currently not supported.
 
 ### Tutorial
 
@@ -87,7 +87,7 @@ Each plugin **must be configured** in the daemon configuration file by specifyin
 
 ### DPDK plugins
 
-To fully support a DPDK-based plugin and still guarantee the flexibility of INSANE, we had to modify a few lines of the driver of the Mellanox card (mlx5). Hence, we provide a [diff file](dpdk_22_11_mods.diff) that contains the changes we made to the driver source code. You can apply this patch to the DPDK source code before building it.
+To fully support a DPDK-based plugin and still guarantee the flexibility of INSANE, we had to modify a few lines of some drivers. Hence, we provide a [diff file](dpdk_22_11_mods.diff) that contains the changes we made to the driver source code. You can apply this patch to the DPDK source code before building it.
 
 Furthermore, if you are using a Mellanox card for the DPDK plugin, you need to explicitly disable the use of vectorial instructions, as it conflicts with the features we use in the DPDK plugin. To do so, add the following parameter to the DPDK configuration (i.e., the `eal_args` string) in the INSANE daemon configuration file: `-a <pcie_addr>,rx_vec_en=0`, where `<pcie_addr>` is the PCI address of the Mellanox card (e.g., `0000:05:00.0`).
 
