@@ -285,3 +285,9 @@ nsn_os_file_close(nsn_file_t file)
 {
     close(file.handle);
 }
+
+void
+nsn_os_file_delete(string_t filename)
+{
+    unlink(to_cstr(filename));
+}

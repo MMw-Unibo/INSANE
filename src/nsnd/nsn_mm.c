@@ -3,6 +3,12 @@
 nsn_mem_manager_t *
 nsn_memory_manager_create(mem_arena_t *arena, nsn_mem_manager_cfg_t *cfg)
 {
+
+    // Ensure the shm segment does not already exist
+    char full_shm_name[64];
+    sprintf(full_shm_name, "%s/%s", NSN_HUGETLBFS_PATH, to_cstr(cfg->shm_name));
+    nsn_os_file_delete(str_cstr(full_shm_name));
+
     // TODO(garbu): create a shared memory for the data plane using the config 
     //              to determine the size of the shared memory. 
     //              In the shared memory, we have both the memory buffer and the

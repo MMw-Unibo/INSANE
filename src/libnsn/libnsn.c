@@ -210,6 +210,13 @@ nsn_init()
 
     temp_mem_arena_t temp = temp_mem_arena_begin(arena);
 
+    char name[IPC_MAX_PATH_SIZE];
+    snprintf(name, IPC_MAX_PATH_SIZE, "%s%d", NSND_TO_NSNAPP_IPC, app_id);
+    strncpy(nsn_app_addr.sun_path, name, sizeof(nsn_app_addr.sun_path));
+
+    // Make sure the shared area name is unique per app id
+    nsn_os_file_delete(str_lit(name));
+
     // open a connection with the insance of the nsn daemon
     sockfd = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (sockfd < 0) {
@@ -217,11 +224,6 @@ nsn_init()
     }
 
     nsn_app_addr.sun_family = AF_UNIX;
-    
-    char name[IPC_MAX_PATH_SIZE];
-    snprintf(name, IPC_MAX_PATH_SIZE, "%s%d", NSND_TO_NSNAPP_IPC, app_id);
-    strncpy(nsn_app_addr.sun_path, name, sizeof(nsn_app_addr.sun_path));
-
     if (bind(sockfd, (struct sockaddr *)&nsn_app_addr, sizeof(struct sockaddr_un)) < 0) {
         log_error("failed to bind to path %s: '%s'\n", name, strerror(errno));
         goto exit_error;
@@ -271,7 +273,7 @@ nsn_init()
         log_error("failed to attach to the shared memory segment\n");
         goto exit_error;
     }
-    log_info("connected to nsnd, the shm is at /dev/shm/%s, with size %zu\n", resp->shm_name, resp->shm_size);
+    log_info("connected to nsnd, the shm is at /dev/hugepages/%s, with size %zu\n", resp->shm_name, resp->shm_size);
 
     // // Lookup the free slots ring
     // char* ring_position = (char*)(shm->data + resp->free_slots_ring_offset);

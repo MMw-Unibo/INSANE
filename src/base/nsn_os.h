@@ -148,5 +148,7 @@ nsn_file_t nsn_os_file_open(string_t filename, enum nsn_file_flag flags);
 bool       nsn_file_valid(nsn_file_t file);
 string_t   nsn_os_read_entire_file(mem_arena_t *arena, nsn_file_t file);
 void       nsn_os_file_close(nsn_file_t file);
+void       nsn_os_file_delete(string_t filename);
+
 
 #endif // NSN_OS_H

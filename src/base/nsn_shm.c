@@ -1,7 +1,5 @@
 #include "nsn_shm.h"
 
-#define NSN_HUGETLBFS_PATH "/dev/hugepages"
-
 static void *
 _nsn_shm_create_with_flags(const char *name, usize size, int flags, int mode, int *out_fd)
 {

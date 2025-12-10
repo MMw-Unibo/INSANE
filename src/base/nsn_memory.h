@@ -20,6 +20,8 @@ struct mem_arena {
 #define MEM_ARENA_DEFAULT_SIZE                  gigabytes(8)
 #define MEM_ARENA_DEFAULT_COMMIT_GRANULARITY    kilobytes(4)    // Page size
 
+#define NSN_HUGETLBFS_PATH "/dev/hugepages"
+
 mem_arena_t *mem_arena_alloc_with_alignement(usize size, usize align);
 #define mem_arena_alloc(size)       mem_arena_alloc_with_alignement(size, MEM_ARENA_DEFAULT_ALIGNEMENT)
 #define mem_arena_alloc_default()   mem_arena_alloc(MEM_ARENA_DEFAULT_SIZE)
