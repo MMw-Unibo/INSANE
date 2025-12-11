@@ -1,4 +1,4 @@
-# INSANE
+# INSANE: Kernel-Bypass Networking Made Easy
 
 INSANE is a research prototype that provides Network Acceleration as a Service to applications running bare-metal or in cloud platforms. The key component of INSANE is a userspace OS module, the INSANE runtime, that provides applications transparent access to a wide set of low-latency userspace networking, such as Linux XDP, DPDK, RDMA, in addition to standard kernel networking. The OS module runs as a separate process co-located with the applications and applications interact with it via shared-memory channels.
 
