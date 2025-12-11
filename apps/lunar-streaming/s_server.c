@@ -49,7 +49,7 @@ int gen(void *self, struct frame *f) {
     struct app_data *ad = self;
 
     memset(f, 0, sizeof(*f));
-    f->data = ad->data;
+    f->data = (uint8_t *)ad->data;
     f->id   = ad->frame_id++;
     f->size = ad->size;
     f->x    = x;
@@ -87,7 +87,7 @@ int main(int argc, char *argv[]) {
     ad->frame_id        = 0;
     ad->rate            = rate_ms * 1000000ll;
 
-    ad->data = stbi_load(filename, &x, &y, &n, 0);
+    ad->data = (char *)stbi_load(filename, &x, &y, &n, 0);
     if (!ad->data) {
         fprintf(stderr, "cannot open image: %s\n", filename);
         exit(EXIT_FAILURE);

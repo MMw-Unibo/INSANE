@@ -23,7 +23,7 @@ static void
 add_config_value(const char *key, const char *val)
 {
     size_t klen = strlen(key);
-    size_t vlen = strlen(val);
+    //size_t vlen = strlen(val);
 
     if (strncmp("insane_id", key, klen) == 0) {
         config.insane_id = atoi(val);

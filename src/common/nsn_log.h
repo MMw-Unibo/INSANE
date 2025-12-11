@@ -1,0 +1,256 @@
+#ifndef NSN_LOG_H
+#define NSN_LOG_H
+
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#if __linux__
+# include <sys/time.h>
+#else
+# error "Unsupported operating system"
+#endif
+
+#define logger_array_count(a)   (sizeof((a))/sizeof((a)[0]))
+
+//--------------------------------------------------------------------------------------------------
+// Colors
+#define ANSI_COLOR_RED     "\x1b[31m"
+#define ANSI_COLOR_GREEN   "\x1b[32m"
+#define ANSI_COLOR_YELLOW  "\x1b[33m"
+#define ANSI_COLOR_BLUE    "\x1b[34m"
+#define ANSI_COLOR_MAGENTA "\x1b[35m"
+#define ANSI_COLOR_CYAN    "\x1b[36m"
+#define ANSI_COLOR_RESET   "\x1b[0m"
+
+struct logger_config
+{
+    char *filename;
+    int   ts;    // enable timestamp
+    int   level; // enable level
+    int   color; // enable color
+    char *title;
+};
+
+struct logger
+{
+    char *filename;
+    FILE *file;
+};
+
+enum logger_level
+{
+    LOGGER_LEVEL_ERROR,
+    LOGGER_LEVEL_WARN,
+    LOGGER_LEVEL_INFO,
+    LOGGER_LEVEL_DEBUG,
+    LOGGER_LEVEL_TRACE
+};
+
+int 
+log_level_from_cstr(char *s) 
+{
+    int res = LOGGER_LEVEL_ERROR;
+    char* log_levels[] = {"error", "warn", "info", "debug", "trace"};
+    for (size_t i = 0; i < logger_array_count(log_levels); ++i) {
+        if (strncmp(log_levels[i], s, strlen(log_levels[i])) == 0) {
+            res = i;
+            break;
+        }
+    }
+    return res;
+}
+
+#ifdef NSN_ENABLE_LOGGER
+# define log(level, fmt, ...) logger_log(level, fmt, ##__VA_ARGS__)
+# define log_trace(fmt, ...)  logger_log(LOGGER_LEVEL_TRACE, fmt, ##__VA_ARGS__)
+# define log_debug(fmt, ...)  logger_log(LOGGER_LEVEL_DEBUG, fmt, ##__VA_ARGS__)
+# define log_info(fmt, ...)   logger_log(LOGGER_LEVEL_INFO, fmt, ##__VA_ARGS__)
+# define log_warn(fmt, ...)   logger_log(LOGGER_LEVEL_WARN, fmt, ##__VA_ARGS__)
+# define log_error(fmt, ...)  logger_log(LOGGER_LEVEL_ERROR, fmt, ##__VA_ARGS__)
+#else
+# define log(level, fmt, ...)
+# define log_trace(fmt, ...)
+# define log_debug(fmt, ...)
+# define log_info(fmt, ...)
+# define log_warn(fmt, ...)
+# define log_error(fmt, ...)
+#endif // NSN_ENABLE_LOGGER
+
+int  logger_init(struct logger_config *config);
+void logger_log(int level, const char *fmt, ...);
+void logger_close();
+void logger_set_level(int level);
+void logger_set_title(char *title);
+void logger_enable_timestamp(int enable);
+
+#endif // NSN_LOG_H
+
+#ifdef NSN_LOG_IMPLEMENTATION
+
+struct logger        s_logger;
+struct logger_config s_config = {
+    .filename = NULL,
+    .ts       = 1,
+    .level    = LOGGER_LEVEL_INFO,
+    .color    = 1,
+    .title    = NULL,
+};
+
+int
+logger_init(struct logger_config *config)
+{
+    memset(&s_logger, 0, sizeof(s_logger));
+
+    if (config)
+    {
+        s_config.filename = config->filename;
+        s_config.ts       = config->ts;
+        s_config.level    = config->level;
+        s_config.color    = config->color;
+        s_config.title    = config->title;
+    }
+
+    if (s_config.filename)
+    {
+        s_logger.filename = s_config.filename;
+        s_logger.file     = fopen(s_logger.filename, "a");
+        if (!s_logger.file)
+        {
+            fprintf(stderr, "Failed to open log file: %s\n", s_logger.filename);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+void
+logger_set_level(int level)
+{
+    s_config.level = level;
+}
+
+void
+logger_set_level_by_name(char *name) 
+{
+    u32 level = log_level_from_cstr(name);
+    // printf("level name %s (%d)\n", name, level);
+    logger_set_level(level);
+}
+
+void
+logger_set_title(char *title)
+{
+    s_config.title = title;
+}
+
+void
+logger_enable_timestamp(int enable)
+{
+    s_config.ts = enable;
+}
+
+void
+logger_close()
+{
+    if (s_logger.file)
+    {
+        fclose(s_logger.file);
+    }
+}
+
+void
+logger_log(int level, const char *fmt, ...)
+{
+    if (level > s_config.level)
+    {
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+
+    char   buf[4096];
+    size_t buflen = 0;
+
+    if (s_config.title)
+    {
+        buflen += snprintf(buf + buflen, sizeof(buf) - buflen, "[%s ", s_config.title);
+    }
+    else
+    {
+        buflen += snprintf(buf + buflen, sizeof(buf) - buflen, "[");
+    }
+
+    if (s_config.ts)
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        struct tm *tm = localtime(&ts.tv_sec);
+
+        buflen += strftime(buf + buflen, sizeof(buf) - buflen, "%Y-%m-%d %H:%M:%S", tm);
+        buflen += snprintf(buf + buflen, sizeof(buf) - buflen, ".%09ld ", ts.tv_nsec);
+    }
+
+    if (s_config.color)
+    {
+        switch (level)
+        {
+        case LOGGER_LEVEL_ERROR:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen,
+                               ANSI_COLOR_RED "ERROR" ANSI_COLOR_RESET);
+            break;
+        case LOGGER_LEVEL_WARN:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen,
+                               ANSI_COLOR_YELLOW "WARN" ANSI_COLOR_RESET);
+            break;
+        case LOGGER_LEVEL_INFO:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen,
+                               ANSI_COLOR_GREEN "INFO" ANSI_COLOR_RESET);
+            break;
+        case LOGGER_LEVEL_DEBUG:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen,
+                               ANSI_COLOR_BLUE "DEBUG" ANSI_COLOR_RESET);
+            break;
+        case LOGGER_LEVEL_TRACE:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen,
+                               ANSI_COLOR_CYAN "TRACE" ANSI_COLOR_RESET);
+            break;
+        }
+    }
+    else
+    {
+        switch (level)
+        {
+        case LOGGER_LEVEL_ERROR:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen, "ERROR");
+            break;
+        case LOGGER_LEVEL_WARN:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen, "WARN");
+            break;
+        case LOGGER_LEVEL_INFO:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen, "INFO");
+            break;
+        case LOGGER_LEVEL_DEBUG:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen, "DEBUG");
+            break;
+        case LOGGER_LEVEL_TRACE:
+            buflen += snprintf(buf + buflen, sizeof(buf) - buflen, "TRACE");
+            break;
+        }
+    }
+
+    buflen += snprintf(buf + buflen, sizeof(buf) - buflen, "] ");
+
+    buflen += vsnprintf(buf + buflen, sizeof(buf) - buflen, fmt, args);
+
+    FILE *file = s_config.filename ? s_logger.file : stderr;
+    fprintf(file, "%s", buf);
+
+    va_end(args);
+}
+
+#endif // NSN_LOG_IMPLEMENTATION

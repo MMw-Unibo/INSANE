@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -17,6 +18,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#ifndef SO_ZEROCOPY
+#define SO_ZEROCOPY 60
+#endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -26,9 +31,7 @@ int fd;
 int filesize;
 
 // Function designed for chat between client and server.
-void func(int sockfd, int connfd) {
-    int n;
-
+void func(int connfd) {
     struct header {
         int64_t timestamp;
         int     size;
@@ -90,22 +93,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // fd = open(filename, O_RDONLY, 0);
-    // if (fd < 0) {
-    //     perror("open");
-    //     exit(1);
-    // }
-
-    // struct stat st;
-    // if (fstat(fd, &st)) {
-    //     perror("stat");
-    //     exit(1);
-    // }
-
-    // filesize = st.st_size;
-
     int   x, y, n;
-    char *data = stbi_load(filename, &x, &y, &n, 0);
+    char *data = (char *) stbi_load(filename, &x, &y, &n, 0);
     if (!data) {
         fprintf(stderr, "cannot open image: %s\n", filename);
         exit(EXIT_FAILURE);
@@ -132,7 +121,7 @@ int main(int argc, char *argv[]) {
 
     uint8_t *memory = mmap(0, frame_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
 
-    for (int i = 0; i < frame_size; i++) {
+    for (size_t i = 0; i < frame_size; i++) {
         *memory++ = *data++;
     }
 
@@ -145,7 +134,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in saddr;
     memset(&saddr, 0, sizeof(saddr));
     saddr.sin_family      = AF_INET;
-    saddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    saddr.sin_addr.s_addr = inet_addr(address); //htonl(INADDR_ANY)
     saddr.sin_port        = htons(port);
 
     // Binding newly created socket to given IP and verification
@@ -173,7 +162,7 @@ int main(int argc, char *argv[]) {
         printf("server accept the client...\n");
 
     // Function for chatting between client and server
-    func(sockfd, connfd);
+    func(connfd);
 
     // After chatting close the socket
     close(sockfd);

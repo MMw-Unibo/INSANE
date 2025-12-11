@@ -66,7 +66,7 @@ int main(int argc, char *argv[]) {
     lnr_streaming_connect();
 
     struct frame *frame = NULL;
-    struct frame *ff    = NULL;
+    //struct frame *ff    = NULL;
 
     int                  total_frames = 0;
     int                  first        = 1;
@@ -75,13 +75,14 @@ int main(int argc, char *argv[]) {
     do {
         frame = lnr_streaming_recv(&frame_time);
         if (frame) {
+            printf("RECEIVED FRAME\n");
             stat       = &g_stats[total_frames++];
             stat->lat  = frame->ts;
             stat->time = frame_time;
 
             if (first) {
                 first = 0;
-                ff    = frame;
+                //ff    = frame;
             }
             // lns_release_frame(frame->id);
         }

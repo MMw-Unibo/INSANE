@@ -1,0 +1,139 @@
+diff --git a/drivers/net/i40e/i40e_ethdev.c b/drivers/net/i40e/i40e_ethdev.c
+index 7726a89d99..5496966307 100644
+--- a/drivers/net/i40e/i40e_ethdev.c
++++ b/drivers/net/i40e/i40e_ethdev.c
+@@ -2657,6 +2657,8 @@ i40e_dev_close(struct rte_eth_dev *dev)
+ 
+ 	i40e_clear_automask(pf);
+ 
++	rte_pci_unmap_device(pci_dev);
++
+ 	hw->adapter_closed = 1;
+ 	return ret;
+ }
+diff --git a/drivers/net/mlx5/mlx5_ethdev.c b/drivers/net/mlx5/mlx5_ethdev.c
+index 4a85415ff3..f43b3b2759 100644
+--- a/drivers/net/mlx5/mlx5_ethdev.c
++++ b/drivers/net/mlx5/mlx5_ethdev.c
+@@ -337,6 +337,7 @@ mlx5_dev_infos_get(struct rte_eth_dev *dev, struct rte_eth_dev_info *info)
+ 				 info->rx_queue_offload_capa);
+ 	info->tx_offload_capa = mlx5_get_tx_port_offloads(dev);
+ 	info->dev_capa = RTE_ETH_DEV_CAPA_FLOW_SHARED_OBJECT_KEEP;
++	info->dev_capa |= RTE_ETH_DEV_CAPA_RUNTIME_RX_QUEUE_SETUP;
+ 	info->if_index = mlx5_ifindex(dev);
+ 	info->reta_size = priv->reta_idx_n ?
+ 		priv->reta_idx_n : priv->sh->dev_cap.ind_table_max_size;
+diff --git a/drivers/net/mlx5/mlx5_rxq.c b/drivers/net/mlx5/mlx5_rxq.c
+index 81aa3f074a..132c5658b1 100644
+--- a/drivers/net/mlx5/mlx5_rxq.c
++++ b/drivers/net/mlx5/mlx5_rxq.c
+@@ -546,6 +546,79 @@ mlx5_rx_queue_stop(struct rte_eth_dev *dev, uint16_t idx)
+ 	return ret;
+ }
+ 
++/**
++ * Register Rx queue mempools and fill the Rx queue cache.
++ * This function tolerates repeated mempool registration.
++ *
++ * @param[in] rxq_ctrl
++ *   Rx queue control data.
++ *
++ * @return
++ *   0 on success, (-1) on failure and rte_errno is set.
++ */
++static int
++mlx5_rxq_mempool_register(struct mlx5_rxq_ctrl *rxq_ctrl)
++{
++	struct rte_mempool *mp;
++	uint32_t s;
++	int ret = 0;
++
++	mlx5_mr_flush_local_cache(&rxq_ctrl->rxq.mr_ctrl);
++	/* MPRQ mempool is registered on creation, just fill the cache. */
++	if (mlx5_rxq_mprq_enabled(&rxq_ctrl->rxq))
++		return mlx5_mr_mempool_populate_cache(&rxq_ctrl->rxq.mr_ctrl,
++						      rxq_ctrl->rxq.mprq_mp);
++	for (s = 0; s < rxq_ctrl->rxq.rxseg_n; s++) {
++		bool is_extmem;
++
++		mp = rxq_ctrl->rxq.rxseg[s].mp;
++		is_extmem = (rte_pktmbuf_priv_flags(mp) &
++			     RTE_PKTMBUF_POOL_F_PINNED_EXT_BUF) != 0;
++		ret = mlx5_mr_mempool_register(rxq_ctrl->sh->cdev, mp,
++					       is_extmem);
++		if (ret < 0 && rte_errno != EEXIST)
++			return ret;
++		ret = mlx5_mr_mempool_populate_cache(&rxq_ctrl->rxq.mr_ctrl,
++						     mp);
++		if (ret < 0)
++			return ret;
++	}
++	return 0;
++}
++
++static int
++mlx5_rxq_ctrl_prepare(struct rte_eth_dev *dev, struct mlx5_rxq_ctrl *rxq_ctrl,
++		      unsigned int idx)
++{
++	int ret = 0;
++
++	if (!rxq_ctrl->is_hairpin) {
++		/*
++		 * Pre-register the mempools. Regardless of whether
++		 * the implicit registration is enabled or not,
++		 * Rx mempool destruction is tracked to free MRs.
++		 */
++		if (mlx5_rxq_mempool_register(rxq_ctrl) < 0)
++			return -rte_errno;
++		ret = rxq_alloc_elts(rxq_ctrl);
++		if (ret)
++			return ret;
++	}
++	MLX5_ASSERT(!rxq_ctrl->obj);
++	rxq_ctrl->obj = mlx5_malloc(MLX5_MEM_RTE | MLX5_MEM_ZERO,
++				    sizeof(*rxq_ctrl->obj), 0,
++				    rxq_ctrl->socket);
++	if (!rxq_ctrl->obj) {
++		DRV_LOG(ERR, "Port %u Rx queue %u can't allocate resources.",
++			dev->data->port_id, idx);
++		rte_errno = ENOMEM;
++		return -rte_errno;
++	}
++	DRV_LOG(DEBUG, "Port %u rxq %u updated with %p.", dev->data->port_id,
++		idx, (void *)&rxq_ctrl->obj);
++	return 0;
++}
++
+ /**
+  * Rx queue start. Device queue goes to the ready state,
+  * all required mbufs are allocated and WQ is replenished.
+@@ -562,7 +635,7 @@ int
+ mlx5_rx_queue_start_primary(struct rte_eth_dev *dev, uint16_t idx)
+ {
+ 	struct mlx5_priv *priv = dev->data->dev_private;
+-	struct mlx5_rxq_priv *rxq = mlx5_rxq_get(dev, idx);
++	struct mlx5_rxq_priv *rxq = mlx5_rxq_ref(dev, idx);
+ 	struct mlx5_rxq_data *rxq_data = &rxq->ctrl->rxq;
+ 	int ret;
+ 
+@@ -575,6 +648,20 @@ mlx5_rx_queue_start_primary(struct rte_eth_dev *dev, uint16_t idx)
+ 		rte_errno = errno;
+ 		return ret;
+ 	}
++
++	struct mlx5_rxq_ctrl *rxq_ctrl = rxq->ctrl;
++	if (!rxq_ctrl->started) {
++		if (mlx5_rxq_ctrl_prepare(dev, rxq_ctrl, idx) < 0)
++			return ret;
++		LIST_INSERT_HEAD(&priv->rxqsobj, rxq_ctrl->obj, next);
++	}
++	ret = priv->obj_ops.rxq_obj_new(rxq);
++	if (ret) {
++		mlx5_free(rxq_ctrl->obj);
++		rxq_ctrl->obj = NULL;
++		return ret;
++	}
++
+ 	rte_io_wmb();
+ 	*rxq_data->cq_db = rte_cpu_to_be_32(rxq_data->cq_ci);
+ 	rte_io_wmb();

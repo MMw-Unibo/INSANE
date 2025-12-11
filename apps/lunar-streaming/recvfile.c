@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <errno.h>
 #include <getopt.h>
 #include <signal.h>
@@ -20,6 +21,7 @@
 int run = 1;
 
 void handler(int signum) {
+    (void)signum;
     run = 0;
 }
 
@@ -35,8 +37,8 @@ int64_t nb_frames = 0;
 void func(int sockfd) {
     char          buff[MAX];
     int           n;
-    int64_t       start, end;
-    int           new_frame = 1;
+    //int64_t       start, end; UNUSED variables
+   int           new_frame = 1;
     struct header hdr;
     int           bytes_read = 0;
     while (run) {
@@ -46,7 +48,7 @@ void func(int sockfd) {
         } else if (n > 0) {
             if (new_frame) {
                 memcpy(&hdr, buff, sizeof(struct header));
-                start     = get_realtime_ns();
+                //start     = get_realtime_ns();
                 new_frame = 0;
                 bytes_read += (n - sizeof(struct header));
             } else {
@@ -69,8 +71,8 @@ void func(int sockfd) {
 int main(int argc, char *argv[]) {
     signal(SIGINT, handler);
 
-    int                connfd;
-    struct sockaddr_in servaddr, cli;
+    //int                connfd; unused
+    struct sockaddr_in servaddr; //removed cli
 
     int   opt;
     char *address = "127.0.0.1";
@@ -102,8 +104,8 @@ int main(int argc, char *argv[]) {
         exit(0);
     } else
         printf("Socket successfully created..\n");
-    bzero(&servaddr, sizeof(servaddr));
-
+    //bzero(&servaddr, sizeof(servaddr));
+    memset(&servaddr, 0, sizeof(servaddr));
     // assign IP, PORT
     servaddr.sin_family      = AF_INET;
     servaddr.sin_addr.s_addr = inet_addr(address);
